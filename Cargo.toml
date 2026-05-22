@@ -87,6 +87,10 @@ regex = "1"
 # Wiki git versioning.
 git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
 
+# LLM provider HTTP.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+async-trait = "0.1"
+
 # Testing.
 tempfile = "3"
 

@@ -4,6 +4,7 @@ pub mod backup;
 pub mod commit;
 pub mod init;
 pub mod install_hooks;
+pub mod llm_test;
 pub mod reset;
 pub mod restore;
 pub mod search;

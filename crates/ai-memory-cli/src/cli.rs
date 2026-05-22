@@ -49,6 +49,8 @@ pub enum Command {
     InstallHooks(InstallHooksArgs),
     /// Stage + commit the wiki tree under git.
     Commit(CommitArgs),
+    /// Smoke-test an LLM provider by sending one prompt.
+    LlmTest(LlmTestArgs),
 }
 
 /// Arguments for `init`.
@@ -135,6 +137,37 @@ pub struct CommitArgs {
     /// Commit message.
     #[arg(long, short = 'm', default_value = "manual commit")]
     pub message: String,
+}
+
+/// LLM provider for `llm-test`.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum LlmProviderChoice {
+    /// Anthropic Messages API.
+    Anthropic,
+    /// OpenAI Chat Completions.
+    Openai,
+    /// OpenAI-compatible local (Ollama, vLLM, LM Studio).
+    OpenaiCompat,
+}
+
+/// Arguments for `llm-test`.
+#[derive(Debug, Args)]
+pub struct LlmTestArgs {
+    /// Provider to test.
+    #[arg(long, value_enum)]
+    pub provider: LlmProviderChoice,
+    /// Model identifier (e.g. `claude-sonnet-4-7`, `gpt-4o-mini`, `llama3.1:8b`).
+    #[arg(long)]
+    pub model: String,
+    /// Prompt to send.
+    #[arg(long)]
+    pub prompt: String,
+    /// Base URL override (required for openai-compat).
+    #[arg(long, env = "LLM_BASE_URL")]
+    pub base_url: Option<String>,
+    /// Optional API key override (otherwise pulled from env).
+    #[arg(long, env = "LLM_API_KEY", hide_env_values = true)]
+    pub api_key: Option<String>,
 }
 
 /// Arguments for `install-hooks`.

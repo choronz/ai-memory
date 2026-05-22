@@ -1,0 +1,69 @@
+//! `ai-memory llm-test` — smoke test an LLM provider end-to-end.
+
+use ai_memory_llm::{ChatRequest, ProviderChoice, ProviderConfig, build_provider};
+use anyhow::{Context, Result};
+use secrecy::SecretString;
+use tracing::info;
+
+use crate::cli::{LlmProviderChoice, LlmTestArgs};
+use crate::config::Config;
+
+/// Run the `llm-test` subcommand.
+///
+/// # Errors
+/// Returns an error if the provider cannot be constructed, the env
+/// lacks the required keys, or the HTTP call fails.
+pub async fn run(_config: &Config, args: LlmTestArgs) -> Result<()> {
+    let provider = ProviderChoice::from(args.provider);
+    let api_key = resolve_api_key(args.api_key, provider);
+    let config = ProviderConfig {
+        provider,
+        model: args.model,
+        api_key,
+        base_url: args.base_url,
+    };
+    let client = build_provider(config).context("building LLM provider")?;
+    info!(
+        provider = client.name(),
+        model = client.model(),
+        "sending prompt",
+    );
+    let resp = client
+        .complete(ChatRequest::user_prompt(args.prompt))
+        .await
+        .context("calling provider")?;
+
+    println!("--- model: {} ---", resp.model);
+    if let Some(u) = resp.usage {
+        println!(
+            "--- usage: in={} out={} ---",
+            u.input_tokens, u.output_tokens
+        );
+    }
+    println!("{}", resp.text);
+    Ok(())
+}
+
+fn resolve_api_key(explicit: Option<String>, provider: ProviderChoice) -> Option<SecretString> {
+    if let Some(s) = explicit
+        && !s.is_empty()
+    {
+        return Some(SecretString::from(s));
+    }
+    let env_name = match provider {
+        ProviderChoice::Anthropic => "ANTHROPIC_API_KEY",
+        ProviderChoice::OpenAi => "OPENAI_API_KEY",
+        ProviderChoice::OpenAiCompat => "LLM_API_KEY",
+    };
+    std::env::var(env_name).ok().map(SecretString::from)
+}
+
+impl From<LlmProviderChoice> for ProviderChoice {
+    fn from(value: LlmProviderChoice) -> Self {
+        match value {
+            LlmProviderChoice::Anthropic => Self::Anthropic,
+            LlmProviderChoice::Openai => Self::OpenAi,
+            LlmProviderChoice::OpenaiCompat => Self::OpenAiCompat,
+        }
+    }
+}
