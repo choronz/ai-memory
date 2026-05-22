@@ -14,6 +14,7 @@ pub mod reset;
 pub mod restore;
 pub mod search;
 pub mod serve;
+pub mod setup_agent;
 pub mod status;
 pub mod watch;
 pub mod write_page;

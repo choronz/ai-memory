@@ -28,6 +28,11 @@ RUN apt-get update \
  && mkdir -p /data \
  && chown -R ai-memory:ai-memory /data
 COPY --from=builder /usr/local/bin/ai-memory /usr/local/bin/ai-memory
+# Lifecycle-hook scripts bundled into the image so docker-only users
+# can `ai-memory setup-agent` without needing a repo checkout. The
+# scripts live on a path scanned by `install_hooks::resolve_hooks_dir`
+# (and by `setup_agent::resolve_source`).
+COPY hooks /usr/local/share/ai-memory/hooks
 USER ai-memory
 ENV AI_MEMORY_DATA_DIR=/data
 WORKDIR /data

@@ -55,5 +55,6 @@ async fn main() -> Result<()> {
         Command::Lint(args) => commands::lint::run(&config, args).await,
         Command::Embed(args) => commands::embed::run(&config, args).await,
         Command::GenerateAuthToken(args) => commands::generate_auth_token::run(&config, args),
+        Command::SetupAgent(args) => commands::setup_agent::run(&config, args),
     }
 }

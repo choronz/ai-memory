@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Curl-based installer for ai-memory's lifecycle-hook scripts.
+#
+# Use when you don't want to clone the repo and don't want to use the
+# docker image to extract the bundle. Pulls each hook script for the
+# requested agent straight from the published GitHub raw URL.
+#
+# Usage:
+#   curl -sSL https://raw.githubusercontent.com/akitaonrails/ai-memory/main/scripts/install-hooks.sh \
+#       | bash -s -- --agent claude-code
+#
+# Options:
+#   --agent <claude-code|codex|opencode>     which agent (default: claude-code)
+#   --to <dir>                               install root (default: $HOME/.ai-memory/hooks)
+#   --ref <git-ref>                          repo ref to pull from (default: main)
+#
+# After installation, render the matching agent config snippet:
+#   ai-memory install-hooks --agent claude-code --hooks-dir ~/.ai-memory/hooks
+#
+# If you only have docker:
+#   docker run --rm ai-memory install-hooks --agent claude-code \
+#       --hooks-dir ~/.ai-memory/hooks
+
+set -euo pipefail
+
+AGENT="claude-code"
+TO="$HOME/.ai-memory/hooks"
+REF="main"
+REPO="akitaonrails/ai-memory"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --agent)  AGENT="$2"; shift 2 ;;
+        --to)     TO="$2"; shift 2 ;;
+        --ref)    REF="$2"; shift 2 ;;
+        --repo)   REPO="$2"; shift 2 ;;
+        -h|--help)
+            sed -n '2,18p' "$0"
+            exit 0 ;;
+        *)
+            echo "unknown flag: $1" >&2
+            exit 64 ;;
+    esac
+done
+
+case "$AGENT" in
+    claude-code|codex|opencode) ;;
+    *)
+        echo "unsupported agent: $AGENT (expected claude-code | codex | opencode)" >&2
+        exit 64 ;;
+esac
+
+SCRIPTS=(
+    "session-start"
+    "user-prompt-submit"
+    "pre-tool-use"
+    "post-tool-use"
+    "pre-compact"
+    "stop"
+    "session-end"
+)
+
+DEST="$TO/$AGENT"
+mkdir -p "$DEST"
+
+echo "Installing ai-memory hooks for $AGENT into $DEST"
+for name in "${SCRIPTS[@]}"; do
+    url="https://raw.githubusercontent.com/$REPO/$REF/hooks/$AGENT/${name}.sh"
+    out="$DEST/${name}.sh"
+    if curl -fsSL "$url" -o "$out"; then
+        chmod +x "$out"
+        echo "  ✓ $name"
+    else
+        echo "  ✗ $name (failed to fetch $url)" >&2
+        exit 1
+    fi
+done
+
+echo
+echo "Done. Next steps:"
+echo
+echo "  1. Render the config snippet to merge into your agent's settings:"
+echo "       ai-memory install-hooks --agent $AGENT --hooks-dir $TO"
+echo "     (Or via docker if you don't have the binary locally:"
+echo "       docker run --rm $REPO:latest install-hooks --agent $AGENT --hooks-dir $TO)"
+echo
+echo "  2. If your server uses bearer-token auth, pass --auth-token <token>"
+echo "     to the install-hooks command so the snippet wires it in."

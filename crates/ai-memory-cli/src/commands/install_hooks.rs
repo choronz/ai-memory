@@ -102,27 +102,38 @@ fn repo_root_guess() -> Option<PathBuf> {
         .and_then(|p| p.parent()?.parent()?.parent().map(Path::to_path_buf))
 }
 
-fn render_claude_code(hooks_dir: &Path, server_url: &str, auth_token: Option<&str>) -> Result<()> {
-    let scripts: [(&str, &str); 7] = [
-        ("SessionStart", "session-start.sh"),
-        ("UserPromptSubmit", "user-prompt-submit.sh"),
-        ("PreToolUse", "pre-tool-use.sh"),
-        ("PostToolUse", "post-tool-use.sh"),
-        ("PreCompact", "pre-compact.sh"),
-        ("Stop", "stop.sh"),
-        ("SessionEnd", "session-end.sh"),
-    ];
+/// The seven Claude Code hook events ai-memory wires up, paired with
+/// the vendored script filename. Used by both `install-hooks` and
+/// `setup-agent`.
+pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 7] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("PreCompact", "pre-compact.sh"),
+    ("Stop", "stop.sh"),
+    ("SessionEnd", "session-end.sh"),
+];
 
+/// Build the Claude Code settings-fragment JSON for the given paths.
+///
+/// `emit_root` is the directory the JSON snippet will reference as
+/// the home of the hook scripts. It does NOT need to exist on the
+/// filesystem this binary is running on — that's exactly the docker
+/// case where `setup-agent` writes to a mounted volume and emits
+/// host-side paths.
+///
+/// `auth_token`, when set, lands in each hook's `env` block as
+/// `AI_MEMORY_AUTH_TOKEN`, which the shell scripts forward as
+/// `Authorization: Bearer …` to the server.
+pub(crate) fn build_claude_code_payload(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+) -> serde_json::Value {
     let mut hooks_block = serde_json::Map::new();
-    for (event, script) in scripts {
-        let abs = hooks_dir.join(script);
-        if !abs.exists() {
-            anyhow::bail!("missing hook script: {}", abs.display());
-        }
-        // The env block is passed to the hook command by Claude Code.
-        // We always include AI_MEMORY_HOOK_URL; when an auth token is
-        // configured, we also include AI_MEMORY_AUTH_TOKEN so the
-        // hook scripts can forward it as `Authorization: Bearer …`.
+    for (event, script) in CLAUDE_CODE_EVENTS {
+        let abs = emit_root.join(script);
         let mut env = serde_json::Map::new();
         env.insert(
             "AI_MEMORY_HOOK_URL".into(),
@@ -142,8 +153,27 @@ fn render_claude_code(hooks_dir: &Path, server_url: &str, auth_token: Option<&st
             }]),
         );
     }
-    let payload = json!({ "hooks": hooks_block });
+    json!({ "hooks": hooks_block })
+}
 
+fn render_claude_code(hooks_dir: &Path, server_url: &str, auth_token: Option<&str>) -> Result<()> {
+    // Soft check: warn (don't bail) if a script is missing. The user
+    // may be running this command inside docker against a host path
+    // that exists only on the host's filesystem — bailing would
+    // sabotage the docker-only flow `setup-agent` enables.
+    for (_, script) in CLAUDE_CODE_EVENTS {
+        let abs = hooks_dir.join(script);
+        if !abs.exists() {
+            eprintln!(
+                "# warning: {} not present on this filesystem. \
+                 If this command is running inside docker against a \
+                 host path, you can ignore this; otherwise extract \
+                 the scripts first with `ai-memory setup-agent`.",
+                abs.display()
+            );
+        }
+    }
+    let payload = build_claude_code_payload(hooks_dir, server_url, auth_token);
     let serialized =
         serde_json::to_string_pretty(&payload).context("serializing claude code hook config")?;
     println!("# Claude Code hook config — merge into ~/.claude/settings.json");
