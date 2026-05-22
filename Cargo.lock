@@ -95,6 +95,7 @@ dependencies = [
 name = "ai-memory-hooks"
 version = "0.1.0"
 dependencies = [
+ "ai-memory-consolidate",
  "ai-memory-core",
  "ai-memory-store",
  "ai-memory-wiki",

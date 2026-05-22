@@ -1,5 +1,8 @@
 //! `ai-memory serve` — MCP server with optional filesystem watcher.
 
+use std::sync::Arc;
+
+use ai_memory_consolidate::Consolidator;
 use ai_memory_hooks::{HookState, hook_router};
 use ai_memory_llm::{build_embedder, embedder_from_env, provider_from_env};
 use ai_memory_mcp::AiMemoryServer;
@@ -83,19 +86,33 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     if let Some(e) = embedder.clone() {
         server = server.with_embedder(e);
     }
-    if let Some(cfg) = provider_from_env()? {
+    // Build the consolidator (if LLM configured) once, then share the
+    // Arc between the MCP server (for `memory_consolidate` + lint) and
+    // the hook router (for PreCompact checkpointing).
+    let consolidator: Option<Arc<Consolidator>> = if let Some(cfg) = provider_from_env()? {
         let llm = ai_memory_llm::build_provider(cfg).context("building LLM provider from env")?;
         info!(
             provider = llm.name(),
             model = llm.model(),
-            "memory_consolidate + memory_lint LLM features enabled",
+            "memory_consolidate + PreCompact LLM checkpointing enabled",
         );
-        server = server.with_consolidator(wiki.clone(), llm);
+        let c = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        ));
+        server = server.with_consolidator_arc(wiki.clone(), llm, c.clone());
+        Some(c)
     } else {
         info!(
-            "AI_MEMORY_LLM_PROVIDER unset; memory_consolidate disabled, lint runs rule-based only"
+            "AI_MEMORY_LLM_PROVIDER unset; memory_consolidate disabled, PreCompact \
+             falls back to rule-based checkpoint, lint runs rule-based only"
         );
-    }
+        None
+    };
 
     match args.transport {
         TransportKind::Stdio => {
@@ -118,6 +135,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 writer: store.writer.clone(),
                 reader: store.reader.clone(),
                 wiki: wiki.clone(),
+                consolidator: consolidator.clone(),
             });
             let router = axum::Router::new()
                 .nest_service("/mcp", mcp_service)

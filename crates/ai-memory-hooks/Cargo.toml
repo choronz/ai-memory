@@ -12,6 +12,7 @@ description = "Hook payload schemas, sanitisation, and HTTP ingress for agent li
 ai-memory-core.workspace = true
 ai-memory-store.workspace = true
 ai-memory-wiki.workspace = true
+ai-memory-consolidate.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true

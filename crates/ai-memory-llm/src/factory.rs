@@ -172,12 +172,22 @@ pub fn embedder_from_env() -> LlmResult<Option<EmbedderConfig>> {
         },
         Err(_) => return Ok(None),
     };
-    let model = std::env::var("AI_MEMORY_EMBEDDING_MODEL")
-        .map_err(|_| LlmError::NotConfigured("AI_MEMORY_EMBEDDING_MODEL".into()))?;
-    let dim: u32 = std::env::var("AI_MEMORY_EMBEDDING_DIM")
-        .map_err(|_| LlmError::NotConfigured("AI_MEMORY_EMBEDDING_DIM".into()))?
-        .parse()
-        .map_err(|e| LlmError::NotConfigured(format!("AI_MEMORY_EMBEDDING_DIM: {e}")))?;
+    // Recommended embedder defaults; override via env. text-embedding-3-small
+    // is the price/quality sweet spot for OpenAI; voyage-3 is Voyage's
+    // current general-purpose model. Dim follows model when defaulted.
+    let model = match std::env::var("AI_MEMORY_EMBEDDING_MODEL") {
+        Ok(s) if !s.is_empty() => s,
+        _ => match provider {
+            EmbedderChoice::OpenAi => "text-embedding-3-small".to_string(),
+            EmbedderChoice::Voyage => "voyage-3".to_string(),
+        },
+    };
+    let dim: u32 = match std::env::var("AI_MEMORY_EMBEDDING_DIM") {
+        Ok(s) if !s.is_empty() => s
+            .parse()
+            .map_err(|e| LlmError::NotConfigured(format!("AI_MEMORY_EMBEDDING_DIM: {e}")))?,
+        _ => default_embedding_dim(provider, &model),
+    };
     let base_url = std::env::var("AI_MEMORY_EMBEDDING_BASE_URL").ok();
     let api_key = match provider {
         EmbedderChoice::OpenAi => std::env::var("OPENAI_API_KEY")
@@ -192,6 +202,19 @@ pub fn embedder_from_env() -> LlmResult<Option<EmbedderConfig>> {
         api_key: SecretString::from(api_key),
         base_url,
     }))
+}
+
+/// Default dim for known embedding models. Used when the operator
+/// omits `AI_MEMORY_EMBEDDING_DIM`. Falls back to a model-family
+/// default; unknown models still require an explicit dim.
+fn default_embedding_dim(provider: EmbedderChoice, model: &str) -> u32 {
+    match (provider, model) {
+        (EmbedderChoice::OpenAi, "text-embedding-3-small") => 1536,
+        (EmbedderChoice::OpenAi, "text-embedding-3-large") => 3072,
+        (EmbedderChoice::OpenAi, _) => 1536,
+        (EmbedderChoice::Voyage, "voyage-3-large") => 1024,
+        (EmbedderChoice::Voyage, _) => 1024,
+    }
 }
 
 /// Construct an `Arc<dyn LlmProvider>` matching the config.

@@ -203,12 +203,33 @@ impl AiMemoryServer {
         self
     }
 
+    /// Variant of [`Self::with_consolidator`] that accepts a pre-built
+    /// `Arc<Consolidator>`. Used when the same consolidator must be
+    /// shared with another subsystem (e.g. the hook router's
+    /// PreCompact branch) so both paths see the same handle.
+    #[must_use]
+    pub fn with_consolidator_arc(
+        mut self,
+        wiki: Wiki,
+        llm: Arc<dyn LlmProvider>,
+        consolidator: Arc<Consolidator>,
+    ) -> Self {
+        self.consolidator = Some(consolidator);
+        self.llm = Some(llm);
+        self.wiki = Some(wiki);
+        self
+    }
+
     /// Full-text search the wiki via FTS5. Returns up to `limit` hits with
     /// HTML-marked snippets and a rank score.
-    #[tool(description = "Full-text search the long-term memory wiki via FTS5. \
-        Returns up to `limit` matching pages with HTML-marked snippets and a \
-        rank score (lower rank = better match). Only the latest version of \
-        each page is searched.")]
+    #[tool(description = "Search the project's long-term memory wiki — \
+        prior sessions, decisions, gotchas, architecture notes captured \
+        by ai-memory across earlier runs. Call this BEFORE proposing \
+        designs, BEFORE answering 'why does X work this way', and \
+        whenever the user references prior work you don't recognise. \
+        FTS5 + (when configured) hybrid RRF re-ranking. Returns up to \
+        `limit` pages with HTML-marked snippets and a rank score \
+        (lower rank = better match). Only latest page versions.")]
     async fn memory_query(
         &self,
         Parameters(args): Parameters<QueryArgs>,
@@ -243,8 +264,11 @@ impl AiMemoryServer {
 
     /// Return the N most-recently-updated pages.
     #[tool(description = "Return the N most-recently-updated wiki pages \
-        (descending by updated_at). Useful for resuming a session: \
-        the agent can read the last few pages to see what was worked on.")]
+        for this project (descending by updated_at). Call this at the \
+        START of any session to see what the previous session was \
+        working on — even when no explicit handoff exists. Cheap, fast, \
+        no LLM cost. Pair with memory_query when you need to drill into \
+        specifics.")]
     async fn memory_recent(
         &self,
         Parameters(args): Parameters<RecentArgs>,
@@ -380,8 +404,11 @@ impl AiMemoryServer {
     /// Fetch the latest open handoff for this project (optionally filtered
     /// by cwd) and mark it accepted.
     #[tool(description = "Fetch the latest open handoff for this project \
-        and mark it accepted. Returns the summary + open questions + next \
-        steps so the agent can prepend them to the session context.")]
+        and mark it accepted. The SessionStart hook already calls this \
+        for you and prepends the result, so most sessions never need to \
+        invoke it directly. Call it manually only when the user asks \
+        'where did we leave off?' or when you suspect a handoff was \
+        missed. Returns summary + open questions + next steps.")]
     async fn memory_handoff_accept(
         &self,
         Parameters(args): Parameters<HandoffAcceptArgs>,

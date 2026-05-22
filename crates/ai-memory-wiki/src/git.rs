@@ -76,6 +76,14 @@ impl GitAdapter {
             debug!("working tree clean; no commit");
             return Ok(None);
         }
+        // Fresh repo with no HEAD yet: still skip the commit if there
+        // is nothing staged. Otherwise we'd produce an "initial" commit
+        // pointing at the empty tree, which surprises both `git log`
+        // and our own callers.
+        if repo.head().is_err() && index.len() == 0 {
+            debug!("fresh repo, empty index; no commit");
+            return Ok(None);
+        }
         let tree = repo.find_tree(tree_oid).map_err(map_git_err)?;
         let sig = Signature::now(COMMIT_AUTHOR_NAME, COMMIT_AUTHOR_EMAIL).map_err(map_git_err)?;
 

@@ -152,6 +152,19 @@ pub enum AgentKind {
     Other,
 }
 
+impl AgentKind {
+    /// Kebab-case wire string matching the serde representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude-code",
+            Self::Codex => "codex",
+            Self::OpenCode => "open-code",
+            Self::Other => "other",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
