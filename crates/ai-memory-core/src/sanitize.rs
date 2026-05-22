@@ -223,7 +223,12 @@ mod tests {
 
     #[test]
     fn scrubs_naked_google_api_key() {
-        let out = s().scrub("the key AIzaSyB3tCIXhU0PWMv8hugqbKwKP3ZxBhAFpaY is leaked");
+        // Fixture is the AIzaSy… shape with random hex padding, NOT a
+        // real key. A previous iteration of this file used a live
+        // value as the fixture; do not do that — automated scanners
+        // (GitGuardian, Google's own) will pick it up and you'll
+        // spend an hour rotating credentials.
+        let out = s().scrub("the key AIzaSy0123456789abcdefghijklmnopqrstuvwx is leaked");
         assert!(out.contains("[REDACTED]"));
         assert!(!out.contains("AIzaSy"));
     }

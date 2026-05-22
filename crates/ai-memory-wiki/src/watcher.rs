@@ -121,6 +121,14 @@ async fn run_loop(
     // First tick fires immediately; consume it so we don't reconcile at boot.
     tick.tick().await;
 
+    // Track consecutive failures of the reconciliation pass so we can
+    // surface a clear "watcher is degraded" event after a streak, in
+    // addition to the per-failure error log. Without this, a broken
+    // disk → store bridge can stay broken indefinitely with only a
+    // line per 30s in the warn stream — easy to miss in busy logs.
+    let mut consecutive_failures: u32 = 0;
+    const DEGRADED_AFTER: u32 = 5;
+
     loop {
         tokio::select! {
             biased;
@@ -132,8 +140,35 @@ async fn run_loop(
                 handle_event(&wiki, ws, proj, event).await;
             }
             _ = tick.tick() => {
-                if let Err(e) = reconcile(&wiki, ws, proj).await {
-                    warn!(error = %e, "reconciliation failed");
+                match reconcile(&wiki, ws, proj).await {
+                    Ok(()) => {
+                        if consecutive_failures > 0 {
+                            tracing::info!(
+                                prior_failures = consecutive_failures,
+                                "reconciliation recovered after consecutive failures",
+                            );
+                            consecutive_failures = 0;
+                        }
+                    }
+                    Err(e) => {
+                        consecutive_failures += 1;
+                        tracing::error!(
+                            error = %e,
+                            consecutive_failures,
+                            "reconciliation failed",
+                        );
+                        if consecutive_failures == DEGRADED_AFTER {
+                            tracing::error!(
+                                consecutive_failures,
+                                event = "watcher_degraded",
+                                "wiki↔store reconciliation has failed {DEGRADED_AFTER} \
+                                 times in a row; the disk and SQLite index may now be \
+                                 out of sync. Investigate disk permissions, DB lock \
+                                 contention, or filesystem health. The watcher will \
+                                 keep retrying every {RECONCILE_INTERVAL:?}.",
+                            );
+                        }
+                    }
                 }
             }
             else => return,

@@ -338,13 +338,28 @@ impl Drop for WriterInner {
     }
 }
 
+/// Dispatch one operation's result back to its caller. Logs a warn
+/// when the receiver was dropped (caller cancelled their `.await` or
+/// hit a timeout) so the operator sees backpressure / cancellation
+/// noise instead of silent loss. The result itself is consumed by
+/// the failed `send` and discarded — the caller's await has already
+/// returned a JoinError-shaped failure by this point.
+fn send_or_warn<T>(reply: oneshot::Sender<T>, result: T, op: &'static str) {
+    if reply.send(result).is_err() {
+        tracing::warn!(
+            op,
+            "writer reply dropped — caller cancelled or oneshot receiver closed"
+        );
+    }
+}
+
 fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
             WriteCmd::Shutdown => break,
             WriteCmd::GetOrCreateWorkspace { name, reply } => {
                 let result = ops::get_or_create_workspace(&mut conn, &name);
-                let _ = reply.send(result);
+                send_or_warn(reply, result, "get_or_create_workspace");
             }
             WriteCmd::GetOrCreateProject {
                 workspace_id,
@@ -358,19 +373,19 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     &name,
                     repo_path.as_deref(),
                 );
-                let _ = reply.send(result);
+                send_or_warn(reply, result, "get_or_create_project");
             }
             WriteCmd::UpsertPage { page, reply } => {
                 let result = ops::upsert_page(&mut conn, &page);
-                let _ = reply.send(result);
+                send_or_warn(reply, result, "upsert_page");
             }
             WriteCmd::UpsertPageBatch { pages, reply } => {
                 let result = ops::upsert_pages_batch(&mut conn, &pages);
-                let _ = reply.send(result);
+                send_or_warn(reply, result, "upsert_pages_batch");
             }
             WriteCmd::BeginSession { session, reply } => {
                 let result = ops::begin_session(&mut conn, &session);
-                let _ = reply.send(result);
+                send_or_warn(reply, result, "begin_session");
             }
             WriteCmd::EndSession {
                 session_id,
@@ -378,15 +393,15 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 reply,
             } => {
                 let result = ops::end_session(&mut conn, &session_id, summary_page_id.as_ref());
-                let _ = reply.send(result);
+                send_or_warn(reply, result, "end_session");
             }
             WriteCmd::InsertObservation { obs, reply } => {
                 let result = ops::insert_observation(&mut conn, &obs);
-                let _ = reply.send(result);
+                send_or_warn(reply, result, "insert_observation");
             }
             WriteCmd::InsertHandoff { handoff, reply } => {
                 let result = ops::insert_handoff(&mut conn, &handoff);
-                let _ = reply.send(result);
+                send_or_warn(reply, result, "insert_handoff");
             }
             WriteCmd::AcceptHandoff {
                 handoff_id,
@@ -400,22 +415,22 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     accepting_agent,
                     accepting_session.as_ref(),
                 );
-                let _ = reply.send(result);
+                send_or_warn(reply, result, "accept_handoff");
             }
             WriteCmd::BumpAccess { page_ids, reply } => {
                 let result = ops::bump_access_for_pages(&mut conn, &page_ids);
-                let _ = reply.send(result);
+                send_or_warn(reply, result, "bump_access_for_pages");
             }
             WriteCmd::SoftDeleteForDecay { page_ids, reply } => {
                 let result = ops::soft_delete_for_decay(&mut conn, &page_ids);
-                let _ = reply.send(result);
+                send_or_warn(reply, result, "soft_delete_for_decay");
             }
             WriteCmd::HardDeleteDecayed {
                 hard_delete_after_days,
                 reply,
             } => {
                 let result = ops::hard_delete_decayed_pages(&mut conn, hard_delete_after_days);
-                let _ = reply.send(result);
+                send_or_warn(reply, result, "hard_delete_decayed_pages");
             }
             WriteCmd::StoreEmbedding {
                 page_id,
@@ -433,7 +448,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     &model,
                     dim,
                 );
-                let _ = reply.send(result);
+                send_or_warn(reply, result, "store_embedding");
             }
         }
     }

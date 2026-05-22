@@ -564,3 +564,285 @@ fn audit(
     )?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    //! Focused unit tests for the load-bearing mutating SQL paths.
+    //!
+    //! `Store::open` exercises these incidentally through
+    //! integration tests, but specific edges — supersession on body
+    //! change, no-op on identical body, handoff state transitions,
+    //! end_session summary linkage, embedding PK-replacement —
+    //! deserve direct coverage so a regression surfaces with a
+    //! one-line diff instead of a cascading e2e failure.
+    use super::*;
+    use ai_memory_core::{NewHandoff, NewPage, NewSession, PagePath, Tier};
+    use rusqlite::Connection;
+    use tempfile::TempDir;
+
+    /// Open a fresh DB with migrations applied + a default workspace
+    /// and "scratch" project pre-created. Tuple-return keeps the
+    /// tempdir alive for the duration of the test.
+    fn fresh_db() -> (
+        TempDir,
+        Connection,
+        ai_memory_core::WorkspaceId,
+        ai_memory_core::ProjectId,
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.sqlite");
+        let mut conn = Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        crate::migrations::run(&mut conn).unwrap();
+        let ws = get_or_create_workspace(&mut conn, "default").unwrap();
+        let proj = get_or_create_project(&mut conn, &ws, "scratch", None).unwrap();
+        (tmp, conn, ws, proj)
+    }
+
+    fn page(
+        ws: ai_memory_core::WorkspaceId,
+        proj: ai_memory_core::ProjectId,
+        path: &str,
+        body: &str,
+    ) -> NewPage {
+        NewPage {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new(path).unwrap(),
+            title: "test".into(),
+            body: body.into(),
+            tier: Tier::Semantic,
+            frontmatter_json: serde_json::json!({}),
+            pinned: false,
+        }
+    }
+
+    /// Trickier path: upserting a page with a CHANGED body must
+    /// produce a NEW row and mark the previous row `is_latest = 0`.
+    /// This is the M7 supersession chain — the entire wiki versioning
+    /// guarantee rides on it.
+    #[test]
+    fn upsert_page_supersedes_on_body_change() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let id1 = upsert_page(&mut conn, &page(ws, proj, "notes/foo.md", "v1 body")).unwrap();
+        let id2 = upsert_page(&mut conn, &page(ws, proj, "notes/foo.md", "v2 body")).unwrap();
+
+        assert_ne!(id1, id2, "supersession must produce a new row id");
+
+        let latest_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pages WHERE path = ?1 AND is_latest = 1",
+                params!["notes/foo.md"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(latest_count, 1, "exactly one latest version expected");
+
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pages WHERE path = ?1",
+                params!["notes/foo.md"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 2, "old version must remain on disk for history");
+
+        // The newest row should point at the older as its predecessor
+        // (supersedes column), so chains are reconstructible.
+        let supersedes: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT supersedes FROM pages WHERE id = ?1",
+                params![&id2.as_bytes()[..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(supersedes.is_some(), "new row must link to its predecessor");
+    }
+
+    /// Idempotency: re-upserting the same body should NOT create a
+    /// second row. The watcher's reconciliation calls upsert_page on
+    /// every file on every tick — without this, a quiet repo would
+    /// accumulate spurious history every 30 seconds.
+    #[test]
+    fn upsert_page_is_noop_when_body_unchanged() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let p = page(ws, proj, "notes/foo.md", "same body");
+        let id1 = upsert_page(&mut conn, &p).unwrap();
+        let id2 = upsert_page(&mut conn, &p).unwrap();
+
+        assert_eq!(id1, id2, "identical body should not supersede");
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pages WHERE path = ?1",
+                params!["notes/foo.md"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 1, "no duplicate row for unchanged content");
+    }
+
+    /// Handoff state machine: insert → Open; accept_handoff → Accepted
+    /// with accepted_by stamped. Calling accept again must be safe
+    /// (idempotent at the DB level) because hooks fire-and-forget.
+    #[test]
+    fn accept_handoff_transitions_open_to_accepted() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let new = NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_session_id: None,
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            cwd: None,
+            summary: "test summary".into(),
+            open_questions: vec![],
+            next_steps: vec![],
+            files_touched: vec![],
+        };
+        let id = insert_handoff(&mut conn, &new).unwrap();
+
+        // Pre-state: Open, accepted_by NULL.
+        let (state, accepted_by): (String, Option<String>) = conn
+            .query_row(
+                "SELECT state, accepted_by FROM handoffs WHERE id = ?1",
+                params![&id.as_bytes()[..]],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "open");
+        assert!(accepted_by.is_none());
+
+        accept_handoff(&mut conn, &id, AgentKind::Codex, None).unwrap();
+        let (state, accepted_by): (String, Option<String>) = conn
+            .query_row(
+                "SELECT state, accepted_by FROM handoffs WHERE id = ?1",
+                params![&id.as_bytes()[..]],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "accepted");
+        assert_eq!(accepted_by.as_deref(), Some("codex"));
+
+        // Idempotency: accepting an already-accepted handoff must
+        // either succeed silently or fail clearly, never corrupt
+        // the row. (Current impl is a no-op UPDATE with a state
+        // guard.)
+        let second = accept_handoff(&mut conn, &id, AgentKind::Codex, None);
+        assert!(second.is_ok(), "double-accept must not error");
+    }
+
+    /// end_session links the synthesised summary page so callers can
+    /// jump straight from session row to summary.
+    #[test]
+    fn end_session_links_summary_page_when_provided() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let sid = SessionId::new();
+        begin_session(
+            &mut conn,
+            &NewSession {
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+            },
+        )
+        .unwrap();
+        let page_id = upsert_page(
+            &mut conn,
+            &page(ws, proj, "sessions/abc.md", "summary body"),
+        )
+        .unwrap();
+        end_session(&mut conn, &sid, Some(&page_id)).unwrap();
+
+        let summary: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT summary_page_id FROM sessions WHERE id = ?1",
+                params![&sid.as_bytes()[..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            summary.is_some(),
+            "summary_page_id must persist when supplied"
+        );
+        let bytes = summary.unwrap();
+        assert_eq!(bytes.len(), 16);
+        assert_eq!(&bytes[..], &page_id.as_bytes()[..]);
+    }
+
+    /// end_session without a summary leaves the column NULL — the
+    /// session ended but no page was synthesised (e.g. zero
+    /// observations recorded). This must not be confused with the
+    /// summary-linked case.
+    #[test]
+    fn end_session_without_summary_page_id_leaves_null() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let sid = SessionId::new();
+        begin_session(
+            &mut conn,
+            &NewSession {
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+            },
+        )
+        .unwrap();
+        end_session(&mut conn, &sid, None).unwrap();
+        let summary: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT summary_page_id FROM sessions WHERE id = ?1",
+                params![&sid.as_bytes()[..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(summary.is_none());
+    }
+
+    /// Embeddings are keyed by page_id (PK). Re-storing for the same
+    /// page must REPLACE, not duplicate — otherwise `ai-memory embed
+    /// --reembed` would multiply rows on each run.
+    #[test]
+    fn store_embedding_replaces_existing_row() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let pid = upsert_page(&mut conn, &page(ws, proj, "notes/x.md", "body")).unwrap();
+        store_embedding(
+            &mut conn,
+            &pid,
+            &vec![0u8; 1536 * 4],
+            "test",
+            "model-a",
+            1536,
+        )
+        .unwrap();
+        store_embedding(
+            &mut conn,
+            &pid,
+            &vec![1u8; 1536 * 4],
+            "test",
+            "model-b",
+            1536,
+        )
+        .unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM page_embeddings WHERE page_id = ?1",
+                params![&pid.as_bytes()[..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "embedding row must be replaced, not duplicated");
+
+        let model: String = conn
+            .query_row(
+                "SELECT model FROM page_embeddings WHERE page_id = ?1",
+                params![&pid.as_bytes()[..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(model, "model-b", "latest model metadata wins");
+    }
+}
