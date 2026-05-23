@@ -77,11 +77,42 @@ pub(crate) fn build_claude_code_payload(
     build_hook_payload(&CLAUDE_CODE_EVENTS, emit_root, server_url, auth_token)
 }
 
+/// Different agents nest hook entries differently. Two shapes
+/// cover everyone we support:
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HookShape {
+    /// Claude Code / Codex / Gemini CLI:
+    /// `"E": [ { "matcher":"", "hooks":[ {"type":"command",
+    /// "command":"..."} ] } ]`
+    /// Gemini CLI tolerates (but doesn't require) a sibling
+    /// `sequential` key at the outer level — we don't set it.
+    Nested,
+    /// Cursor: `"e": [ { "type":"command", "command":"...",
+    /// "matcher":"" } ]` (no inner `hooks` array). Cursor's
+    /// `hooks.json` also requires a sibling `version: 1` key at
+    /// the top level — handled by the caller's apply path.
+    Flat,
+}
+
+/// One hook profile = (event vocabulary, JSON shape). Each agent
+/// gets its own constant so the install path is purely data-
+/// driven: pick the profile, build the payload, write the file.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HookProfile {
+    /// `(EventName, script_basename)` tuples in the order the
+    /// agent surfaces them. Event names are case-sensitive and
+    /// agent-specific — Claude Code uses `SessionStart` while
+    /// Cursor uses `sessionStart`. The script basename resolves
+    /// against `hooks/<agent-dir>/`.
+    pub events: &'static [(&'static str, &'static str)],
+    /// JSON shape the file uses.
+    pub shape: HookShape,
+}
+
 /// Codex's hook-event vocabulary (per the openai/codex source —
 /// see `codex-rs/config/src/hooks_tests.rs`). Same shape as Claude
-/// Code's seven events, EXCEPT: Codex has no `SessionEnd` (it uses
-/// `Stop` for both turn-end and session-end signalling). The other
-/// six events line up 1:1.
+/// Code's six common events, EXCEPT: Codex has no `SessionEnd` (it
+/// uses `Stop` for both turn-end and session-end signalling).
 pub(crate) const CODEX_EVENTS: [(&str, &str); 6] = [
     ("SessionStart", "session-start.sh"),
     ("UserPromptSubmit", "user-prompt-submit.sh"),
@@ -91,21 +122,97 @@ pub(crate) const CODEX_EVENTS: [(&str, &str); 6] = [
     ("Stop", "stop.sh"),
 ];
 
-/// Build a Codex-flavoured hook payload. Same JSON shape as Claude
-/// Code's (verified against `openai/codex/codex-rs/config/src/hooks_tests.rs`)
-/// minus `SessionEnd`, which Codex doesn't have.
+/// Cursor's hook-event vocabulary (per
+/// <https://cursor.com/docs/agent/hooks>). camelCase event names
+/// and a FLAT JSON shape (no inner `hooks: [...]` wrapper).
+/// `beforeSubmitPrompt` maps to ai-memory's `user-prompt-submit`
+/// concept. Cursor has no `userPromptSubmit` event.
+pub(crate) const CURSOR_EVENTS: [(&str, &str); 7] = [
+    ("sessionStart", "session-start.sh"),
+    ("sessionEnd", "session-end.sh"),
+    ("beforeSubmitPrompt", "user-prompt-submit.sh"),
+    ("preToolUse", "pre-tool-use.sh"),
+    ("postToolUse", "post-tool-use.sh"),
+    ("preCompact", "pre-compact.sh"),
+    ("stop", "stop.sh"),
+];
+
+/// Gemini CLI's hook-event vocabulary (per
+/// <https://geminicli.com/docs/hooks/reference>). Event names use
+/// PascalCase. The vocab DIFFERS from Claude Code's:
+///   - `BeforeTool` / `AfterTool` instead of `PreToolUse` / `PostToolUse`
+///   - `PreCompress` instead of `PreCompact`
+///   - No `UserPromptSubmit` equivalent (skipped)
+///   - No `Stop` event (SessionEnd covers it)
+pub(crate) const GEMINI_EVENTS: [(&str, &str); 5] = [
+    ("SessionStart", "session-start.sh"),
+    ("SessionEnd", "session-end.sh"),
+    ("BeforeTool", "pre-tool-use.sh"),
+    ("AfterTool", "post-tool-use.sh"),
+    ("PreCompress", "pre-compact.sh"),
+];
+
+/// Per-agent profile constants. Add a new agent by adding one of
+/// these + a script-dir name + a config-file path resolver — the
+/// payload-build path picks up the rest from `shape`.
+// Defined for completeness alongside the other profiles; the Claude
+// Code apply path still goes through `build_claude_code_payload`
+// (kept stable for the existing setup-agent emitter). Marked
+// `allow(dead_code)` so cargo doesn't complain — anyone adding a
+// new caller can switch to `build_profile_payload(&CLAUDE_CODE_PROFILE, …)`.
+#[allow(dead_code)]
+pub(crate) const CLAUDE_CODE_PROFILE: HookProfile = HookProfile {
+    events: &CLAUDE_CODE_EVENTS,
+    shape: HookShape::Nested,
+};
+pub(crate) const CODEX_PROFILE: HookProfile = HookProfile {
+    events: &CODEX_EVENTS,
+    shape: HookShape::Nested,
+};
+pub(crate) const CURSOR_PROFILE: HookProfile = HookProfile {
+    events: &CURSOR_EVENTS,
+    shape: HookShape::Flat,
+};
+pub(crate) const GEMINI_PROFILE: HookProfile = HookProfile {
+    events: &GEMINI_EVENTS,
+    shape: HookShape::Nested,
+};
+
+/// Build a Codex-flavoured hook payload. Thin alias for back-compat;
+/// new code should call `build_profile_payload(&CODEX_PROFILE, …)`.
 pub(crate) fn build_codex_payload(
     emit_root: &Path,
     server_url: &str,
     auth_token: Option<&str>,
 ) -> serde_json::Value {
-    build_hook_payload(&CODEX_EVENTS, emit_root, server_url, auth_token)
+    build_profile_payload(&CODEX_PROFILE, emit_root, server_url, auth_token)
 }
 
-/// Shared helper. Given a list of `(event_name, script_basename)`,
-/// emit `{ "hooks": { "EventName": [matcher+inner-hooks] } }`.
+/// Build a hook payload for `profile`. The output is always
+/// `{ "hooks": { "<EventName>": <profile-specific-array> } }`; the
+/// caller is responsible for any sibling top-level keys (e.g.
+/// Cursor's `"version": 1`).
+pub(crate) fn build_profile_payload(
+    profile: &HookProfile,
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+) -> serde_json::Value {
+    build_hook_payload_inner(profile.events, profile.shape, emit_root, server_url, auth_token)
+}
+
 fn build_hook_payload(
     events: &[(&str, &str)],
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+) -> serde_json::Value {
+    build_hook_payload_inner(events, HookShape::Nested, emit_root, server_url, auth_token)
+}
+
+fn build_hook_payload_inner(
+    events: &[(&str, &str)],
+    shape: HookShape,
     emit_root: &Path,
     server_url: &str,
     auth_token: Option<&str>,
@@ -145,16 +252,21 @@ fn build_hook_payload(
         // Empty matcher = fire on every event of this kind. Right
         // for ai-memory's capture hooks (every prompt, every tool
         // call, every session boundary).
-        hooks_block.insert(
-            (*event).to_string(),
-            json!([{
+        let entry = match shape {
+            HookShape::Nested => json!([{
                 "matcher": "",
                 "hooks": [{
                     "type": "command",
                     "command": command,
                 }],
             }]),
-        );
+            HookShape::Flat => json!([{
+                "type": "command",
+                "command": command,
+                "matcher": "",
+            }]),
+        };
+        hooks_block.insert((*event).to_string(), entry);
     }
     json!({ "hooks": hooks_block })
 }
@@ -227,6 +339,90 @@ mod tests {
     /// outer level — which made Claude Code refuse to load
     /// settings.json with "hooks: Expected array, but received
     /// undefined" on every event.
+    #[test]
+    fn cursor_payload_uses_flat_shape() {
+        // Flat shape: no inner `hooks: [...]` array; each event
+        // maps to an array of {type, command, matcher} entries.
+        let root = PathBuf::from("/host/hooks/cursor");
+        let v =
+            build_profile_payload(&CURSOR_PROFILE, &root, "http://localhost:49374", Some("tok"));
+        let session_start = v
+            .pointer("/hooks/sessionStart/0")
+            .and_then(|e| e.as_object())
+            .expect("missing /hooks/sessionStart/0");
+        assert_eq!(
+            session_start.get("type").and_then(|t| t.as_str()),
+            Some("command"),
+            "Cursor flat entries put `type` at the outer level"
+        );
+        assert!(
+            session_start.contains_key("command"),
+            "Cursor flat entries put `command` at the outer level"
+        );
+        // No nested hooks array.
+        assert!(
+            !session_start.contains_key("hooks"),
+            "Cursor must NOT use the nested hooks shape — found one: {session_start:?}"
+        );
+        // Auth token still inlined into command.
+        let cmd = session_start
+            .get("command")
+            .and_then(|c| c.as_str())
+            .unwrap();
+        assert!(cmd.contains("AI_MEMORY_AUTH_TOKEN=tok"));
+        // Events are camelCase, not PascalCase.
+        let events: Vec<&str> = v
+            .pointer("/hooks")
+            .and_then(|h| h.as_object())
+            .map(|o| o.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        assert!(events.contains(&"sessionStart"));
+        assert!(events.contains(&"preToolUse"));
+        assert!(
+            !events.contains(&"SessionStart"),
+            "Cursor uses camelCase, not PascalCase"
+        );
+    }
+
+    #[test]
+    fn gemini_payload_uses_nested_shape_with_gemini_event_names() {
+        // Same nested shape as Claude Code, but DIFFERENT event
+        // names (BeforeTool / AfterTool / PreCompress; no
+        // UserPromptSubmit, no Stop).
+        let root = PathBuf::from("/host/hooks/gemini-cli");
+        let v =
+            build_profile_payload(&GEMINI_PROFILE, &root, "http://localhost:49374", Some("tok"));
+        let session_start = v
+            .pointer("/hooks/SessionStart/0")
+            .and_then(|e| e.as_object())
+            .expect("missing /hooks/SessionStart/0");
+        // Outer level has matcher + hooks (nested shape).
+        assert!(session_start.contains_key("matcher"));
+        let inner = session_start
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .unwrap();
+        assert_eq!(inner.len(), 1);
+        let entry = inner[0].as_object().unwrap();
+        assert_eq!(entry.get("type").and_then(|t| t.as_str()), Some("command"));
+        // Event vocab: Gemini-specific names present, Claude Code-
+        // only names absent.
+        let events: Vec<&str> = v
+            .pointer("/hooks")
+            .and_then(|h| h.as_object())
+            .map(|o| o.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        for expected in ["SessionStart", "SessionEnd", "BeforeTool", "AfterTool", "PreCompress"] {
+            assert!(events.contains(&expected), "missing Gemini event {expected}");
+        }
+        for unexpected in ["PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop", "PreCompact"] {
+            assert!(
+                !events.contains(&unexpected),
+                "Gemini should NOT have CC-only event {unexpected}; got {events:?}"
+            );
+        }
+    }
+
     #[test]
     fn claude_code_payload_uses_matcher_plus_inner_hooks_shape() {
         let root = PathBuf::from("/host/hooks/claude-code");

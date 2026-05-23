@@ -48,7 +48,17 @@ pub fn run(_config: &Config, args: SetupAgentArgs) -> Result<()> {
     let agent_sub = match args.agent {
         AgentChoice::ClaudeCode => "claude-code",
         AgentChoice::Codex => "codex",
+        AgentChoice::Cursor => "cursor",
+        AgentChoice::GeminiCli => "gemini-cli",
         AgentChoice::OpenCode => "opencode",
+        AgentChoice::Openclaw => {
+            anyhow::bail!(
+                "OpenClaw has no lifecycle hooks (only HTTP webhooks); \
+                 `setup-agent --agent openclaw` is not applicable. Use \
+                 `install-mcp --client openclaw --apply` for the MCP config \
+                 only."
+            );
+        }
     };
 
     let source = resolve_source(args.source.as_deref(), agent_sub)?;
@@ -101,7 +111,16 @@ pub fn run(_config: &Config, args: SetupAgentArgs) -> Result<()> {
 
     match args.agent {
         AgentChoice::ClaudeCode => emit_claude_code(&emit_root, &args)?,
-        AgentChoice::Codex | AgentChoice::OpenCode => emit_other(&emit_root, agent_sub, &args),
+        AgentChoice::Codex | AgentChoice::Cursor | AgentChoice::GeminiCli | AgentChoice::OpenCode => {
+            emit_other(&emit_root, agent_sub, &args);
+        }
+        AgentChoice::Openclaw => {
+            // Unreachable — the early bail at the top of run()
+            // catches openclaw before we get here. Defensive
+            // arm so the match stays exhaustive if the bail is
+            // ever removed.
+            unreachable!("openclaw handled by the early bail above");
+        }
     }
     Ok(())
 }

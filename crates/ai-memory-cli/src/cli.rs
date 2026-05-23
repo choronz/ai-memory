@@ -278,8 +278,18 @@ pub enum AgentChoice {
     ClaudeCode,
     /// OpenAI Codex CLI.
     Codex,
-    /// OpenCode (open-source coding agent).
+    /// Cursor IDE agent — JSON-config hooks in `~/.cursor/hooks.json`.
+    Cursor,
+    /// Google Gemini CLI — JSON-config hooks in `~/.gemini/settings.json`.
+    GeminiCli,
+    /// OpenCode (open-source coding agent) — TypeScript plugin hooks
+    /// under `~/.config/opencode/plugins/`. Print-only for now; the
+    /// plugin generator lands in a follow-up commit.
     OpenCode,
+    /// OpenClaw personal AI gateway — **no lifecycle hooks**;
+    /// `install-hooks --apply --agent openclaw` prints an
+    /// explanation and exits without mutating anything.
+    Openclaw,
 }
 
 /// MCP client to render configuration for. Includes both the
