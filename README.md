@@ -1,4 +1,9 @@
-# ai-memory
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo-dark.png">
+    <img alt="ai-memory" src="docs/logo.png" width="480">
+  </picture>
+</p>
 
 > Long-term memory for AI coding agents. Quit Claude Code mid-task,
 > start OpenAI Codex in the same directory, continue without
