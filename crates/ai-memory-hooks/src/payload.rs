@@ -4,12 +4,24 @@ use ai_memory_core::{AgentKind, ObservationKind};
 use serde::{Deserialize, Serialize};
 
 /// Query-string parameters on `POST /hook`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct HookQuery {
     /// Lifecycle event identifier (kebab-case or snake_case).
     pub event: String,
     /// Agent CLI identifier (`claude-code`, `codex`, `open-code`, `omp`).
     pub agent: Option<String>,
+    /// Working directory of the agent at the time the hook fired.
+    /// Most agents put this in the JSON body, but accepting it on the
+    /// query string too lets `curl` / tests / non-Claude bridges
+    /// populate it without constructing a body envelope.
+    pub cwd: Option<String>,
+    /// Workspace name override (typically declared by the agent's
+    /// host-side hook via a `.ai-memory.toml` walk-up). When `None`
+    /// the server falls back to `DEFAULT_WORKSPACE_NAME`.
+    pub workspace: Option<String>,
+    /// Project name override (same source as `workspace`). When
+    /// `None` the server falls back to `basename(cwd)`.
+    pub project: Option<String>,
 }
 
 /// Coalesced view of an incoming hook event after light parsing of the
@@ -26,6 +38,12 @@ pub struct HookEnvelope {
     pub session_id: Option<String>,
     /// Current working directory at the time of the event.
     pub cwd: Option<String>,
+    /// Workspace name override declared by the hook (via marker file
+    /// walk-up). Empty / `None` defers to `DEFAULT_WORKSPACE_NAME`.
+    pub workspace_override: Option<String>,
+    /// Project name override declared by the hook. Empty / `None`
+    /// defers to `basename(cwd)`.
+    pub project_override: Option<String>,
     /// Optional title hint extracted from the body.
     pub title_hint: Option<String>,
     /// Optional body excerpt extracted from the agent's raw payload.
@@ -135,7 +153,7 @@ impl HookEnvelope {
                     ],
                 )
             });
-        let cwd = extract_string(&raw, &["cwd", "current_dir", "working_dir", "directory"])
+        let body_cwd = extract_string(&raw, &["cwd", "current_dir", "working_dir", "directory"])
             .or_else(|| {
                 extract_string_path(
                     &raw,
@@ -150,6 +168,12 @@ impl HookEnvelope {
                     ],
                 )
             });
+        // Body cwd wins over the query-string fallback: the body is
+        // what agent CLIs natively send, so any query-string `cwd` is
+        // a bridge / test override that should defer to live data.
+        let cwd = body_cwd.or_else(|| query.cwd.filter(|s| !s.is_empty()));
+        let workspace_override = query.workspace.filter(|s| !s.is_empty());
+        let project_override = query.project.filter(|s| !s.is_empty());
         let title_hint = best_title_hint(event, &raw);
         let body_excerpt = best_body_excerpt(event, &raw);
         Self {
@@ -157,6 +181,8 @@ impl HookEnvelope {
             agent,
             session_id,
             cwd,
+            workspace_override,
+            project_override,
             title_hint,
             body_excerpt,
             raw,
@@ -311,6 +337,7 @@ mod tests {
         let q = HookQuery {
             event: "session-start".into(),
             agent: Some("claude-code".into()),
+            ..Default::default()
         };
         let raw = serde_json::json!({
             "session_id": "abc-123",
@@ -333,6 +360,7 @@ mod tests {
         let q = HookQuery {
             event: "post-tool-use".into(),
             agent: Some("open-code".into()),
+            ..Default::default()
         };
         let raw = serde_json::json!({
             "sessionID": "ses_abc123",
@@ -352,6 +380,7 @@ mod tests {
         let q = HookQuery {
             event: "post-tool-use".into(),
             agent: Some("open-code".into()),
+            ..Default::default()
         };
         let raw = serde_json::json!({
             "hook_event_name": "post-tool-use",
@@ -384,6 +413,7 @@ mod tests {
         let q = HookQuery {
             event: "session-start".into(),
             agent: Some("open-code".into()),
+            ..Default::default()
         };
         let raw = serde_json::json!({
             "event": {
@@ -436,6 +466,7 @@ mod tests {
         let q = HookQuery {
             event: "stop".into(),
             agent: Some("claude-code".into()),
+            ..Default::default()
         };
         let env = HookEnvelope::from_query_and_body(q, serde_json::json!({}));
         assert_eq!(env.event, HookEvent::Stop);
@@ -452,6 +483,7 @@ mod tests {
         let q = HookQuery {
             event: "user-prompt".into(),
             agent: Some("claude-code".into()),
+            ..Default::default()
         };
         let raw = serde_json::json!({ "garbage": 42 });
         let env = HookEnvelope::from_query_and_body(q, raw);
@@ -469,6 +501,7 @@ mod tests {
         let q = HookQuery {
             event: "post-tool-use".into(),
             agent: Some("claude-code".into()),
+            ..Default::default()
         };
         for raw in [
             serde_json::json!(null),
@@ -493,6 +526,7 @@ mod tests {
         let q = HookQuery {
             event: "session-end".into(),
             agent: None,
+            ..Default::default()
         };
         let env = HookEnvelope::from_query_and_body(q, serde_json::json!({}));
         assert_eq!(env.agent, AgentKind::Other);
@@ -507,6 +541,7 @@ mod tests {
         let q = HookQuery {
             event: "user-prompt".into(),
             agent: Some("claude-code".into()),
+            ..Default::default()
         };
         // Multi-line prompt → title is the first line only.
         let env = HookEnvelope::from_query_and_body(
@@ -528,6 +563,7 @@ mod tests {
         let q = HookQuery {
             event: "post-tool-use".into(),
             agent: Some("claude-code".into()),
+            ..Default::default()
         };
         let output = format!("{}é", "x".repeat(1_999));
         let env = HookEnvelope::from_query_and_body(

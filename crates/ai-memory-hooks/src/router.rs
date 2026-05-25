@@ -33,6 +33,12 @@ use crate::log;
 use crate::payload::{HookEnvelope, HookEvent, HookQuery, parse_agent};
 use crate::synth::synthesize_session_page;
 
+/// Resolved-project cache: `(cwd, workspace_override, project_override)`
+/// keyed map, shared behind a Tokio mutex so the router can be cloned
+/// freely without losing the in-flight cache hits.
+pub type ProjectCache =
+    Arc<tokio::sync::Mutex<HashMap<(String, String, String), (WorkspaceId, ProjectId)>>>;
+
 /// Shared state passed to the hook handler.
 #[derive(Clone)]
 pub struct HookState {
@@ -55,11 +61,12 @@ pub struct HookState {
     /// the store. Same handle is also held by the wiki and consolidator
     /// so scrubbing happens at every write boundary.
     pub sanitizer: Sanitizer,
-    /// Cache of `cwd → (workspace_id, project_id)` resolved on first
-    /// sight. Avoids a SQLite round-trip for every hook event from the
-    /// same agent session. Keyed by the raw cwd string; no
-    /// canonicalisation — two symlinked paths are separate buckets.
-    pub project_cache: Arc<tokio::sync::Mutex<HashMap<String, (WorkspaceId, ProjectId)>>>,
+    /// Cache of `(cwd, workspace_override, project_override) → ids`.
+    /// The composite key avoids poisoning between callers that resolve
+    /// the same `cwd` with and without an override during a hook-script
+    /// upgrade window. Each tuple element defaults to the empty string
+    /// when absent so missing overrides collapse into a single slot.
+    pub project_cache: ProjectCache,
     /// Pointer shared with the MCP server. Every cwd-resolved event
     /// publishes its project here so the read tools (which have no cwd
     /// of their own) default to the project the user is actually in
@@ -87,7 +94,7 @@ async fn handle_hook(
 }
 
 /// Query params for `GET /handoff`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct HandoffQuery {
     /// Identifier of the agent fetching the handoff. Used to mark the
     /// handoff as accepted-by; defaults to `Other` if unrecognised.
@@ -96,6 +103,14 @@ pub struct HandoffQuery {
     /// cwd matches this string are returned. Note: the cwd string is
     /// not canonicalized; symlinked paths must match byte-for-byte.
     pub cwd: Option<String>,
+    /// Workspace override (mirror of `HookQuery.workspace`). Lets the
+    /// `session-start` hook fetch the handoff for the same `(workspace,
+    /// project)` pair the marker file declared, without depending on
+    /// the MCP `active_project` cache (which only populates after the
+    /// first hook event of the session).
+    pub workspace: Option<String>,
+    /// Project override (mirror of `HookQuery.project`).
+    pub project: Option<String>,
 }
 
 /// Synchronous endpoint used by `session-start.sh` to discover any
@@ -126,7 +141,13 @@ async fn fetch_and_accept_handoff(
     query: HandoffQuery,
 ) -> anyhow::Result<Option<String>> {
     let agent = query.agent.as_deref().map_or(AgentKind::Other, parse_agent);
-    let (ws, proj) = resolve_project_ids(state, query.cwd.as_deref()).await?;
+    let (ws, proj) = resolve_project_ids(
+        state,
+        query.cwd.as_deref(),
+        query.workspace.as_deref(),
+        query.project.as_deref(),
+    )
+    .await?;
     let handoff = state
         .reader
         .latest_open_handoff(ws, proj, query.cwd)
@@ -202,20 +223,38 @@ fn render_handoff_markdown(h: &Handoff) -> String {
 
 /// Resolve the `(workspace_id, project_id)` pair for a hook event.
 ///
-/// When `cwd` is present, derives `project_name = basename(cwd)` and
-/// upserts it under the `default` workspace (cached to avoid a SQLite
-/// round-trip per event). Falls back to the server's default IDs when
-/// `cwd` is `None` or empty.
+/// Precedence:
+/// 1. `workspace_override` (typically declared by the agent's host-side
+///    hook via a `.ai-memory.toml` walk-up) OR `DEFAULT_WORKSPACE_NAME`.
+/// 2. `project_override` OR `basename(cwd)` OR fallback to
+///    `state.project_id` (when `cwd` is also unavailable).
+///
+/// Cache key is `(cwd, workspace_override, project_override)` so the
+/// same `cwd` resolved with and without an override (e.g. during a
+/// hook-script upgrade window) doesn't poison each other's slot.
 async fn resolve_project_ids(
     state: &HookState,
     cwd: Option<&str>,
+    workspace_override: Option<&str>,
+    project_override: Option<&str>,
 ) -> anyhow::Result<(WorkspaceId, ProjectId)> {
-    let Some(cwd) = cwd.filter(|s| !s.is_empty()) else {
+    let cwd_norm = cwd.filter(|s| !s.is_empty()).map(str::to_string);
+
+    // Without cwd AND without a project override, there's nothing to
+    // resolve — fall through to the server defaults.
+    if cwd_norm.is_none() && project_override.is_none() {
         return Ok((state.workspace_id, state.project_id));
-    };
+    }
+
+    let cache_key = (
+        cwd_norm.clone().unwrap_or_default(),
+        workspace_override.unwrap_or("").to_string(),
+        project_override.unwrap_or("").to_string(),
+    );
+
     {
         let cache = state.project_cache.lock().await;
-        if let Some(ids) = cache.get(cwd) {
+        if let Some(ids) = cache.get(&cache_key) {
             // Republish on every hit: a cache hit still means the agent
             // is active in this project *now*, which is exactly what the
             // MCP read tools need as their default.
@@ -223,35 +262,44 @@ async fn resolve_project_ids(
             return Ok(*ids);
         }
     }
-    let Some(project_name) = std::path::Path::new(cwd)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map(str::to_string)
-        .filter(|s| !s.is_empty())
-    else {
-        // Defensive: if basename derivation fails (e.g. cwd is "/"),
-        // fall back to the server defaults rather than hard-erroring.
-        state
-            .active_project
-            .set(state.workspace_id, state.project_id);
-        return Ok((state.workspace_id, state.project_id));
+
+    let workspace_name = workspace_override
+        .unwrap_or(DEFAULT_WORKSPACE_NAME)
+        .to_string();
+
+    let project_name = match (project_override, cwd_norm.as_deref()) {
+        (Some(p), _) => p.to_string(),
+        (None, Some(c)) => match std::path::Path::new(c)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+        {
+            Some(name) => name,
+            None => {
+                // Defensive: basename derivation failed (e.g. cwd is "/").
+                // Fall back to server defaults rather than hard-erroring.
+                state
+                    .active_project
+                    .set(state.workspace_id, state.project_id);
+                return Ok((state.workspace_id, state.project_id));
+            }
+        },
+        (None, None) => unreachable!("guarded above by the early return"),
     };
+
     let ws = state
         .writer
-        .get_or_create_workspace(DEFAULT_WORKSPACE_NAME.to_string())
+        .get_or_create_workspace(workspace_name)
         .await
         .map_err(|e| anyhow::anyhow!("get_or_create_workspace: {e}"))?;
     let proj = state
         .writer
-        .get_or_create_project(ws, project_name, Some(cwd.to_string()))
+        .get_or_create_project(ws, project_name, cwd_norm.clone())
         .await
         .map_err(|e| anyhow::anyhow!("get_or_create_project: {e}"))?;
     let ids = (ws, proj);
-    state
-        .project_cache
-        .lock()
-        .await
-        .insert(cwd.to_string(), ids);
+    state.project_cache.lock().await.insert(cache_key, ids);
     state.active_project.set(ws, proj);
     Ok(ids)
 }
@@ -264,7 +312,13 @@ async fn process_envelope(state: Arc<HookState>, env: HookEnvelope) {
 
 async fn process(state: &HookState, env: HookEnvelope) -> anyhow::Result<()> {
     let session_id = resolve_session_id(&env)?;
-    let (ws, proj) = resolve_project_ids(state, env.cwd.as_deref()).await?;
+    let (ws, proj) = resolve_project_ids(
+        state,
+        env.cwd.as_deref(),
+        env.workspace_override.as_deref(),
+        env.project_override.as_deref(),
+    )
+    .await?;
 
     // Hooks are fire-and-forget and may arrive out of order. Begin the
     // session idempotently before every observation so a resumed agent
@@ -586,13 +640,15 @@ mod tests {
         let state = make_state(&tmp).await;
 
         // Event from /home/user/project-alpha.
-        let (ws_a, proj_a) = resolve_project_ids(&state, Some("/home/user/project-alpha"))
-            .await
-            .unwrap();
+        let (ws_a, proj_a) =
+            resolve_project_ids(&state, Some("/home/user/project-alpha"), None, None)
+                .await
+                .unwrap();
         // Event from /home/user/project-beta.
-        let (ws_b, proj_b) = resolve_project_ids(&state, Some("/home/user/project-beta"))
-            .await
-            .unwrap();
+        let (ws_b, proj_b) =
+            resolve_project_ids(&state, Some("/home/user/project-beta"), None, None)
+                .await
+                .unwrap();
 
         // Projects must be distinct; workspace is the same (`default`).
         assert_ne!(proj_a, proj_b, "different cwds → different projects");
@@ -613,12 +669,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let state = make_state(&tmp).await;
 
-        let (ws, proj) = resolve_project_ids(&state, None).await.unwrap();
+        let (ws, proj) = resolve_project_ids(&state, None, None, None).await.unwrap();
         assert_eq!(ws, state.workspace_id);
         assert_eq!(proj, state.project_id);
 
         // Likewise for an empty string.
-        let (ws2, proj2) = resolve_project_ids(&state, Some("")).await.unwrap();
+        let (ws2, proj2) = resolve_project_ids(&state, Some(""), None, None)
+            .await
+            .unwrap();
         assert_eq!(ws2, state.workspace_id);
         assert_eq!(proj2, state.project_id);
 
@@ -633,7 +691,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let state = make_state(&tmp).await;
 
-        let (ws, proj) = resolve_project_ids(&state, Some("/")).await.unwrap();
+        let (ws, proj) = resolve_project_ids(&state, Some("/"), None, None)
+            .await
+            .unwrap();
         assert_eq!(ws, state.workspace_id);
         assert_eq!(proj, state.project_id);
         assert_eq!(state.active_project.get(), Some((ws, proj)));
@@ -645,6 +705,7 @@ mod tests {
             HookQuery {
                 event: "post-tool-use".into(),
                 agent: Some("opencode".into()),
+                ..Default::default()
             },
             serde_json::json!({ "sessionID": "opencode-session-123" }),
         );
@@ -665,17 +726,25 @@ mod tests {
         let cwd = "/home/user/cached-project";
 
         // First call — populates the cache.
-        let (_, proj_first) = resolve_project_ids(&state, Some(cwd)).await.unwrap();
+        let (_, proj_first) = resolve_project_ids(&state, Some(cwd), None, None)
+            .await
+            .unwrap();
 
         // Inspect the cache: should have exactly one entry.
         {
             let cache = state.project_cache.lock().await;
             assert_eq!(cache.len(), 1, "cache has one entry after first call");
-            assert!(cache.contains_key(cwd), "cache keyed by raw cwd");
+            let key = (cwd.to_string(), String::new(), String::new());
+            assert!(
+                cache.contains_key(&key),
+                "cache keyed by (cwd, ws_override, proj_override)"
+            );
         }
 
         // Second call — must return the same IDs from the cache.
-        let (_, proj_second) = resolve_project_ids(&state, Some(cwd)).await.unwrap();
+        let (_, proj_second) = resolve_project_ids(&state, Some(cwd), None, None)
+            .await
+            .unwrap();
         assert_eq!(proj_first, proj_second, "cache must return identical IDs");
 
         // Cache must still have exactly one entry (no duplicate insert).
@@ -697,6 +766,7 @@ mod tests {
             HookQuery {
                 event: "session-start".into(),
                 agent: Some("claude-code".into()),
+                ..Default::default()
             },
             serde_json::json!({
                 "session_id": "test-session-cwd-routing",
@@ -708,9 +778,10 @@ mod tests {
 
         // The observation must be in the project derived from the cwd,
         // not in the server-default `scratch` project.
-        let (_, expected_proj) = resolve_project_ids(&state, Some("/home/user/my-project"))
-            .await
-            .unwrap();
+        let (_, expected_proj) =
+            resolve_project_ids(&state, Some("/home/user/my-project"), None, None)
+                .await
+                .unwrap();
         assert_ne!(
             expected_proj, state.project_id,
             "routing must not use server-default project"
@@ -726,6 +797,7 @@ mod tests {
             HookQuery {
                 event: "user-prompt".into(),
                 agent: Some("opencode".into()),
+                ..Default::default()
             },
             serde_json::json!({
                 "sessionID": "opencode-resumed-session",
@@ -739,5 +811,113 @@ mod tests {
         let counts = state.reader.status_counts().await.unwrap();
         assert_eq!(counts.sessions, 1);
         assert_eq!(counts.observations, 1);
+    }
+
+    /// `.ai-memory.toml` walk-up declares `workspace = "movvia"`. The hook
+    /// forwards it as a query param, so the same `cwd` ends up in a
+    /// distinct workspace from the default-buckets resolver path.
+    #[tokio::test]
+    async fn workspace_override_yields_distinct_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+
+        let (ws_default, _) = resolve_project_ids(&state, Some("/home/u/repo"), None, None)
+            .await
+            .unwrap();
+        let (ws_movvia, _) =
+            resolve_project_ids(&state, Some("/home/u/repo"), Some("movvia"), None)
+                .await
+                .unwrap();
+
+        assert_ne!(
+            ws_default, ws_movvia,
+            "marker-declared workspace must not collide with the default"
+        );
+    }
+
+    /// A marker file with `project = "pe-portais"` replaces the
+    /// basename-derived project name for every descendant `cwd`.
+    #[tokio::test]
+    async fn project_override_replaces_basename() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+
+        let (_, proj_basename) = resolve_project_ids(&state, Some("/home/u/api"), None, None)
+            .await
+            .unwrap();
+        let (_, proj_override) =
+            resolve_project_ids(&state, Some("/home/u/api"), None, Some("pe-portais"))
+                .await
+                .unwrap();
+
+        assert_ne!(
+            proj_basename, proj_override,
+            "project override must produce a different ProjectId than basename(cwd)"
+        );
+    }
+
+    /// Two events resolved with overrides land in the same `(ws, proj)`
+    /// pair as long as the override names match — even if the `cwd`
+    /// differs. Confirms the override is the source of truth.
+    #[tokio::test]
+    async fn matching_overrides_collapse_to_same_pair() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+
+        let (ws_a, proj_a) = resolve_project_ids(&state, Some("/x"), Some("acme"), Some("api"))
+            .await
+            .unwrap();
+        let (ws_b, proj_b) = resolve_project_ids(&state, Some("/y"), Some("acme"), Some("api"))
+            .await
+            .unwrap();
+
+        assert_eq!(ws_a, ws_b);
+        assert_eq!(proj_a, proj_b);
+    }
+
+    /// During a hook-script upgrade window, the same `cwd` may resolve
+    /// with and without an override in the same process. The composite
+    /// cache key keeps both rows isolated; otherwise the first one
+    /// "wins" and the second silently inherits its `ProjectId`.
+    #[tokio::test]
+    async fn cache_does_not_poison_across_override_variants() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let cwd = "/home/u/poison-test";
+
+        let (ws_default, _) = resolve_project_ids(&state, Some(cwd), None, None)
+            .await
+            .unwrap();
+        let (ws_movvia, _) = resolve_project_ids(&state, Some(cwd), Some("movvia"), None)
+            .await
+            .unwrap();
+
+        assert_ne!(
+            ws_default, ws_movvia,
+            "cache must distinguish override variants"
+        );
+
+        let cache = state.project_cache.lock().await;
+        assert_eq!(
+            cache.len(),
+            2,
+            "two distinct cache entries for same cwd with different overrides"
+        );
+    }
+
+    /// With no `cwd` but with both overrides, the resolver still produces
+    /// a real `(ws, proj)` pair — covers handoff fetches issued before
+    /// any hook event has populated the cwd cache.
+    #[tokio::test]
+    async fn overrides_resolve_without_cwd() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+
+        let (ws, proj) = resolve_project_ids(&state, None, Some("acme"), Some("api"))
+            .await
+            .unwrap();
+
+        assert_ne!(ws, state.workspace_id);
+        assert_ne!(proj, state.project_id);
     }
 }
