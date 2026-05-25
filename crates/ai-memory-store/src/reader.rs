@@ -646,8 +646,8 @@ impl ReaderPool {
     ) -> StoreResult<Vec<Observation>> {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare_cached(
-                "SELECT id, session_id, workspace_id, project_id, kind, title, body, \
-                        importance, created_at \
+                "SELECT id, session_id, workspace_id, project_id, kind, extension, source_event, \
+                        title, body, importance, created_at \
                  FROM observations \
                  WHERE session_id = ?1 \
                  ORDER BY created_at ASC",
@@ -1905,16 +1905,20 @@ fn row_to_observation(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<O
     let workspace_bytes: Vec<u8> = row.get(2)?;
     let project_bytes: Vec<u8> = row.get(3)?;
     let kind_str: String = row.get(4)?;
-    let title: String = row.get(5)?;
-    let body: String = row.get(6)?;
-    let importance: i64 = row.get(7)?;
-    let created_us: i64 = row.get(8)?;
+    let extension: Option<String> = row.get(5)?;
+    let source_event: Option<String> = row.get(6)?;
+    let title: String = row.get(7)?;
+    let body: String = row.get(8)?;
+    let importance: i64 = row.get(9)?;
+    let created_us: i64 = row.get(10)?;
     Ok(materialise_observation(
         id_bytes,
         session_bytes,
         workspace_bytes,
         project_bytes,
         kind_str,
+        extension,
+        source_event,
         title,
         body,
         importance,
@@ -1929,6 +1933,8 @@ fn materialise_observation(
     workspace_bytes: Vec<u8>,
     project_bytes: Vec<u8>,
     kind_str: String,
+    extension: Option<String>,
+    source_event: Option<String>,
     title: String,
     body: String,
     importance: i64,
@@ -1942,6 +1948,8 @@ fn materialise_observation(
         kind: kind_str
             .parse::<ObservationKind>()
             .map_err(StoreError::from)?,
+        extension,
+        source_event,
         title,
         body,
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]

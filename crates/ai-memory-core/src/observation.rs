@@ -87,6 +87,15 @@ pub struct NewObservation {
     pub project_id: ProjectId,
     /// Event classification.
     pub kind: ObservationKind,
+    /// Optional third-party extension namespace that supplied
+    /// `source_event`. Core ai-memory event routing does not use
+    /// this; it preserves custom vocabularies without expanding
+    /// [`ObservationKind`].
+    pub extension: Option<String>,
+    /// Optional source event name from an opt-in extension vocabulary.
+    /// Unknown hook events leave this unset unless the hook explicitly
+    /// declared an extension namespace.
+    pub source_event: Option<String>,
     /// Short title (auto-derived from event when blank).
     pub title: String,
     /// Sanitised body (may include excerpts of prompts or tool I/O).
@@ -108,6 +117,10 @@ pub struct Observation {
     pub project_id: ProjectId,
     /// Event classification.
     pub kind: ObservationKind,
+    /// Optional third-party extension namespace.
+    pub extension: Option<String>,
+    /// Optional source event name from an opt-in extension vocabulary.
+    pub source_event: Option<String>,
     /// Short title.
     pub title: String,
     /// Sanitised body.

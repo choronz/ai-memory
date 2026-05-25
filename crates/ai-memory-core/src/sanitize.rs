@@ -282,6 +282,8 @@ mod tests {
             workspace_id: WorkspaceId::new(),
             project_id: ProjectId::new(),
             kind: ObservationKind::UserPrompt,
+            extension: None,
+            source_event: None,
             title: "OPENAI_API_KEY=sk-leak-1234567890abcdef".into(),
             body: "see /home/user/.ssh/id_ed25519".into(),
             importance: 5,

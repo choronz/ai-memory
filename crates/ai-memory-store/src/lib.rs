@@ -555,6 +555,8 @@ mod tests {
                 workspace_id: ws,
                 project_id: proj,
                 kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
                 title: "prompt".into(),
                 body: "the raw-only zebra detail lives here".into(),
                 importance: 5,

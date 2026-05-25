@@ -374,6 +374,8 @@ async fn process(state: &HookState, env: HookEnvelope) -> anyhow::Result<()> {
         workspace_id: ws,
         project_id: proj,
         kind,
+        extension: env.extension.clone(),
+        source_event: env.source_event.clone(),
         title,
         body,
         importance: importance_for(env.event),
@@ -864,6 +866,94 @@ mod tests {
         let counts = state.reader.status_counts().await.unwrap();
         assert_eq!(counts.sessions, 1);
         assert_eq!(counts.observations, 1);
+    }
+
+    #[tokio::test]
+    async fn process_preserves_opt_in_extension_event_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "lead.contact".into(),
+                agent: Some("other".into()),
+                extension: Some("fstech".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "fstech-custom-event",
+                "cwd": "/home/user/crm",
+                "title": "Lead contacted",
+                "message": "Lead Maria requested a proposal"
+            }),
+        );
+        let session_id = resolve_session_id(&env).unwrap();
+
+        process(&state, env).await.unwrap();
+
+        let observations = state
+            .reader
+            .observations_for_session(session_id)
+            .await
+            .unwrap();
+        assert_eq!(observations.len(), 1);
+        let obs = &observations[0];
+        assert_eq!(obs.kind, ObservationKind::Other);
+        assert_eq!(obs.extension.as_deref(), Some("fstech"));
+        assert_eq!(obs.source_event.as_deref(), Some("lead.contact"));
+        assert_eq!(obs.title, "Lead contacted");
+        assert_eq!(obs.body, "Lead Maria requested a proposal");
+        let hits = state
+            .reader
+            .search_observations_for_project(obs.workspace_id, obs.project_id, "maria".into(), 5)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "extension body should be searchable");
+    }
+
+    #[tokio::test]
+    async fn process_unknown_event_without_extension_leaves_storage_clean() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "lead.contact".into(),
+                agent: Some("other".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "plain-unknown-event",
+                "cwd": "/home/user/crm",
+                "title": "Lead contacted",
+                "message": "Lead Maria requested a proposal"
+            }),
+        );
+        let session_id = resolve_session_id(&env).unwrap();
+
+        process(&state, env).await.unwrap();
+
+        let observations = state
+            .reader
+            .observations_for_session(session_id)
+            .await
+            .unwrap();
+        assert_eq!(observations.len(), 1);
+        let obs = &observations[0];
+        assert_eq!(obs.kind, ObservationKind::Other);
+        assert_eq!(obs.extension, None);
+        assert_eq!(obs.source_event, None);
+        assert_eq!(obs.title, "other");
+        assert!(obs.body.is_empty());
+        let hits = state
+            .reader
+            .search_observations_for_project(obs.workspace_id, obs.project_id, "maria".into(), 5)
+            .await
+            .unwrap();
+        assert!(
+            hits.is_empty(),
+            "unknown events without extension must not leak custom payload into observation FTS"
+        );
     }
 
     /// `.ai-memory.toml` walk-up declares `workspace = "movvia"`. The hook

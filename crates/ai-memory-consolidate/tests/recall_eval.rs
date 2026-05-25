@@ -273,6 +273,8 @@ async fn raw_observation_fallback_recovers_detail_when_wiki_misses() {
             workspace_id: ws,
             project_id: proj,
             kind: ObservationKind::UserPrompt,
+            extension: None,
+            source_event: None,
             title: "raw prompt".into(),
             body: "raw fallback detail mentions capybara exactly once".into(),
             importance: 5,

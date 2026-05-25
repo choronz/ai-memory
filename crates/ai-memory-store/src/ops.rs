@@ -384,16 +384,25 @@ pub fn insert_observation(
     let now = Timestamp::now().as_microsecond();
     let kind = observation_kind_as_str(obs.kind);
     let importance: i64 = i64::from(obs.importance.clamp(1, 10));
+    let (extension, source_event) = match (&obs.extension, &obs.source_event) {
+        (Some(extension), Some(source_event)) => {
+            (Some(extension.as_str()), Some(source_event.as_str()))
+        }
+        _ => (None, None),
+    };
     conn.execute(
         "INSERT INTO observations \
-         (id, session_id, workspace_id, project_id, kind, title, body, importance, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         (id, session_id, workspace_id, project_id, kind, extension, source_event, title, body, \
+          importance, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             id.as_bytes(),
             obs.session_id.as_bytes(),
             obs.workspace_id.as_bytes(),
             obs.project_id.as_bytes(),
             kind,
+            extension,
+            source_event,
             obs.title,
             obs.body,
             importance,

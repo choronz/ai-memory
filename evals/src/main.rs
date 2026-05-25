@@ -385,6 +385,8 @@ fn synthesise_observations(fx: &Fixture) -> Vec<Observation> {
                 .kind
                 .parse::<ObservationKind>()
                 .unwrap_or(ObservationKind::Other),
+            extension: None,
+            source_event: None,
             title: f.title.clone(),
             body: f.body.clone(),
             importance: 5,

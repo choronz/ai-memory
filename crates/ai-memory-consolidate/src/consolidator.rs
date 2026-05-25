@@ -363,7 +363,11 @@ pub fn build_batch_request(session_id: SessionId, observations: &[Observation]) 
     buf.push_str(&session_id.to_string());
     buf.push_str("\n\nObservations:\n");
     for o in observations {
-        buf.push_str(&format!("- {} | {}\n", o.kind.as_str(), one_line(&o.title)));
+        buf.push_str(&format!(
+            "- {} | {}\n",
+            observation_label(o),
+            one_line(&o.title)
+        ));
         if !o.body.trim().is_empty() {
             buf.push_str(&format!("    body: {}\n", one_line(&o.body)));
         }
@@ -441,7 +445,11 @@ fn build_request(
     buf.push_str(&session_id.to_string());
     buf.push_str("\nObservations (in order):\n\n");
     for o in observations {
-        buf.push_str(&format!("- {} | {}\n", o.kind.as_str(), one_line(&o.title)));
+        buf.push_str(&format!(
+            "- {} | {}\n",
+            observation_label(o),
+            one_line(&o.title)
+        ));
         if !o.body.trim().is_empty() {
             buf.push_str(&format!("    body: {}\n", one_line(&o.body)));
         }
@@ -468,6 +476,15 @@ fn build_request(
         // Cheaper to over-allocate than to truncate JSON mid-response.
         max_tokens: 32_000,
         temperature: Some(0.2),
+    }
+}
+
+fn observation_label(obs: &Observation) -> String {
+    match (&obs.extension, &obs.source_event) {
+        (Some(extension), Some(source_event)) => {
+            format!("{} [{}:{}]", obs.kind.as_str(), extension, source_event)
+        }
+        _ => obs.kind.as_str().to_string(),
     }
 }
 

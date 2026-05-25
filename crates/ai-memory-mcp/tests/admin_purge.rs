@@ -127,6 +127,8 @@ async fn seed_two_projects(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectI
                     workspace_id: ws,
                     project_id: proj,
                     kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
                     title: format!("{label} obs {i}"),
                     body: "body".into(),
                     importance: 5,

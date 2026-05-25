@@ -101,6 +101,35 @@ markdown stays the source of truth.
    backup API so the source stays writable; `ai-memory restore`
    reverses. Or: `git push` the wiki dir + `rsync` the data dir.
 
+## Hook event vocabulary
+
+The core observation vocabulary is a closed set of agent lifecycle
+events. Hook bridges may accept client-specific aliases, but storage
+normalises them to exactly one of these `ObservationKind` values:
+
+| Stored kind | Semantics |
+|---|---|
+| `session-start` | Agent session began; cwd/model/session identity captured. |
+| `user-prompt` | User submitted prompt text to the agent. |
+| `pre-tool-use` | Agent is about to call a tool. |
+| `post-tool-use` | Agent finished a tool call. |
+| `pre-compact` | Agent is about to compact or compress its context. |
+| `notification` | Agent emitted a notification-style event. |
+| `stop` | Agent finished an interactive turn or stopped naturally. |
+| `session-end` | Agent session ended; summary/handoff path may run. |
+| `other` | Unknown or unsupported hook event. |
+
+Unknown events do **not** expand the enum and, by default, leave no
+source-event metadata in storage; they collapse to `other`. Third-party
+integrations that need their own vocabulary can opt in by sending
+`extension=<namespace>` on `/hook`. With a valid extension namespace,
+ai-memory stores an explicit `source_event=<name>` when provided, or the
+unknown `event` string when `source_event` is omitted. The stored pair is
+nullable observation metadata; `kind` stays canonical. This is an
+extension seam, not a runtime plugin system: external processors must use
+the existing HTTP/MCP APIs and cannot bypass the sanitizer, hook
+backpressure, or single-writer SQLite actor.
+
 ## Storage architecture
 
 **Two layers, one source of truth.**

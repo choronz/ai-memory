@@ -22,6 +22,14 @@ pub struct HookQuery {
     /// Project name override (same source as `workspace`). When
     /// `None` the server falls back to `basename(cwd)`.
     pub project: Option<String>,
+    /// Optional third-party extension namespace. When present, ai-memory
+    /// preserves a validated source event name without expanding the
+    /// closed core event vocabulary.
+    pub extension: Option<String>,
+    /// Optional explicit source event name for extension vocabularies.
+    /// When omitted and `extension` is present, unknown `event` values
+    /// are preserved as the source event.
+    pub source_event: Option<String>,
 }
 
 /// Coalesced view of an incoming hook event after light parsing of the
@@ -44,6 +52,10 @@ pub struct HookEnvelope {
     /// Project name override declared by the hook. Empty / `None`
     /// defers to `basename(cwd)`.
     pub project_override: Option<String>,
+    /// Optional third-party extension namespace.
+    pub extension: Option<String>,
+    /// Optional source event name from the extension vocabulary.
+    pub source_event: Option<String>,
     /// Optional title hint extracted from the body.
     pub title_hint: Option<String>,
     /// Optional body excerpt extracted from the agent's raw payload.
@@ -177,8 +189,29 @@ impl HookEnvelope {
         let cwd = body_cwd.or_else(|| query.cwd.filter(|s| !s.is_empty()));
         let workspace_override = query.workspace.filter(|s| !s.is_empty());
         let project_override = query.project.filter(|s| !s.is_empty());
-        let title_hint = best_title_hint(event, &raw);
-        let body_excerpt = best_body_excerpt(event, &raw);
+        let extension = normalize_extension_name(query.extension.as_deref());
+        let source_event = extension.as_ref().and_then(|_| {
+            let raw_source = query
+                .source_event
+                .as_deref()
+                .or_else(|| (event == HookEvent::Other).then_some(query.event.as_str()))?;
+            normalize_source_event(raw_source)
+        });
+        let extension = if source_event.is_some() {
+            extension
+        } else {
+            None
+        };
+        let title_hint = best_title_hint(event, &raw).or_else(|| {
+            source_event
+                .as_deref()
+                .map(|source| extension_title_hint(&raw, source))
+        });
+        let body_excerpt = best_body_excerpt(event, &raw).or_else(|| {
+            source_event
+                .as_deref()
+                .and_then(|_| extension_body_excerpt(&raw))
+        });
         Self {
             event,
             agent,
@@ -186,6 +219,8 @@ impl HookEnvelope {
             cwd,
             workspace_override,
             project_override,
+            extension,
+            source_event,
             title_hint,
             body_excerpt,
             raw,
@@ -269,6 +304,27 @@ fn best_title_hint(event: HookEvent, raw: &serde_json::Value) -> Option<String> 
     }
 }
 
+fn extension_title_hint(raw: &serde_json::Value, source_event: &str) -> String {
+    extract_string(raw, &["title", "summary", "subject", "name"])
+        .map(|s| truncate_for_title(&s))
+        .unwrap_or_else(|| source_event.to_string())
+}
+
+fn extension_body_excerpt(raw: &serde_json::Value) -> Option<String> {
+    extract_string(
+        raw,
+        &[
+            "body",
+            "message",
+            "text",
+            "description",
+            "summary",
+            "details",
+        ],
+    )
+    .map(|s| truncate_excerpt(&s))
+}
+
 fn best_body_excerpt(event: HookEvent, raw: &serde_json::Value) -> Option<String> {
     match event {
         HookEvent::UserPrompt => extract_string(raw, &["prompt", "message", "text"]),
@@ -315,6 +371,29 @@ fn truncate_excerpt(s: &str) -> String {
     }
 }
 
+fn normalize_extension_name(value: Option<&str>) -> Option<String> {
+    normalize_token(value?, 64)
+}
+
+fn normalize_source_event(value: &str) -> Option<String> {
+    normalize_token(value, 128)
+}
+
+fn normalize_token(value: &str, max_len: usize) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.len() > max_len {
+        return None;
+    }
+    if trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':'))
+    {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,6 +404,67 @@ mod tests {
         assert_eq!(HookEvent::parse("PreToolUse"), HookEvent::PreToolUse);
         assert_eq!(HookEvent::parse("user_prompt"), HookEvent::UserPrompt);
         assert_eq!(HookEvent::parse("bogus"), HookEvent::Other);
+    }
+
+    #[test]
+    fn extension_event_preserves_source_event_when_opted_in() {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "lead.contact".into(),
+                extension: Some("fstech".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "fst-1",
+                "title": "Lead contacted",
+                "message": "Lead Maria requested a proposal"
+            }),
+        );
+
+        assert_eq!(env.event, HookEvent::Other);
+        assert_eq!(env.extension.as_deref(), Some("fstech"));
+        assert_eq!(env.source_event.as_deref(), Some("lead.contact"));
+        assert_eq!(env.title_hint.as_deref(), Some("Lead contacted"));
+        assert_eq!(
+            env.body_excerpt.as_deref(),
+            Some("Lead Maria requested a proposal")
+        );
+    }
+
+    #[test]
+    fn unknown_event_without_extension_leaves_no_source_event() {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "lead.contact".into(),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "fst-1",
+                "title": "Lead contacted",
+                "message": "Lead Maria requested a proposal"
+            }),
+        );
+
+        assert_eq!(env.event, HookEvent::Other);
+        assert_eq!(env.extension, None);
+        assert_eq!(env.source_event, None);
+        assert_eq!(env.title_hint, None);
+        assert_eq!(env.body_excerpt, None);
+    }
+
+    #[test]
+    fn invalid_extension_tokens_are_not_preserved() {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "lead.contact".into(),
+                extension: Some("bad extension".into()),
+                ..Default::default()
+            },
+            serde_json::json!({ "session_id": "fst-1" }),
+        );
+
+        assert_eq!(env.extension, None);
+        assert_eq!(env.source_event, None);
     }
 
     #[test]

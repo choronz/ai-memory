@@ -108,9 +108,10 @@ fn render_body(session_id: SessionId, observations: &[Observation], title: &str)
 
     buf.push_str("## Raw observations\n\n");
     for obs in observations {
+        let kind = observation_kind_label(obs);
         buf.push_str(&format!(
             "- `{}` @ {} — {}\n",
-            obs.kind.as_str(),
+            kind,
             human_ts(&obs.created_at),
             obs.title.chars().take(80).collect::<String>(),
         ));
@@ -118,6 +119,15 @@ fn render_body(session_id: SessionId, observations: &[Observation], title: &str)
 
     buf.push_str("\n_Synthesised by ai-memory (M3, no-LLM heuristic)._\n");
     buf
+}
+
+fn observation_kind_label(obs: &Observation) -> String {
+    match (&obs.extension, &obs.source_event) {
+        (Some(extension), Some(source_event)) => {
+            format!("{} [{}:{}]", obs.kind.as_str(), extension, source_event)
+        }
+        _ => obs.kind.as_str().to_string(),
+    }
 }
 
 fn human_ts(ts: &jiff::Timestamp) -> String {
@@ -139,6 +149,8 @@ mod tests {
             workspace_id: WorkspaceId::new(),
             project_id: ProjectId::new(),
             kind,
+            extension: None,
+            source_event: None,
             title: title.into(),
             body: String::new(),
             importance: 5,
@@ -181,5 +193,21 @@ mod tests {
         assert!(page.body.contains("`Edit`: 2"));
         assert!(page.body.contains("`Bash`: 1"));
         assert!(page.body.contains("build the thing"));
+    }
+
+    #[test]
+    fn body_includes_opt_in_extension_source_event() {
+        let mut custom = obs(ObservationKind::Other, "Lead contacted");
+        custom.extension = Some("fstech".into());
+        custom.source_event = Some("lead.contact".into());
+
+        let page = synthesize_session_page(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            SessionId::new(),
+            &[custom],
+        );
+
+        assert!(page.body.contains("`other [fstech:lead.contact]`"));
     }
 }
