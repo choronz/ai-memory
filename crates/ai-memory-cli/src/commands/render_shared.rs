@@ -52,6 +52,28 @@ pub(crate) fn bearer_header_value(token: Option<&str>) -> Option<String> {
     token.map(|t| format!("Bearer {t}"))
 }
 
+/// Emit a TypeScript string literal containing `s`. Escapes
+/// backslashes, double quotes, and common control characters. This is
+/// sufficient for URL, auth-token, and path strings embedded into
+/// generated TypeScript integrations.
+#[must_use]
+pub(crate) fn ts_string_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Build the Claude Code `settings.json` fragment that wires the
 /// seven hooks. Used by both:
 /// - `install-hooks --agent claude-code` (script paths are

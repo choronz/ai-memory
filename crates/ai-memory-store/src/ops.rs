@@ -329,7 +329,7 @@ fn refresh_incoming_links_for_path(
 /// Idempotent: a second call with the same id leaves the row untouched.
 pub fn begin_session(conn: &mut Connection, session: &NewSession) -> StoreResult<()> {
     let now = Timestamp::now().as_microsecond();
-    let agent = agent_kind_as_str(session.agent_kind);
+    let agent = session.agent_kind.as_str();
     let cwd: Option<String> = session
         .cwd
         .as_ref()
@@ -506,8 +506,8 @@ pub fn insert_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Hand
     let files = serde_json::to_string(&h.files_touched)?;
     let from_session: Option<&[u8]> = h.from_session_id.as_ref().map(|s| &s.as_bytes()[..]);
     let cwd: Option<String> = h.cwd.as_ref().map(|p| p.to_string_lossy().into_owned());
-    let from_agent = agent_kind_as_str(h.from_agent);
-    let to_agent = h.to_agent.map(agent_kind_as_str);
+    let from_agent = h.from_agent.as_str();
+    let to_agent = h.to_agent.map(AgentKind::as_str);
     conn.execute(
         "INSERT INTO handoffs \
          (id, workspace_id, project_id, from_session_id, from_agent, to_agent, cwd, summary, \
@@ -539,7 +539,7 @@ pub fn accept_handoff(
     accepting_session: Option<&SessionId>,
 ) -> StoreResult<()> {
     let now = Timestamp::now().as_microsecond();
-    let agent = agent_kind_as_str(accepting_agent);
+    let agent = accepting_agent.as_str();
     let session: Option<&[u8]> = accepting_session.map(|s| &s.as_bytes()[..]);
     conn.execute(
         "UPDATE handoffs SET state = 'accepted', accepted_by = ?1, accepted_at = ?2, \
@@ -548,20 +548,6 @@ pub fn accept_handoff(
         params![agent, now, session, handoff_id.as_bytes()],
     )?;
     Ok(())
-}
-
-fn agent_kind_as_str(kind: AgentKind) -> &'static str {
-    match kind {
-        AgentKind::ClaudeCode => "claude-code",
-        AgentKind::Codex => "codex",
-        AgentKind::OpenCode => "open-code",
-        AgentKind::Cursor => "cursor",
-        AgentKind::GeminiCli => "gemini-cli",
-        AgentKind::ClaudeDesktop => "claude-desktop",
-        AgentKind::OpenClaw => "openclaw",
-        AgentKind::Omp => "omp",
-        AgentKind::Other => "other",
-    }
 }
 
 fn observation_kind_as_str(kind: ObservationKind) -> &'static str {

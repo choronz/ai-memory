@@ -110,6 +110,14 @@ impl PagePath {
                 "leading slash: {raw}"
             )));
         }
+        if raw.len() >= 3 {
+            let bytes = raw.as_bytes();
+            if bytes[1] == b':' && bytes[2] == b'/' && bytes[0].is_ascii_alphabetic() {
+                return Err(MemoryError::InvalidPagePath(format!(
+                    "windows drive prefix in {raw}"
+                )));
+            }
+        }
         if raw.contains('\\') {
             return Err(MemoryError::InvalidPagePath(format!(
                 "backslash separator in {raw}"
@@ -200,6 +208,24 @@ impl AgentKind {
             Self::Other => "other",
         }
     }
+
+    /// Parse a known wire string or common alias. Unknown values map
+    /// to [`AgentKind::Other`], which keeps hook ingestion tolerant of
+    /// typos or future agents.
+    #[must_use]
+    pub fn from_wire(s: &str) -> Self {
+        match s {
+            "claude-code" | "claude_code" | "claude" => Self::ClaudeCode,
+            "codex" => Self::Codex,
+            "open-code" | "opencode" => Self::OpenCode,
+            "cursor" => Self::Cursor,
+            "gemini-cli" | "gemini" => Self::GeminiCli,
+            "claude-desktop" | "claude_desktop" => Self::ClaudeDesktop,
+            "openclaw" | "open-claw" => Self::OpenClaw,
+            "omp" | "pi" | "oh-my-pi" => Self::Omp,
+            _ => Self::Other,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -231,6 +257,7 @@ mod tests {
     fn page_path_rejects_backslashes_and_windows_prefixes() {
         assert!(PagePath::new(r"notes\secret.md").is_err());
         assert!(PagePath::new(r"C:\Users\me\secret.md").is_err());
+        assert!(PagePath::new("C:/Users/me/secret.md").is_err());
     }
 
     #[test]

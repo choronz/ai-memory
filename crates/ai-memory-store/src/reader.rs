@@ -1991,17 +1991,7 @@ fn materialise_handoff(
 }
 
 fn parse_agent(s: &str) -> AgentKind {
-    match s {
-        "claude-code" => AgentKind::ClaudeCode,
-        "codex" => AgentKind::Codex,
-        "open-code" => AgentKind::OpenCode,
-        "cursor" => AgentKind::Cursor,
-        "gemini-cli" => AgentKind::GeminiCli,
-        "claude-desktop" => AgentKind::ClaudeDesktop,
-        "openclaw" => AgentKind::OpenClaw,
-        "omp" => AgentKind::Omp,
-        _ => AgentKind::Other,
-    }
+    AgentKind::from_wire(s)
 }
 
 fn count(conn: &Connection, sql: &str) -> StoreResult<u64> {

@@ -44,6 +44,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   being parsed as column operators.
 - Gemini 2.5 Flash requests disable default dynamic thinking so hidden thought
   tokens do not consume `maxOutputTokens` and truncate strict JSON responses.
+- `install-mcp --client claude-code` now prints the direct-edit JSON path as
+  `~/.claude.json`, matching the `--apply` path and `claude mcp add` behavior.
 
 ## [0.1.3] - 2026-05-24
 

@@ -105,17 +105,7 @@ impl HookEvent {
 /// [`AgentKind::Other`].
 #[must_use]
 pub fn parse_agent(s: &str) -> AgentKind {
-    match s {
-        "claude-code" | "claude_code" | "claude" => AgentKind::ClaudeCode,
-        "codex" => AgentKind::Codex,
-        "open-code" | "opencode" => AgentKind::OpenCode,
-        "cursor" => AgentKind::Cursor,
-        "gemini-cli" | "gemini" => AgentKind::GeminiCli,
-        "claude-desktop" | "claude_desktop" => AgentKind::ClaudeDesktop,
-        "openclaw" | "open-claw" => AgentKind::OpenClaw,
-        "omp" | "pi" | "oh-my-pi" => AgentKind::Omp,
-        _ => AgentKind::Other,
-    }
+    AgentKind::from_wire(s)
 }
 
 impl HookEnvelope {

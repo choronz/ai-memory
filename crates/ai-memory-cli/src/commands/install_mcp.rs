@@ -24,6 +24,15 @@ use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json, mut
 use crate::commands::render_shared::bearer_header_value;
 use crate::config::Config;
 
+const GEMINI_MCP_TIMEOUT_MS: u64 = 5000;
+
+#[derive(Clone, Copy)]
+enum JsonMcpLocation {
+    RootMcpServers,
+    RootMcp,
+    NestedMcpServers,
+}
+
 /// Run the `install-mcp` subcommand.
 ///
 /// # Errors
@@ -107,53 +116,11 @@ fn resolve_config_file(args: &InstallMcpArgs) -> Result<PathBuf> {
 fn apply_to_config_file(args: &InstallMcpArgs) -> Result<()> {
     let path = resolve_config_file(args)?;
     let outcome = match args.client {
-        McpClient::ClaudeCode
-        | McpClient::ClaudeDesktop
-        | McpClient::Cursor
-        | McpClient::GeminiCli
-        | McpClient::Pi => apply_atomic(&path, |existing| {
-            mutate_json(existing, |root| {
-                let entry = build_mcp_entry(args)?;
-                let servers = root
-                    .entry("mcpServers")
-                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
-                    .as_object_mut()
-                    .context("`mcpServers` is present but not an object")?;
-                servers.insert(args.name.clone(), entry);
-                Ok(())
-            })
-        })?,
-        McpClient::OpenCode => apply_atomic(&path, |existing| {
-            mutate_json(existing, |root| {
-                let entry = build_mcp_entry_opencode(args)?;
-                let mcp = root
-                    .entry("mcp")
-                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
-                    .as_object_mut()
-                    .context("`mcp` is present but not an object")?;
-                mcp.insert(args.name.clone(), entry);
-                Ok(())
-            })
-        })?,
-        McpClient::Openclaw => apply_atomic(&path, |existing| {
-            mutate_json(existing, |root| {
-                let entry = build_mcp_entry_openclaw(args)?;
-                let mcp = root
-                    .entry("mcp")
-                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
-                    .as_object_mut()
-                    .context("`mcp` is present but not an object")?;
-                let servers = mcp
-                    .entry("servers")
-                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
-                    .as_object_mut()
-                    .context("`mcp.servers` is present but not an object")?;
-                servers.insert(args.name.clone(), entry);
-                Ok(())
-            })
-        })?,
         McpClient::Codex => apply_atomic(&path, |existing| {
             mutate_toml(existing, |doc| codex_upsert_mcp_server(doc, args))
+        })?,
+        _ => apply_atomic(&path, |existing| {
+            mutate_json(existing, |root| upsert_json_mcp_entry(root, args))
         })?,
     };
     println!(
@@ -167,6 +134,84 @@ fn apply_to_config_file(args: &InstallMcpArgs) -> Result<()> {
         }
     );
     Ok(())
+}
+
+fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
+    match client {
+        McpClient::ClaudeCode
+        | McpClient::ClaudeDesktop
+        | McpClient::Cursor
+        | McpClient::GeminiCli
+        | McpClient::Pi => Some(JsonMcpLocation::RootMcpServers),
+        McpClient::OpenCode => Some(JsonMcpLocation::RootMcp),
+        McpClient::Openclaw => Some(JsonMcpLocation::NestedMcpServers),
+        McpClient::Codex => None,
+    }
+}
+
+fn build_json_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
+    match args.client {
+        McpClient::OpenCode => build_mcp_entry_opencode(args),
+        McpClient::Openclaw => build_mcp_entry_openclaw(args),
+        McpClient::Codex => bail!("internal: Codex MCP config is TOML, not JSON"),
+        _ => build_mcp_entry(args),
+    }
+}
+
+fn upsert_json_mcp_entry(
+    root: &mut serde_json::Map<String, serde_json::Value>,
+    args: &InstallMcpArgs,
+) -> Result<()> {
+    let entry = build_json_mcp_entry(args)?;
+    match json_mcp_location(args.client).context("internal: unsupported JSON MCP client")? {
+        JsonMcpLocation::RootMcpServers => {
+            let servers = root
+                .entry("mcpServers")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .context("`mcpServers` is present but not an object")?;
+            servers.insert(args.name.clone(), entry);
+        }
+        JsonMcpLocation::RootMcp => {
+            let mcp = root
+                .entry("mcp")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .context("`mcp` is present but not an object")?;
+            mcp.insert(args.name.clone(), entry);
+        }
+        JsonMcpLocation::NestedMcpServers => {
+            let mcp = root
+                .entry("mcp")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .context("`mcp` is present but not an object")?;
+            let servers = mcp
+                .entry("servers")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .context("`mcp.servers` is present but not an object")?;
+            servers.insert(args.name.clone(), entry);
+        }
+    }
+    Ok(())
+}
+
+fn render_json_mcp_fragment(args: &InstallMcpArgs) -> Result<String> {
+    let entry = build_json_mcp_entry(args)?;
+    let fragment =
+        match json_mcp_location(args.client).context("internal: unsupported JSON MCP client")? {
+            JsonMcpLocation::RootMcpServers => json!({
+                "mcpServers": { args.name.as_str(): entry }
+            }),
+            JsonMcpLocation::RootMcp => json!({
+                "mcp": { args.name.as_str(): entry }
+            }),
+            JsonMcpLocation::NestedMcpServers => json!({
+                "mcp": { "servers": { args.name.as_str(): entry } }
+            }),
+        };
+    Ok(serde_json::to_string_pretty(&fragment)?)
 }
 
 /// JSON entry shape used by Claude Code, Claude Desktop, Cursor, and
@@ -203,7 +248,7 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
         }
         McpClient::GeminiCli => {
             entry.insert("httpUrl".into(), json!(args.server_url));
-            entry.insert("timeout".into(), json!(5000));
+            entry.insert("timeout".into(), json!(GEMINI_MCP_TIMEOUT_MS));
             if let Some(b) = &bearer {
                 entry.insert("headers".into(), json!({"Authorization": b}));
             }
@@ -355,23 +400,14 @@ fn render_claude_code(args: &InstallMcpArgs) -> Result<String> {
             url = args.server_url,
         )
     };
-    let mut entry = serde_json::Map::new();
-    entry.insert("type".into(), json!("http"));
-    entry.insert("url".into(), json!(args.server_url));
-    if let Some(b) = &bearer {
-        entry.insert("headers".into(), json!({"Authorization": b}));
-    }
-    let snippet = serde_json::to_string_pretty(&json!({
-        "mcpServers": { args.name.as_str(): entry }
-    }))?;
+    let snippet = render_json_mcp_fragment(args)?;
     Ok(format!(
         "# Claude Code — register the MCP server\n\
          #\n\
          # Recommended (one-shot CLI):\n\
          {cli_line}\n\
          #\n\
-         # Equivalent JSON if you'd rather edit settings directly\n\
-         # (~/.claude/settings.json):\n\
+         # Equivalent JSON if you'd rather edit ~/.claude.json directly:\n\
          {snippet}\n"
     ))
 }
@@ -414,28 +450,14 @@ fn render_codex(args: &InstallMcpArgs) -> String {
 }
 
 fn render_opencode(args: &InstallMcpArgs) -> Result<String> {
-    let mut entry = serde_json::Map::new();
-    entry.insert("type".into(), json!("remote"));
-    entry.insert("url".into(), json!(args.server_url));
-    entry.insert("enabled".into(), json!(true));
-    if let Some(b) = bearer_header_value(args.auth_token.as_deref()) {
-        entry.insert("headers".into(), json!({"Authorization": b}));
-    }
     Ok(format!(
         "# OpenCode — add to ~/.config/opencode/opencode.json under \"mcp\":\n\
          {snippet}\n",
-        snippet = serde_json::to_string_pretty(&json!({
-            "mcp": { args.name.as_str(): entry }
-        }))?,
+        snippet = render_json_mcp_fragment(args)?,
     ))
 }
 
 fn render_cursor(args: &InstallMcpArgs) -> Result<String> {
-    let mut entry = serde_json::Map::new();
-    entry.insert("url".into(), json!(args.server_url));
-    if let Some(b) = bearer_header_value(args.auth_token.as_deref()) {
-        entry.insert("headers".into(), json!({"Authorization": b}));
-    }
     Ok(format!(
         "# Cursor — write to one of:\n\
          #   - ~/.cursor/mcp.json   (global, all projects)\n\
@@ -446,9 +468,7 @@ fn render_cursor(args: &InstallMcpArgs) -> Result<String> {
          # adding a new entry; live reload landed in recent builds but\n\
          # is still flaky.\n\
          {snippet}\n",
-        snippet = serde_json::to_string_pretty(&json!({
-            "mcpServers": { args.name.as_str(): entry }
-        }))?,
+        snippet = render_json_mcp_fragment(args)?,
     ))
 }
 
@@ -457,16 +477,6 @@ fn render_claude_desktop(args: &InstallMcpArgs) -> Result<String> {
     // through Claude Desktop's stdio-only config. Put the Bearer value
     // in env so Windows subprocess parsing never has to split a value
     // containing a space.
-    let bearer = bearer_header_value(args.auth_token.as_deref());
-    let mut cmd_args = vec![json!("-y"), json!("mcp-remote"), json!(args.server_url)];
-    let mut server = serde_json::Map::new();
-    if let Some(b) = &bearer {
-        cmd_args.push(json!("--header"));
-        cmd_args.push(json!("Authorization:${AI_MEMORY_AUTH_HEADER}"));
-        server.insert("env".into(), json!({"AI_MEMORY_AUTH_HEADER": b}));
-    }
-    server.insert("command".into(), json!("npx"));
-    server.insert("args".into(), serde_json::Value::Array(cmd_args));
     Ok(format!(
         "# Claude Desktop — write to claude_desktop_config.json:\n\
          #   - macOS:    ~/Library/Application Support/Claude/claude_desktop_config.json\n\
@@ -480,58 +490,33 @@ fn render_claude_desktop(args: &InstallMcpArgs) -> Result<String> {
          # After editing, fully quit + relaunch Claude Desktop; \"Check for\n\
          # Updates\" is not enough.\n\
          {snippet}\n",
-        snippet = serde_json::to_string_pretty(&json!({
-            "mcpServers": { args.name.as_str(): server }
-        }))?,
+        snippet = render_json_mcp_fragment(args)?,
     ))
 }
 
 fn render_gemini_cli(args: &InstallMcpArgs) -> Result<String> {
-    let mut entry = serde_json::Map::new();
-    entry.insert("httpUrl".into(), json!(args.server_url));
-    entry.insert("timeout".into(), json!(5000));
-    if let Some(b) = bearer_header_value(args.auth_token.as_deref()) {
-        entry.insert("headers".into(), json!({"Authorization": b}));
-    }
     Ok(format!(
         "# Gemini CLI — merge into ~/.gemini/settings.json:\n\
          #\n\
          # Gemini CLI uses `httpUrl` (not `url`) for streamable-HTTP\n\
          # endpoints. The `timeout` is in milliseconds.\n\
          {snippet}\n",
-        snippet = serde_json::to_string_pretty(&json!({
-            "mcpServers": { args.name.as_str(): entry }
-        }))?,
+        snippet = render_json_mcp_fragment(args)?,
     ))
 }
 
 fn render_openclaw(args: &InstallMcpArgs) -> Result<String> {
-    let mut entry = serde_json::Map::new();
-    entry.insert("url".into(), json!(args.server_url));
-    entry.insert("transport".into(), json!("streamable-http"));
-    if let Some(b) = bearer_header_value(args.auth_token.as_deref()) {
-        entry.insert("headers".into(), json!({"Authorization": b}));
-    }
     Ok(format!(
         "# OpenClaw — merge into ~/.openclaw/config.json:\n\
          #\n\
          # OpenClaw distinguishes transports explicitly. Use\n\
          # \"transport\": \"streamable-http\" for ai-memory's HTTP endpoint.\n\
          {snippet}\n",
-        snippet = serde_json::to_string_pretty(&json!({
-            "mcp": { "servers": { args.name.as_str(): entry } }
-        }))?,
+        snippet = render_json_mcp_fragment(args)?,
     ))
 }
 
 fn render_pi(args: &InstallMcpArgs) -> Result<String> {
-    let mut entry = serde_json::Map::new();
-    entry.insert("type".into(), json!("http"));
-    entry.insert("url".into(), json!(args.server_url));
-    entry.insert("enabled".into(), json!(true));
-    if let Some(b) = bearer_header_value(args.auth_token.as_deref()) {
-        entry.insert("headers".into(), json!({"Authorization": b}));
-    }
     Ok(format!(
         "# Oh My Pi / OMP — merge into ~/.omp/agent/mcp.json:\n\
          #\n\
@@ -539,9 +524,7 @@ fn render_pi(args: &InstallMcpArgs) -> Result<String> {
          # `.omp` config directories; `pi` is accepted here as the compatible\n\
          # client name. Restart `omp` after changing MCP config.\n\
          {snippet}\n",
-        snippet = serde_json::to_string_pretty(&json!({
-            "mcpServers": { args.name.as_str(): entry }
-        }))?,
+        snippet = render_json_mcp_fragment(args)?,
     ))
 }
 
