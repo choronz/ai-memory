@@ -342,6 +342,24 @@ impl Config {
         }))
     }
 
+    /// OpenAI-compatible embedding key. Direct OpenAI keeps requiring
+    /// `OPENAI_API_KEY`; a custom embedding base URL may reuse `LLM_API_KEY`
+    /// for gateways such as OpenRouter.
+    fn openai_embedding_api_key(&self) -> LlmResult<SecretString> {
+        if let Some(key) = self.runtime_env.openai_api_key.clone() {
+            return Ok(key);
+        }
+        if non_empty(self.embedding_base_url.as_deref()).is_some() {
+            if let Some(key) = self.runtime_env.llm_api_key.clone() {
+                return Ok(key);
+            }
+            return Err(LlmError::NotConfigured(
+                "OPENAI_API_KEY or LLM_API_KEY required for openai-compatible embeddings".into(),
+            ));
+        }
+        Err(LlmError::NotConfigured("OPENAI_API_KEY".into()))
+    }
+
     /// Build the configured embedder settings, if hybrid search is enabled.
     ///
     /// # Errors
@@ -373,11 +391,7 @@ impl Config {
             .embedding_dim
             .unwrap_or_else(|| ai_memory_llm::default_embedding_dim(provider, &model));
         let api_key = match provider {
-            EmbedderChoice::OpenAi => self
-                .runtime_env
-                .openai_api_key
-                .clone()
-                .ok_or_else(|| LlmError::NotConfigured("OPENAI_API_KEY".into()))?,
+            EmbedderChoice::OpenAi => self.openai_embedding_api_key()?,
             EmbedderChoice::Voyage => self
                 .runtime_env
                 .voyage_api_key
@@ -462,6 +476,7 @@ fn canonicalise_or_keep(p: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secrecy::ExposeSecret;
     use tempfile::TempDir;
 
     #[test]
@@ -541,5 +556,43 @@ mod tests {
             cfg.embedder_config().unwrap().unwrap().provider,
             EmbedderChoice::Google
         );
+    }
+
+    #[test]
+    fn openai_embedding_falls_back_to_llm_api_key_for_openrouter() {
+        let cfg = Config {
+            embedding_provider: Some("openai".into()),
+            embedding_model: Some("text-embedding-3-small".into()),
+            embedding_base_url: Some("https://openrouter.ai/api/v1".into()),
+            runtime_env: RuntimeEnv {
+                llm_api_key: Some(SecretString::from("sk-or-test-key")),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let embedder = cfg.embedder_config().unwrap().unwrap();
+        assert_eq!(embedder.provider, EmbedderChoice::OpenAi);
+        assert_eq!(embedder.model, "text-embedding-3-small");
+        assert_eq!(embedder.api_key.expose_secret(), "sk-or-test-key");
+        assert_eq!(
+            embedder.base_url.as_deref(),
+            Some("https://openrouter.ai/api/v1")
+        );
+    }
+
+    #[test]
+    fn openai_embedding_does_not_use_llm_api_key_without_custom_base_url() {
+        let cfg = Config {
+            embedding_provider: Some("openai".into()),
+            runtime_env: RuntimeEnv {
+                llm_api_key: Some(SecretString::from("sk-or-test-key")),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let err = cfg.embedder_config().unwrap_err();
+        assert!(matches!(err, LlmError::NotConfigured(msg) if msg == "OPENAI_API_KEY"));
     }
 }

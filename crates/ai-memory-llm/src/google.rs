@@ -84,31 +84,45 @@ impl GoogleEmbedder {
         };
 
         debug!(url, model = %self.model, ?task_type, "POST google/embedContent");
-        let resp = self
-            .client
-            .post(&url)
-            .header("x-goog-api-key", self.api_key.expose_secret())
-            .json(&body)
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(LlmError::Provider {
-                status: status.as_u16(),
-                body: truncate_with_ellipsis(&body_text, 1024),
-            });
+        let mut attempt = 0u32;
+        loop {
+            let resp = self
+                .client
+                .post(&url)
+                .header("x-goog-api-key", self.api_key.expose_secret())
+                .json(&body)
+                .send()
+                .await?;
+            let status = resp.status();
+            if status.as_u16() == 429 && attempt < 5 {
+                attempt += 1;
+                let delay = Duration::from_secs(2u64.saturating_pow(attempt));
+                debug!(
+                    attempt,
+                    ?delay,
+                    "google embedContent rate-limited; retrying"
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            if !status.is_success() {
+                let body_text = resp.text().await.unwrap_or_default();
+                return Err(LlmError::Provider {
+                    status: status.as_u16(),
+                    body: truncate_with_ellipsis(&body_text, 1024),
+                });
+            }
+            let parsed: GeminiEmbedResponse = resp.json().await?;
+            let values = parsed.embedding.values;
+            if values.len() as u32 != self.dim {
+                return Err(LlmError::UnexpectedShape(format!(
+                    "expected dim {}, got {}",
+                    self.dim,
+                    values.len()
+                )));
+            }
+            return Ok(normalise(values));
         }
-        let parsed: GeminiEmbedResponse = resp.json().await?;
-        let values = parsed.embedding.values;
-        if values.len() as u32 != self.dim {
-            return Err(LlmError::UnexpectedShape(format!(
-                "expected dim {}, got {}",
-                self.dim,
-                values.len()
-            )));
-        }
-        Ok(normalise(values))
     }
 }
 

@@ -152,9 +152,11 @@ alternatives:
 > reasoning off.
 
 ai-memory's consolidator uses OpenAI's `json_schema` strict mode for
-structured output. Most modern models honour this, but if you switch
-to a niche local model, run a quick `ai-memory llm-test` (with a
-structured prompt) before trusting it.
+structured output. The OpenAI provider normalizes schemars output into
+OpenAI's supported subset (`additionalProperties: false`, complete
+`required`, generated enum `anyOf`, and plain `$ref` nodes). Most modern
+models honour this, but if you switch to a niche local model, run a quick
+`ai-memory llm-test` (with a structured prompt) before trusting it.
 
 ## Backups
 

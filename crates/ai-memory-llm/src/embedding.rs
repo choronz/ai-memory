@@ -21,7 +21,11 @@ use tracing::debug;
 
 use crate::error::{LlmError, LlmResult};
 use crate::openai::normalize_openai_base;
-use crate::text::truncate_with_ellipsis;
+use crate::text::{truncate_for_embedding, truncate_with_ellipsis};
+
+/// Conservative per-request input cap for OpenAI-compatible embedding APIs
+/// (8192 token server limit; we stay well below with head truncation).
+const OPENAI_EMBED_MAX_TOKENS: usize = 5000;
 
 /// Provider-agnostic embedding API.
 ///
@@ -111,6 +115,74 @@ struct OpenAiEmbeddingDatum {
     embedding: Vec<f32>,
 }
 
+/// Parse OpenAI-compatible embedding responses, including OpenRouter error bodies.
+fn parse_openai_embedding_values(body: &str, status: u16) -> LlmResult<Vec<f32>> {
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| LlmError::Provider {
+        status,
+        body: truncate_with_ellipsis(&format!("openai embeddings json: {e}; body={body}"), 1024),
+    })?;
+    if let Some(err) = v.get("error") {
+        let msg = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .or_else(|| err.as_str())
+            .unwrap_or("unknown");
+        return Err(LlmError::Provider {
+            status,
+            body: truncate_with_ellipsis(msg, 1024),
+        });
+    }
+    if let Some(data) = v.get("data").and_then(|d| d.as_array()) {
+        let first = data.first().ok_or_else(|| LlmError::Provider {
+            status,
+            body: truncate_with_ellipsis(
+                &format!("openai embeddings data[] empty; body={body}"),
+                512,
+            ),
+        })?;
+        let emb = first
+            .get("embedding")
+            .and_then(|e| e.as_array())
+            .ok_or_else(|| LlmError::Provider {
+                status,
+                body: truncate_with_ellipsis(
+                    &format!("missing embedding array in data[0]; body={body}"),
+                    512,
+                ),
+            })?;
+        let mut out = Vec::with_capacity(emb.len());
+        for n in emb {
+            let f = n.as_f64().ok_or_else(|| LlmError::Provider {
+                status,
+                body: truncate_with_ellipsis(
+                    &format!("non-numeric embedding value in data[0]; body={body}"),
+                    512,
+                ),
+            })?;
+            out.push(f as f32);
+        }
+        if !out.is_empty() {
+            return Ok(out);
+        }
+    }
+    // Strict OpenAI shape fallback.
+    let parsed: OpenAiEmbeddingResponse =
+        serde_json::from_value(v).map_err(|e| LlmError::Provider {
+            status,
+            body: truncate_with_ellipsis(
+                &format!("openai embeddings shape: {e}; body={body}"),
+                1024,
+            ),
+        })?;
+    let first = parsed.data.into_iter().next().ok_or_else(|| {
+        LlmError::UnexpectedShape(format!(
+            "openai response had no data[0]; body={}",
+            truncate_with_ellipsis(body, 512)
+        ))
+    })?;
+    Ok(first.embedding)
+}
+
 #[async_trait]
 impl Embedder for OpenAiEmbedder {
     fn provider(&self) -> &'static str {
@@ -126,40 +198,61 @@ impl Embedder for OpenAiEmbedder {
     }
 
     async fn embed(&self, text: &str) -> LlmResult<Vec<f32>> {
+        let input = truncate_for_embedding(text, OPENAI_EMBED_MAX_TOKENS);
         let url = normalize_openai_base(&self.base_url, "embeddings");
-        debug!(url, model = %self.model, "POST openai/embeddings");
+        debug!(
+            url,
+            model = %self.model,
+            input_chars = input.len(),
+            "POST openai/embeddings"
+        );
         let req = OpenAiEmbeddingRequest {
-            input: text,
+            input: &input,
             model: &self.model,
         };
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(self.api_key.expose_secret())
-            .json(&req)
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
+        let mut attempt = 0u32;
+        loop {
+            let resp = self
+                .client
+                .post(&url)
+                .bearer_auth(self.api_key.expose_secret())
+                .json(&req)
+                .send()
+                .await?;
+            let status = resp.status();
+            if status.as_u16() == 429 && attempt < 5 {
+                attempt += 1;
+                let delay = Duration::from_secs(2u64.saturating_pow(attempt));
+                debug!(attempt, ?delay, "openai embeddings rate-limited; retrying");
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            // Client errors (e.g. input > 8192 tokens) are not retried.
+            if status.as_u16() == 400 {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(LlmError::Provider {
+                    status: status.as_u16(),
+                    body: truncate_with_ellipsis(&body, 1024),
+                });
+            }
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(LlmError::Provider {
+                    status: status.as_u16(),
+                    body: truncate_with_ellipsis(&body, 1024),
+                });
+            }
             let body = resp.text().await.unwrap_or_default();
-            return Err(LlmError::Provider {
-                status: status.as_u16(),
-                body: truncate_with_ellipsis(&body, 1024),
-            });
+            let values = parse_openai_embedding_values(&body, status.as_u16())?;
+            if values.len() as u32 != self.dim {
+                return Err(LlmError::UnexpectedShape(format!(
+                    "expected dim {}, got {}",
+                    self.dim,
+                    values.len()
+                )));
+            }
+            return Ok(normalise(values));
         }
-        let parsed: OpenAiEmbeddingResponse = resp.json().await?;
-        let first =
-            parsed.data.into_iter().next().ok_or_else(|| {
-                LlmError::UnexpectedShape("openai response had no data[0]".into())
-            })?;
-        if first.embedding.len() as u32 != self.dim {
-            return Err(LlmError::UnexpectedShape(format!(
-                "expected dim {}, got {}",
-                self.dim,
-                first.embedding.len()
-            )));
-        }
-        Ok(normalise(first.embedding))
     }
 }
 
@@ -386,5 +479,26 @@ mod tests {
         let a = e.embed("compile not retrieve").await.unwrap();
         let b = e.embed("compile not retrieve").await.unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn parse_openai_embedding_accepts_data_array() {
+        let body = r#"{"data":[{"embedding":[0.1,0.2,0.3]}]}"#;
+        let v = parse_openai_embedding_values(body, 200).unwrap();
+        assert_eq!(v.len(), 3);
+    }
+
+    #[test]
+    fn parse_openai_embedding_accepts_openrouter_error() {
+        let body = r#"{"error":{"message":"Provider returned error","code":502}}"#;
+        let err = parse_openai_embedding_values(body, 502).unwrap_err();
+        assert!(matches!(err, LlmError::Provider { status: 502, .. }));
+    }
+
+    #[test]
+    fn parse_openai_embedding_rejects_non_numeric_values() {
+        let body = r#"{"data":[{"embedding":[0.1,"oops",0.3]}]}"#;
+        let err = parse_openai_embedding_values(body, 200).unwrap_err();
+        assert!(matches!(err, LlmError::Provider { status: 200, .. }));
     }
 }

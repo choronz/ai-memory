@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use ai_memory_core::{PagePath, ProjectId, WorkspaceId};
 use notify::{EventKind, RecursiveMode};
-use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
+use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -36,9 +36,14 @@ pub const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 /// Debounce window for filesystem events.
 pub const DEBOUNCE_WINDOW: Duration = Duration::from_millis(300);
 
+#[cfg(all(test, target_os = "macos"))]
+type PlatformWatcher = notify::PollWatcher;
+#[cfg(not(all(test, target_os = "macos")))]
+type PlatformWatcher = notify::RecommendedWatcher;
+
 /// Handle representing an active watcher; drop to stop.
 pub struct WatcherHandle {
-    _debouncer: Debouncer<notify::RecommendedWatcher, RecommendedCache>,
+    _debouncer: Debouncer<PlatformWatcher, RecommendedCache>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -57,7 +62,7 @@ impl WatcherHandle {
     pub fn start(wiki: Wiki) -> WikiResult<Self> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
-        let mut debouncer = new_debouncer(
+        let mut debouncer = new_debouncer_opt::<_, PlatformWatcher, RecommendedCache>(
             DEBOUNCE_WINDOW,
             None,
             move |result: DebounceEventResult| match result {
@@ -72,6 +77,8 @@ impl WatcherHandle {
                     }
                 }
             },
+            RecommendedCache::new(),
+            watcher_config(),
         )
         .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))?;
 
@@ -105,6 +112,21 @@ impl Drop for WatcherHandle {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
         }
+    }
+}
+
+fn watcher_config() -> notify::Config {
+    let config = notify::Config::default();
+    #[cfg(all(test, target_os = "macos"))]
+    {
+        // GitHub macOS runners have flaky FSEvents delivery for tempdir unit
+        // tests. Use the polling backend there so the test covers our watcher
+        // loop without depending on runner-specific FSEvents behavior.
+        config.with_poll_interval(DEBOUNCE_WINDOW)
+    }
+    #[cfg(not(all(test, target_os = "macos")))]
+    {
+        config
     }
 }
 
