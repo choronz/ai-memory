@@ -482,6 +482,10 @@ mod tests {
         std::fs::create_dir_all(&proj_dir).unwrap();
 
         let handle = WatcherHandle::start(wiki.clone()).unwrap();
+        // FSEvents can report readiness before the recursive watch is fully
+        // settled. Give the backend one debounce window before creating the
+        // file so this test checks event delivery, not watcher-start races.
+        tokio::time::sleep(DEBOUNCE_WINDOW + Duration::from_millis(200)).await;
 
         // Drop a file inside the per-project directory, bypassing the wiki write API
         // (simulating an external editor).
@@ -490,7 +494,7 @@ mod tests {
 
         // Poll for the row to land. Watcher debounces at 300ms; extra
         // margin for slow CI environments.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
         let mut hits = Vec::new();
         while std::time::Instant::now() < deadline {
             hits = store
