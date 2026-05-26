@@ -181,6 +181,13 @@ async fn handle_event(wiki: &Wiki, event: notify_debouncer_full::DebouncedEvent)
         return;
     }
     for raw_path in &event.paths {
+        if raw_path.is_dir() {
+            let Some((ws, proj, proj_root)) = extract_project_dir_ids(wiki.root(), raw_path) else {
+                continue;
+            };
+            reindex_project_dir(wiki, ws, proj, proj_root).await;
+            continue;
+        }
         if !is_markdown(raw_path) {
             continue;
         }
@@ -200,6 +207,32 @@ async fn handle_event(wiki: &Wiki, event: notify_debouncer_full::DebouncedEvent)
         match wiki.reindex_page(ws, proj, page_path.clone()).await {
             Ok(_) => debug!(path = %page_path, "reindexed via watcher"),
             Err(e) => warn!(path = %page_path, error = %e, "watcher reindex failed"),
+        }
+    }
+}
+
+async fn reindex_project_dir(
+    wiki: &Wiki,
+    ws: WorkspaceId,
+    proj: ProjectId,
+    proj_root: std::path::PathBuf,
+) {
+    let pages = match tokio::task::spawn_blocking(move || walk_markdown(&proj_root)).await {
+        Ok(Ok(pages)) => pages,
+        Ok(Err(e)) => {
+            warn!(error = %e, "watcher directory walk failed");
+            return;
+        }
+        Err(e) => {
+            warn!(error = %e, "watcher directory walk task failed");
+            return;
+        }
+    };
+
+    for path in pages {
+        match wiki.reindex_page(ws, proj, path.clone()).await {
+            Ok(_) => debug!(path = %path, "reindexed via watcher directory event"),
+            Err(e) => warn!(path = %path, error = %e, "watcher directory reindex failed"),
         }
     }
 }
@@ -303,6 +336,22 @@ pub(crate) fn extract_project_ids(
     }
     let page_path = PagePath::new(page_str).ok()?;
     Some((ws_id, proj_id, page_path))
+}
+
+fn extract_project_dir_ids(
+    wiki_root: &Path,
+    event_path: &Path,
+) -> Option<(WorkspaceId, ProjectId, std::path::PathBuf)> {
+    let rel = event_path.strip_prefix(wiki_root).ok()?;
+    let mut components = rel.components();
+
+    let ws_seg = components.next()?.as_os_str().to_str()?;
+    let ws_id = WorkspaceId::from_str(ws_seg).ok()?;
+
+    let proj_seg = components.next()?.as_os_str().to_str()?;
+    let proj_id = ProjectId::from_str(proj_seg).ok()?;
+
+    Some((ws_id, proj_id, wiki_root.join(ws_seg).join(proj_seg)))
 }
 
 fn walk_markdown(root: &Path) -> WikiResult<Vec<PagePath>> {
@@ -510,6 +559,37 @@ mod tests {
         assert!(!hits.is_empty(), "watcher did not pick up external write");
         assert_eq!(hits[0].path.as_str(), "external.md");
         handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn directory_event_reindexes_project_markdown() {
+        let (tmp, store, wiki, ws, proj) = setup().await;
+        let proj_dir = tmp
+            .path()
+            .join("wiki")
+            .join(ws.to_string())
+            .join(proj.to_string());
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        std::fs::write(
+            proj_dir.join("external.md"),
+            "Directory event should reindex this page.\n",
+        )
+        .unwrap();
+
+        let event = notify_debouncer_full::DebouncedEvent::new(
+            notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+                .add_path(proj_dir),
+            std::time::Instant::now(),
+        );
+        handle_event(&wiki, event).await;
+
+        let hits = store
+            .reader
+            .search_pages("reindex".into(), 5)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path.as_str(), "external.md");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
