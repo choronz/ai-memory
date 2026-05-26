@@ -61,6 +61,15 @@ pub(crate) fn gemini_settings_path() -> anyhow::Result<std::path::PathBuf> {
         .join("settings.json"))
 }
 
+/// `~/.gemini/config/hooks.json` — Antigravity CLI lifecycle hooks.
+pub(crate) fn antigravity_hooks_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(dirs::home_dir()
+        .context("could not locate $HOME for ~/.gemini/config/hooks.json")?
+        .join(".gemini")
+        .join("config")
+        .join("hooks.json"))
+}
+
 /// `~/.config/opencode/plugins/ai-memory.ts` — OpenCode's plugin file.
 pub(crate) fn opencode_plugin_path() -> anyhow::Result<std::path::PathBuf> {
     Ok(dirs::home_dir()
@@ -68,6 +77,16 @@ pub(crate) fn opencode_plugin_path() -> anyhow::Result<std::path::PathBuf> {
         .join(".config")
         .join("opencode")
         .join("plugins")
+        .join("ai-memory.ts"))
+}
+
+/// `~/.omp/agent/extensions/ai-memory.ts` — OMP lifecycle extension.
+pub(crate) fn omp_extension_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(dirs::home_dir()
+        .context("could not locate $HOME for ~/.omp/agent/extensions")?
+        .join(".omp")
+        .join("agent")
+        .join("extensions")
         .join("ai-memory.ts"))
 }
 
@@ -450,11 +469,7 @@ fn apply_to_antigravity_settings(
 ) -> Result<()> {
     let path = match &args.config_file {
         Some(p) => p.clone(),
-        None => dirs::home_dir()
-            .context("could not locate $HOME for ~/.gemini/config/hooks.json")?
-            .join(".gemini")
-            .join("config")
-            .join("hooks.json"),
+        None => antigravity_hooks_path()?,
     };
     let staged = stage_hook_scripts(hooks_dir, "antigravity-cli")?;
     let command_dir = staged_command_dir(&staged, "antigravity-cli");
@@ -830,12 +845,7 @@ fn resolve_omp_extension_path(args: &InstallHooksArgs) -> Result<PathBuf> {
     if let Some(p) = &args.config_file {
         return Ok(p.clone());
     }
-    Ok(dirs::home_dir()
-        .context("could not locate $HOME for ~/.omp/agent/extensions")?
-        .join(".omp")
-        .join("agent")
-        .join("extensions")
-        .join("ai-memory.ts"))
+    omp_extension_path()
 }
 
 fn build_omp_extension(server_url: &str, auth_token: Option<&str>) -> String {

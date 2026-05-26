@@ -120,6 +120,15 @@ pub struct UninstallArgs {
     /// Limit to one concern. Omitted = hooks + mcp + instructions.
     #[arg(long, value_enum)]
     pub only: Option<UninstallOnly>,
+    /// Optional MCP server entry-name filter. Uninstall never matches by name
+    /// alone; when this is set, the entry must match both name and `--mcp-url`.
+    #[arg(long = "mcp-name")]
+    pub mcp_name: Option<String>,
+    /// MCP endpoint URL used to identify ai-memory server entries. Defaults to
+    /// the standard local endpoint; pass this when you installed with a custom
+    /// `install-mcp --server-url`.
+    #[arg(long = "mcp-url", visible_alias = "server-url", default_value_t = crate::config::DEFAULT_MCP_URL.to_string())]
+    pub mcp_url: String,
     /// Skip the interactive confirmation when a TTY is attached.
     #[arg(long)]
     pub yes: bool,
@@ -406,7 +415,7 @@ pub enum AgentChoice {
 /// hook-capable agents (Claude Code / Codex / OpenCode — same MCP
 /// surface, also covered by `install-hooks`) and the MCP-only
 /// clients researched in docs/mcp-install.md.
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum McpClient {
     /// Anthropic Claude Code — `claude mcp add`.
     ClaudeCode,

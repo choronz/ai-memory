@@ -422,6 +422,7 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | `install-mcp --client` | `docker run --rm` | MCP-config snippet per client |
 | `install-hooks --agent` | `docker run --rm` | Hook-config snippet for an existing hooks dir |
 | `setup-agent --agent --to --host-prefix` | `docker run --rm -v` | Extract bundled scripts + print config (one-shot) |
+| `uninstall --apply` | same host environment used for install | Remove only ai-memory-owned hooks, MCP entries, and instruction blocks; generated plugin files are deleted only after content validation. Use `--mcp-url` for custom MCP endpoints and `--mcp-name` only to narrow removal. |
 | `llm-test --provider …` | `docker run --rm -e …` | Smoke-test an LLM provider |
 
 Data dir inside the container is `/data` (mounted via the compose

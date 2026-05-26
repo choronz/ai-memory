@@ -11,20 +11,94 @@ use crate::cli::UninstallArgs;
 use crate::commands::apply_shared::apply_atomic;
 use crate::commands::apply_shared::mutate_json;
 use crate::commands::apply_shared::mutate_toml;
-use crate::commands::{data_purge, install_hooks, install_mcp};
-use crate::config::{Config, DEFAULT_MCP_URL};
+use crate::commands::{data_purge, install_hooks, install_mcp, openclaw_plugin};
+use crate::config::Config;
 use ai_memory_core::{MARKER_END, MARKER_START};
 use anyhow::{Context, Result};
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// One rewrite operation to apply to a config file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RewriteOp {
+    /// CLAUDE.md / AGENTS.md routing block.
+    Instructions,
+    /// Standard JSON hook table under `hooks`.
+    HooksJson,
+    /// Antigravity CLI named hook group under top-level `ai-memory`.
+    AntigravityHooksJson,
+    /// MCP JSON config for one client shape.
+    McpJson(McpClient),
+    /// Codex TOML MCP config.
+    McpToml,
+}
+
+/// Generated files that uninstall may delete after content re-validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteKind {
+    OpenCodePlugin,
+    OmpExtension,
+    OpenClawPackageJson,
+    OpenClawManifest,
+    OpenClawEntrypoint,
+}
+
+impl DeleteKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::OpenCodePlugin => "OpenCode plugin",
+            Self::OmpExtension => "OMP extension",
+            Self::OpenClawPackageJson => "OpenClaw package manifest",
+            Self::OpenClawManifest => "OpenClaw plugin manifest",
+            Self::OpenClawEntrypoint => "OpenClaw plugin entrypoint",
+        }
+    }
+}
 
 /// One file the uninstall will touch, plus what it will do to it.
 #[derive(Debug)]
 enum PlannedChange {
     /// JSON/TOML rewrite removing the listed items (events or server names).
-    Rewrite { path: PathBuf, removed: Vec<String> },
-    /// Whole-file delete (OpenCode plugin).
-    DeleteFile { path: PathBuf },
+    Rewrite {
+        path: PathBuf,
+        removed: Vec<String>,
+        ops: Vec<RewriteOp>,
+    },
+    /// Whole-file delete, limited to generated files whose contents still
+    /// prove they are ai-memory-owned at apply time.
+    DeleteFile { path: PathBuf, kind: DeleteKind },
+}
+
+fn push_rewrite(plan: &mut Vec<PlannedChange>, path: PathBuf, removed: Vec<String>, op: RewriteOp) {
+    if removed.is_empty() {
+        return;
+    }
+    for change in plan.iter_mut() {
+        if let PlannedChange::Rewrite {
+            path: existing,
+            removed: existing_removed,
+            ops,
+        } = change
+            && *existing == path
+        {
+            existing_removed.extend(removed);
+            if !ops.contains(&op) {
+                ops.push(op);
+            }
+            return;
+        }
+    }
+    plan.push(PlannedChange::Rewrite {
+        path,
+        removed,
+        ops: vec![op],
+    });
+}
+
+fn push_generated_delete(plan: &mut Vec<PlannedChange>, path: PathBuf, kind: DeleteKind) {
+    if generated_file_is_ours(&path, kind) {
+        plan.push(PlannedChange::DeleteFile { path, kind });
+    }
 }
 
 /// Build the full removal plan by reading each existing config file and
@@ -33,8 +107,8 @@ enum PlannedChange {
 fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
     let mut plan = Vec::new();
     let want = |k: crate::cli::UninstallOnly| args.only.is_none() || args.only == Some(k);
-    let name = "ai-memory";
-    let url = DEFAULT_MCP_URL;
+    let name = args.mcp_name.as_deref();
+    let url = args.mcp_url.as_str();
 
     // ---- Hooks (JSON configs) ----
     if want(crate::cli::UninstallOnly::Hooks) {
@@ -51,17 +125,49 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
             let content = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
             let removal = strip_ai_memory_hooks(&content)?;
-            if !removal.removed_events.is_empty() {
-                plan.push(PlannedChange::Rewrite {
-                    path,
-                    removed: removal.removed_events,
-                });
-            }
+            push_rewrite(
+                &mut plan,
+                path,
+                removal.removed_events,
+                RewriteOp::HooksJson,
+            );
         }
+
+        let antigravity = install_hooks::antigravity_hooks_path()?;
+        if antigravity.exists() {
+            let content = std::fs::read_to_string(&antigravity)
+                .with_context(|| format!("reading {}", antigravity.display()))?;
+            let removal = strip_antigravity_hooks(&content)?;
+            push_rewrite(
+                &mut plan,
+                antigravity,
+                removal.removed_events,
+                RewriteOp::AntigravityHooksJson,
+            );
+        }
+
         let plugin = install_hooks::opencode_plugin_path()?;
-        if plugin.exists() {
-            plan.push(PlannedChange::DeleteFile { path: plugin });
-        }
+        push_generated_delete(&mut plan, plugin, DeleteKind::OpenCodePlugin);
+
+        let omp = install_hooks::omp_extension_path()?;
+        push_generated_delete(&mut plan, omp, DeleteKind::OmpExtension);
+
+        let openclaw_dir = openclaw_plugin::default_plugin_dir()?;
+        push_generated_delete(
+            &mut plan,
+            openclaw_dir.join(openclaw_plugin::PACKAGE_JSON),
+            DeleteKind::OpenClawPackageJson,
+        );
+        push_generated_delete(
+            &mut plan,
+            openclaw_dir.join(openclaw_plugin::MANIFEST_JSON),
+            DeleteKind::OpenClawManifest,
+        );
+        push_generated_delete(
+            &mut plan,
+            openclaw_dir.join(openclaw_plugin::ENTRYPOINT_TS),
+            DeleteKind::OpenClawEntrypoint,
+        );
     }
 
     // ---- MCP (per client) ----
@@ -75,6 +181,8 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
             ClaudeDesktop,
             GeminiCli,
             Openclaw,
+            Pi,
+            AntigravityCli,
         ] {
             let Ok(path) = install_mcp::mcp_config_path(client) else {
                 continue;
@@ -89,9 +197,12 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
             } else {
                 strip_mcp_json(&content, client, name, url)?
             };
-            if !removed.is_empty() {
-                plan.push(PlannedChange::Rewrite { path, removed });
-            }
+            let op = if matches!(client, Codex) {
+                RewriteOp::McpToml
+            } else {
+                RewriteOp::McpJson(client)
+            };
+            push_rewrite(&mut plan, path, removed, op);
         }
     }
 
@@ -107,10 +218,12 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
                 .with_context(|| format!("reading {}", path.display()))?;
             let (_new, found) = strip_instructions_block(&content);
             if found {
-                plan.push(PlannedChange::Rewrite {
+                push_rewrite(
+                    &mut plan,
                     path,
-                    removed: vec!["instruction block".to_string()],
-                });
+                    vec!["instruction block".to_string()],
+                    RewriteOp::Instructions,
+                );
             }
         }
     }
@@ -126,68 +239,55 @@ fn print_plan(plan: &[PlannedChange]) {
     }
     for change in plan {
         match change {
-            PlannedChange::Rewrite { path, removed } => {
+            PlannedChange::Rewrite { path, removed, .. } => {
                 println!(
                     "would remove {} from {}",
                     removed.join(", "),
                     path.display()
                 );
             }
-            PlannedChange::DeleteFile { path } => {
-                println!("would delete {}", path.display());
+            PlannedChange::DeleteFile { path, kind } => {
+                println!("would delete {} ({})", path.display(), kind.label());
             }
         }
     }
 }
 
-/// Re-run the matching stripper inside `apply_atomic` so the actual
-/// write is atomic + backed up. The stripper is chosen by filename.
-/// `only` gates which strippers run in the JSON `else` branch so that
-/// `--only hooks` does not accidentally strip `mcpServers` from a
-/// shared file (e.g. `~/.gemini/settings.json`).
-fn apply_change(
-    change: &PlannedChange,
-    name: &str,
-    url: &str,
-    only: Option<crate::cli::UninstallOnly>,
-) -> anyhow::Result<()> {
+/// Re-run the planned strippers inside `apply_atomic` so the actual write is
+/// atomic + backed up. Planning records exact operations per file, so shared
+/// files such as `~/.gemini/settings.json` only apply the selected concerns.
+fn apply_change(change: &PlannedChange, name: Option<&str>, url: &str) -> anyhow::Result<()> {
     match change {
-        PlannedChange::DeleteFile { path } => {
+        PlannedChange::DeleteFile { path, kind } => {
+            if !path.exists() {
+                return Ok(());
+            }
+            if !generated_file_is_ours(path, *kind) {
+                println!(
+                    "skipped {} because it no longer looks like an ai-memory-generated {}",
+                    path.display(),
+                    kind.label()
+                );
+                return Ok(());
+            }
             std::fs::remove_file(path).with_context(|| format!("deleting {}", path.display()))?;
             println!("✓ deleted {}", path.display());
         }
-        PlannedChange::Rewrite { path, .. } => {
-            let file = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+        PlannedChange::Rewrite { path, ops, .. } => {
             let outcome = apply_atomic(path, |existing| {
-                if file == "CLAUDE.md" || file == "AGENTS.md" {
-                    // build_plan only puts these in the plan under
-                    // Instructions; no gating needed here.
-                    Ok(strip_instructions_block(existing).0)
-                } else if file == "config.toml" {
-                    // build_plan only puts config.toml in the plan under
-                    // Mcp; no gating needed here.
-                    Ok(strip_mcp_toml(existing, name, url)?.0)
-                } else {
-                    // hooks settings/hooks.json OR a shared file with both
-                    // hooks and mcpServers (e.g. ~/.gemini/settings.json).
-                    // Gate each stripper on the --only filter so that
-                    // `--only hooks` never strips mcpServers and vice-versa.
-                    use crate::cli::UninstallOnly;
-                    let mut out = existing.to_string();
-                    if only.is_none() || only == Some(UninstallOnly::Hooks) {
-                        out = strip_ai_memory_hooks(&out)?.new_content;
-                    }
-                    if only.is_none() || only == Some(UninstallOnly::Mcp) {
-                        for client in [
-                            crate::cli::McpClient::ClaudeCode,
-                            crate::cli::McpClient::OpenCode,
-                            crate::cli::McpClient::Openclaw,
-                        ] {
-                            out = strip_mcp_json(&out, client, name, url)?.0;
+                let mut out = existing.to_string();
+                for op in ops {
+                    out = match *op {
+                        RewriteOp::Instructions => strip_instructions_block(&out).0,
+                        RewriteOp::HooksJson => strip_ai_memory_hooks(&out)?.new_content,
+                        RewriteOp::AntigravityHooksJson => {
+                            strip_antigravity_hooks(&out)?.new_content
                         }
-                    }
-                    Ok(out)
+                        RewriteOp::McpJson(client) => strip_mcp_json(&out, client, name, url)?.0,
+                        RewriteOp::McpToml => strip_mcp_toml(&out, name, url)?.0,
+                    };
                 }
+                Ok(out)
             })?;
             println!("✓ {} {}", outcome.verb(), path.display());
         }
@@ -201,8 +301,8 @@ fn apply_change(
 /// Returns an error if a config file is malformed or a removal write
 /// fails. Absent files / nothing-to-remove are not errors.
 pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
-    let name = "ai-memory";
-    let url = crate::config::DEFAULT_MCP_URL;
+    let name = args.mcp_name.clone();
+    let url = args.mcp_url.clone();
 
     let plan = build_plan(&args)?;
     print_plan(&plan);
@@ -243,7 +343,7 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
     }
 
     for change in &plan {
-        apply_change(change, name, url, args.only)?;
+        apply_change(change, name.as_deref(), &url)?;
     }
 
     if args.purge_data {
@@ -373,6 +473,63 @@ fn strip_ai_memory_hooks(content: &str) -> Result<HookRemoval> {
     })
 }
 
+/// Remove ai-memory's named Antigravity CLI hook group entries. The group
+/// name alone is not enough to prove ownership; every removed entry must still
+/// carry ai-memory's hook command signature.
+fn strip_antigravity_hooks(content: &str) -> Result<HookRemoval> {
+    let mut removed_events = Vec::new();
+    let new_content = mutate_json(content, |root| {
+        let Some(group) = root.get_mut("ai-memory").and_then(|g| g.as_object_mut()) else {
+            return Ok(());
+        };
+        let events: Vec<String> = group.keys().cloned().collect();
+        for event in events {
+            let Some(arr) = group.get_mut(&event).and_then(|v| v.as_array_mut()) else {
+                continue;
+            };
+            let before = arr.len();
+            arr.retain(|entry| !hook_entry_is_ours(entry));
+            if arr.len() != before {
+                removed_events.push(format!("ai-memory.{event}"));
+            }
+            if arr.is_empty() {
+                group.remove(&event);
+            }
+        }
+        if group.is_empty() {
+            root.remove("ai-memory");
+        }
+        Ok(())
+    })?;
+    Ok(HookRemoval {
+        new_content,
+        removed_events,
+    })
+}
+
+fn generated_file_is_ours(path: &Path, kind: DeleteKind) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    match kind {
+        DeleteKind::OpenCodePlugin => {
+            content.contains("Auto-generated by `ai-memory install-hooks --agent opencode --apply`")
+                && content.contains("const AGENT = \"open-code\";")
+        }
+        DeleteKind::OmpExtension => {
+            content.contains("Auto-generated by `ai-memory install-hooks --agent omp --apply`")
+                && content.contains("const AGENT = \"omp\";")
+        }
+        DeleteKind::OpenClawEntrypoint => {
+            content.contains("Auto-generated by `ai-memory install-hooks --agent openclaw --apply`")
+                && content.contains("definePluginEntry")
+                && content.contains("id: \"ai-memory\"")
+        }
+        DeleteKind::OpenClawPackageJson => content == openclaw_plugin::package_json(),
+        DeleteKind::OpenClawManifest => content == openclaw_plugin::manifest_json(),
+    }
+}
+
 /// Where the servers object lives in each JSON client's config.
 /// (Codex is TOML — handled separately in Task 5.)
 fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
@@ -380,21 +537,25 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         McpClient::ClaudeCode
         | McpClient::ClaudeDesktop
         | McpClient::Cursor
-        | McpClient::GeminiCli => Some(&["mcpServers"]),
+        | McpClient::GeminiCli
+        | McpClient::Pi
+        | McpClient::AntigravityCli => Some(&["mcpServers"]),
         McpClient::OpenCode => Some(&["mcp"]),
         McpClient::Openclaw => Some(&["mcp", "servers"]),
-        McpClient::Codex | McpClient::Pi => None,
+        McpClient::Codex => None,
     }
 }
 
-/// True when an MCP server entry is ai-memory's: keyed by the expected
-/// name, OR its url/httpUrl equals the endpoint, OR it is a
-/// `mcp-remote` stdio shim whose args contain the endpoint.
-fn mcp_entry_is_ours(key: &str, entry: &serde_json::Value, name: &str, url: &str) -> bool {
-    if key == name {
-        return true;
+/// True when an MCP server entry is ai-memory's: its url/httpUrl/serverUrl
+/// equals the endpoint, or it is a `mcp-remote` stdio shim whose args contain
+/// the endpoint. The key/name alone is intentionally not enough: users may
+/// have unrelated entries named `ai-memory`, and uninstall must not remove
+/// them unless the endpoint also matches.
+fn mcp_entry_is_ours(key: &str, entry: &serde_json::Value, name: Option<&str>, url: &str) -> bool {
+    if name.is_some_and(|name| key != name) {
+        return false;
     }
-    for field in ["url", "httpUrl"] {
+    for field in ["url", "httpUrl", "serverUrl"] {
         if entry.get(field).and_then(|v| v.as_str()) == Some(url) {
             return true;
         }
@@ -415,7 +576,7 @@ fn mcp_entry_is_ours(key: &str, entry: &serde_json::Value, name: &str, url: &str
 fn strip_mcp_json(
     content: &str,
     client: McpClient,
-    name: &str,
+    name: Option<&str>,
     url: &str,
 ) -> Result<(String, Vec<String>)> {
     let Some(path) = mcp_servers_path(client) else {
@@ -457,7 +618,7 @@ fn strip_mcp_json(
 
 /// Remove ai-memory's Codex MCP table by name or `url`. Returns new
 /// content and removed names. Preserves comments + other tables.
-fn strip_mcp_toml(content: &str, name: &str, url: &str) -> Result<(String, Vec<String>)> {
+fn strip_mcp_toml(content: &str, name: Option<&str>, url: &str) -> Result<(String, Vec<String>)> {
     let mut removed = Vec::new();
     let new_content = mutate_toml(content, |doc| {
         let Some(servers) = doc.get_mut("mcp_servers").and_then(|i| i.as_table_mut()) else {
@@ -471,7 +632,7 @@ fn strip_mcp_toml(content: &str, name: &str, url: &str) -> Result<(String, Vec<S
                 .and_then(|t| t.get("url"))
                 .and_then(|u| u.as_str())
                 == Some(url);
-            if k == name || matches_url {
+            if name.is_none_or(|name| k == name) && matches_url {
                 servers.remove(&k);
                 removed.push(k);
             }
@@ -611,12 +772,93 @@ mod tests {
     }
 
     #[test]
+    fn strip_antigravity_hooks_removes_only_signed_entries() {
+        let content = r#"{
+          "ai-memory": {
+            "PreInvocation": [
+              {"type":"command","command":"AI_MEMORY_HOOK_URL=http://h /x/session-start.sh"},
+              {"type":"command","command":"/usr/bin/user-hook"}
+            ],
+            "Stop": [
+              {"type":"command","command":"AI_MEMORY_HOOK_URL=http://h /x/stop.sh"}
+            ]
+          },
+          "my-group": {
+            "Stop": [{"type":"command","command":"/usr/bin/other"}]
+          }
+        }"#;
+
+        let out = strip_antigravity_hooks(content).unwrap();
+        assert_eq!(
+            out.removed_events,
+            vec![
+                "ai-memory.PreInvocation".to_string(),
+                "ai-memory.Stop".to_string()
+            ]
+        );
+        let v: serde_json::Value = serde_json::from_str(&out.new_content).unwrap();
+        assert_eq!(v["ai-memory"]["PreInvocation"].as_array().unwrap().len(), 1);
+        assert!(v["ai-memory"].get("Stop").is_none());
+        assert!(v.get("my-group").is_some());
+    }
+
+    #[test]
+    fn generated_file_detection_rejects_user_files_at_ours_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ai-memory.ts");
+        std::fs::write(&path, "// my personal plugin named ai-memory\n").unwrap();
+
+        assert!(!generated_file_is_ours(&path, DeleteKind::OpenCodePlugin));
+
+        std::fs::write(
+            &path,
+            "// Auto-generated by `ai-memory install-hooks --agent opencode --apply`.\nconst AGENT = \"open-code\";\n",
+        )
+        .unwrap();
+        assert!(generated_file_is_ours(&path, DeleteKind::OpenCodePlugin));
+    }
+
+    #[test]
+    fn generated_openclaw_package_detection_requires_our_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("package.json");
+        std::fs::write(&path, r#"{"name":"@ai-memory/openclaw-plugin"}"#).unwrap();
+
+        assert!(!generated_file_is_ours(
+            &path,
+            DeleteKind::OpenClawPackageJson
+        ));
+
+        std::fs::write(&path, openclaw_plugin::package_json()).unwrap();
+        assert!(generated_file_is_ours(
+            &path,
+            DeleteKind::OpenClawPackageJson
+        ));
+    }
+
+    #[test]
+    fn generated_openclaw_manifest_detection_requires_exact_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("openclaw.plugin.json");
+        std::fs::write(
+            &path,
+            r#"{"id":"ai-memory","name":"ai-memory","description":"custom user plugin"}"#,
+        )
+        .unwrap();
+
+        assert!(!generated_file_is_ours(&path, DeleteKind::OpenClawManifest));
+
+        std::fs::write(&path, openclaw_plugin::manifest_json()).unwrap();
+        assert!(generated_file_is_ours(&path, DeleteKind::OpenClawManifest));
+    }
+
+    #[test]
     fn strip_mcp_claude_by_name_keeps_others() {
         let content = r#"{"mcpServers":{"ai-memory":{"type":"http","url":"http://127.0.0.1:49374/mcp"},"other":{"url":"http://x"}}}"#;
         let (out, removed) = strip_mcp_json(
             content,
             McpClient::ClaudeCode,
-            "ai-memory",
+            Some("ai-memory"),
             "http://127.0.0.1:49374/mcp",
         )
         .unwrap();
@@ -632,7 +874,7 @@ mod tests {
         let (out, removed) = strip_mcp_json(
             content,
             McpClient::ClaudeCode,
-            "ai-memory",
+            None,
             "http://127.0.0.1:49374/mcp",
         )
         .unwrap();
@@ -649,12 +891,61 @@ mod tests {
     }
 
     #[test]
+    fn strip_mcp_name_only_does_not_remove_user_entry() {
+        let content = r#"{"mcpServers":{"ai-memory":{"url":"http://example.invalid/mcp"}}}"#;
+        let (out, removed) = strip_mcp_json(
+            content,
+            McpClient::ClaudeCode,
+            Some("ai-memory"),
+            "http://127.0.0.1:49374/mcp",
+        )
+        .unwrap();
+
+        assert!(removed.is_empty());
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["mcpServers"].get("ai-memory").is_some());
+    }
+
+    #[test]
+    fn strip_mcp_antigravity_server_url() {
+        let content = r#"{"mcpServers":{"mem":{"serverUrl":"http://127.0.0.1:49374/mcp"},"other":{"serverUrl":"http://x"}}}"#;
+        let (out, removed) = strip_mcp_json(
+            content,
+            McpClient::AntigravityCli,
+            None,
+            "http://127.0.0.1:49374/mcp",
+        )
+        .unwrap();
+
+        assert_eq!(removed, vec!["mem".to_string()]);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["mcpServers"].get("mem").is_none());
+        assert!(v["mcpServers"].get("other").is_some());
+    }
+
+    #[test]
+    fn strip_mcp_pi_root_servers() {
+        let content = r#"{"mcpServers":{"ai-memory":{"type":"http","url":"http://127.0.0.1:49374/mcp","enabled":true}}}"#;
+        let (out, removed) = strip_mcp_json(
+            content,
+            McpClient::Pi,
+            Some("ai-memory"),
+            "http://127.0.0.1:49374/mcp",
+        )
+        .unwrap();
+
+        assert_eq!(removed, vec!["ai-memory".to_string()]);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("mcpServers").is_none());
+    }
+
+    #[test]
     fn strip_mcp_claude_desktop_mcp_remote_args() {
         let content = r#"{"mcpServers":{"weird-name":{"command":"npx","args":["-y","mcp-remote","http://127.0.0.1:49374/mcp"]}}}"#;
         let (_out, removed) = strip_mcp_json(
             content,
             McpClient::ClaudeDesktop,
-            "ai-memory",
+            None,
             "http://127.0.0.1:49374/mcp",
         )
         .unwrap();
@@ -667,7 +958,7 @@ mod tests {
         let (out, removed) = strip_mcp_json(
             content,
             McpClient::Openclaw,
-            "ai-memory",
+            Some("ai-memory"),
             "http://127.0.0.1:49374/mcp",
         )
         .unwrap();
@@ -682,7 +973,7 @@ mod tests {
         let (_out, removed) = strip_mcp_json(
             content,
             McpClient::ClaudeCode,
-            "ai-memory",
+            Some("ai-memory"),
             "http://127.0.0.1:49374/mcp",
         )
         .unwrap();
@@ -693,7 +984,7 @@ mod tests {
     fn strip_mcp_toml_by_name_keeps_comments_and_tables() {
         let content = "# my codex config\n[other]\nkeep = true\n\n[mcp_servers.ai-memory]\nurl = \"http://127.0.0.1:49374/mcp\"\n";
         let (out, removed) =
-            strip_mcp_toml(content, "ai-memory", "http://127.0.0.1:49374/mcp").unwrap();
+            strip_mcp_toml(content, Some("ai-memory"), "http://127.0.0.1:49374/mcp").unwrap();
         assert_eq!(removed, vec!["ai-memory".to_string()]);
         assert!(out.contains("# my codex config"));
         assert!(out.contains("[other]"));
@@ -703,8 +994,7 @@ mod tests {
     #[test]
     fn strip_mcp_toml_by_url_under_custom_name() {
         let content = "[mcp_servers.custom]\nurl = \"http://127.0.0.1:49374/mcp\"\n";
-        let (out, removed) =
-            strip_mcp_toml(content, "ai-memory", "http://127.0.0.1:49374/mcp").unwrap();
+        let (out, removed) = strip_mcp_toml(content, None, "http://127.0.0.1:49374/mcp").unwrap();
         assert_eq!(removed, vec!["custom".to_string()]);
         assert!(!out.contains("custom"));
     }
@@ -713,7 +1003,7 @@ mod tests {
     fn strip_mcp_toml_no_match_is_noop() {
         let content = "[mcp_servers.other]\nurl = \"http://x\"\n";
         let (_out, removed) =
-            strip_mcp_toml(content, "ai-memory", "http://127.0.0.1:49374/mcp").unwrap();
+            strip_mcp_toml(content, Some("ai-memory"), "http://127.0.0.1:49374/mcp").unwrap();
         assert!(removed.is_empty());
     }
 }

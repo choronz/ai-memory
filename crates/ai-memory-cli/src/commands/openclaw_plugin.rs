@@ -10,11 +10,11 @@ use crate::cli::InstallHooksArgs;
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic};
 use crate::commands::render_shared::ts_string_literal;
 
-const PLUGIN_ID: &str = "ai-memory";
-const PACKAGE_NAME: &str = "@ai-memory/openclaw-plugin";
-const PACKAGE_JSON: &str = "package.json";
-const MANIFEST_JSON: &str = "openclaw.plugin.json";
-const ENTRYPOINT_TS: &str = "index.ts";
+pub(crate) const PLUGIN_ID: &str = "ai-memory";
+pub(crate) const PACKAGE_NAME: &str = "@ai-memory/openclaw-plugin";
+pub(crate) const PACKAGE_JSON: &str = "package.json";
+pub(crate) const MANIFEST_JSON: &str = "openclaw.plugin.json";
+pub(crate) const ENTRYPOINT_TS: &str = "index.ts";
 const OPENCLAW_BIN: &str = "openclaw";
 
 /// Write and install the generated OpenClaw plugin package.
@@ -86,6 +86,10 @@ fn resolve_plugin_dir(args: &InstallHooksArgs) -> Result<PathBuf> {
     if let Some(path) = &args.config_file {
         return Ok(path.clone());
     }
+    default_plugin_dir()
+}
+
+pub(crate) fn default_plugin_dir() -> Result<PathBuf> {
     Ok(dirs::data_local_dir()
         .context("could not locate the user data-local directory")?
         .join("ai-memory")
@@ -152,7 +156,7 @@ fn install_plugin(plugin_dir: &Path) -> Result<InstallStatus> {
     Ok(InstallStatus::Installed)
 }
 
-fn package_json() -> String {
+pub(crate) fn package_json() -> String {
     serde_json::to_string_pretty(&serde_json::json!({
         "name": PACKAGE_NAME,
         "version": env!("CARGO_PKG_VERSION"),
@@ -166,7 +170,7 @@ fn package_json() -> String {
         + "\n"
 }
 
-fn manifest_json() -> String {
+pub(crate) fn manifest_json() -> String {
     serde_json::to_string_pretty(&serde_json::json!({
         "id": PLUGIN_ID,
         "name": "ai-memory",

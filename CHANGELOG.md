@@ -107,7 +107,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CLAUDE.md/AGENTS.md instruction block across all detected agents (dry-run by
   default; `--apply` to execute, with timestamped backups). `--purge-data`
   wipes wiki/db/raw via the reset guard. `--only hooks|mcp|instructions` to
-  narrow. Docker/volume teardown is printed as a hint, not executed.
+  narrow. MCP matching is endpoint-based by default; pass `--mcp-url` when the
+  server was installed with a custom endpoint and `--mcp-name` only to narrow
+  removal to one matching entry. Docker/volume teardown is printed as a hint,
+  not executed.
 
 ### Changed
 - `ai-memory uninstall --purge-data` now previews the `wiki/`/`db/`/`raw/`
@@ -115,6 +118,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ai-memory` process is alive (all-or-nothing) instead of removing the
   wiring and then skipping the purge. The data wipe is now shared with
   `reset` via a single internal helper.
+- `ai-memory uninstall` only deletes generated plugin/extension files after
+  re-validating their ai-memory-generated content, and never treats a matching
+  filename or MCP server name alone as proof of ownership.
 
 ## [0.1.3] - 2026-05-24
 
