@@ -17,7 +17,7 @@ name: release
 on:
   push:
     tags:
-      - 'v*.*.*''
+      - 'v*.*.*'
 
 env:
   CARGO_TERM_COLOR: always
@@ -146,7 +146,7 @@ jobs:
 
       - uses: docker/setup-qemu-action@v4
         with:
-          platforms: linux/arm64
+          platforms: arm64
 
       - uses: docker/setup-buildx-action@v3
 
@@ -171,7 +171,8 @@ jobs:
 
       - name: Smoke test the published image
         run: |
-          docker pull --platform linux/amd64 "${{ secrets.DOCKERHUB_USERNAME }}/ai-memory:${{ needs.validate-version.outputs.version }}"
+          docker pull --platform linux/amd64 \
+            "${{ secrets.DOCKERHUB_USERNAME }}/ai-memory:${{ needs.validate-version.outputs.version }}"
           docker run --rm --platform linux/amd64 \
             "${{ secrets.DOCKERHUB_USERNAME }}/ai-memory:${{ needs.validate-version.outputs.version }}" \
             --version

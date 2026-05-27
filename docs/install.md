@@ -27,6 +27,9 @@ path (docker + Claude Code). This page covers everything else:
 > and replace `homelab` with `localhost` if the server runs on the
 > same machine as the agent CLI.
 
+The Docker image is published for `linux/amd64` and `linux/arm64`; Apple
+Silicon Macs and ARM64 Linux hosts should not need `--platform linux/amd64`.
+
 ---
 
 ## Server on a different machine
