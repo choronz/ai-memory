@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed
+- Docker release images now publish both `linux/amd64` and `linux/arm64`
+  manifests, so Apple Silicon and ARM64 Linux hosts can pull the image without
+  forcing x86 emulation ([#41]).
 
 ## [0.4.0] - 2026-05-27
 ### Added
