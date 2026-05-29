@@ -217,6 +217,7 @@ invariants below.
 | `memory_handoff_accept` | destructive | Fetch + ack the latest open handoff (auto-cwd-matched). |
 | `memory_consolidate` | destructive | LLM-driven page rewrite. `multi_page=true` for atomic fan-out. |
 | `memory_write_page` | destructive | Write durable wiki knowledge when the user explicitly asks to remember/annotate something permanent. |
+| `memory_delete_page` | destructive | Delete a single page by exact `path`. Fires the admission chain (op=delete); idempotent. |
 | `memory_forget_sweep` | destructive | M8 retention pass. `dry_run=true` for preview. |
 | `memory_lint` | destructive | Rule-based + LLM contradiction findings → `wiki/_lint/`. |
 | `memory_install_self_routing` | read-only | Return the canonical routing snippet for CLAUDE.md / AGENTS.md. |

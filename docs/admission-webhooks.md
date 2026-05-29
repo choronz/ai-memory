@@ -40,9 +40,10 @@ Webhooks fire on these `op` values today (extensible enum):
   `write-page`, `/admin/write-page`, the lint rewriter, hook synthesis.
 - `consolidate` — LLM consolidation writes from the consolidator
   (SessionEnd opt-in + PreCompact + manual `memory_consolidate`).
-- `delete` — a single page is removed (`Wiki::delete_page`). Carries the
-  page path, no body; fired **before** the file is removed so a mirror can
-  `git rm` the same path.
+- `delete` — a single page is removed (`Wiki::delete_page`, triggered by the
+  `memory_delete_page` MCP tool). Carries the page path, no body; fired
+  **before** the file is removed so a mirror can `git rm` the same path. The
+  SQLite index is reconciled by the watcher on the file-removal event.
 - `purge_project` — a whole project is purged (`Wiki::purge_project` →
   `remove_dir_all`, routed from `/admin/purge-project`). Carries the
   project in `ctx`, **no** page path; fired before the directory is
