@@ -203,12 +203,13 @@ Each crate has a single responsibility and exposes a typed API. No
 circular deps. Inter-crate boundaries enforce the cross-cutting
 invariants below.
 
-## MCP tool surface (12 tools)
+## MCP tool surface (13 tools)
 
 | Tool | Hint | Purpose |
 |---|---|---|
 | `memory_query` | read-only | FTS5 + graph RRF + optional vector RRF search, with raw fallback. Bumps access counters for page hits. |
 | `memory_recent` | read-only | Most-recently-updated `is_latest=1` pages. |
+| `memory_read_page` | read-only | Fetch the FULL body of a single wiki page by `path` or by top FTS5 hit for a `query`. Use when an agent needs more than the 24-word snippets from `memory_query`. |
 | `memory_status` | read-only | Counts, paths, version. |
 | `memory_briefing` | read-only | Structured counts/activity/rules/slots/recent snapshot. |
 | `memory_explore` | read-only | LLM prose digest over the briefing snapshot, degrading to JSON without a provider. |
@@ -220,16 +221,18 @@ invariants below.
 | `memory_lint` | destructive | Rule-based + LLM contradiction findings → `wiki/_lint/`. |
 | `memory_install_self_routing` | read-only | Return the canonical routing snippet for CLAUDE.md / AGENTS.md. |
 
-`memory_briefing`, `memory_explore`, `memory_write_page`, and
-`memory_install_self_routing`
+`memory_briefing`, `memory_explore`, `memory_write_page`,
+`memory_install_self_routing`, and `memory_read_page`
 post-date the original "narrow on purpose" cut (§10 of
 `design-decisions.md`): briefing/explore separate the structured vs.
 prose halves of "what's going on", `memory_write_page` covers explicit
-durable annotations without abusing single-use handoffs, and
+durable annotations without abusing single-use handoffs,
 `memory_install_self_routing` exists for the meta case where the agent
 must re-write its own routing rules into a project's `CLAUDE.md` /
-`AGENTS.md`. The narrow-surface discipline still holds — every new tool
-has to earn its slot — but the v1 count is 12, not 10.
+`AGENTS.md`, and `memory_read_page` complements `memory_query` for the
+"I need the full page, not a snippet" case (e.g. opening a decision page
+end-to-end). The narrow-surface discipline still holds — every new tool
+has to earn its slot — but the v1 count is 13, not 10.
 
 MCP parameter aliases are intentionally sparse: `memory_query.query` accepts
 `q|search`, and limit fields accept `n` / `top_k` where shipped. Project and

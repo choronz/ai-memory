@@ -330,7 +330,7 @@ struct ReadPageArgs {
     #[serde(default)]
     path: Option<String>,
     /// Project to read from. Omit to target the project you're currently
-    /// working in (resolved from recent hook activity).
+    /// working in (resolved from recent hook activity). **Omit unless the user explicitly names a *different* project.**
     #[serde(default)]
     project: Option<String>,
 }

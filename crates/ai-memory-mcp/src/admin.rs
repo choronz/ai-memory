@@ -1673,4 +1673,130 @@ mod tests {
         assert_eq!(json["providers"]["llm"]["status"], "disabled");
         assert_eq!(json["providers"]["embedding"]["status"], "disabled");
     }
+
+    fn read_page_test_router() -> (TempDir, Router) {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let router = admin_router(AdminState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+        });
+        (tmp, router)
+    }
+
+    async fn post_write_page(router: &Router, ws: &str, project: &str, path: &str, body: &str) {
+        let req_body = serde_json::json!({
+            "workspace": ws,
+            "project": project,
+            "path": path,
+            "body": body,
+            "title": "Read-back fixture",
+        });
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/write-page")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "write-page setup failed");
+    }
+
+    #[tokio::test]
+    async fn read_page_path_mode_returns_full_body() {
+        let (_tmp, router) = read_page_test_router();
+        post_write_page(&router, "default", "audit", "notes/foo.md", "hello body").await;
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/read-page?workspace=default&project=audit&path=notes/foo.md")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["path"], "notes/foo.md");
+        assert_eq!(json["title"], "Read-back fixture");
+        assert!(
+            json["body"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("hello body"),
+            "body must round-trip; got {:?}",
+            json["body"]
+        );
+        assert_eq!(json["workspace"], "default");
+        assert_eq!(json["project"], "audit");
+    }
+
+    #[tokio::test]
+    async fn read_page_missing_path_returns_404() {
+        let (_tmp, router) = read_page_test_router();
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/read-page?workspace=default&project=audit&path=notes/nope.md")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn read_page_traversal_rejected_with_400() {
+        let (_tmp, router) = read_page_test_router();
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/read-page?workspace=default&project=audit&path=../etc/passwd")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn read_page_without_path_or_query_returns_400() {
+        let (_tmp, router) = read_page_test_router();
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/read-page?workspace=default&project=audit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
 }

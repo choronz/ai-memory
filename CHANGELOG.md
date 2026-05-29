@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`memory_read_page` MCP tool** (`read-only`) for fetching the FULL body of a
+  wiki page — pass `path` for a direct lookup or `query` to fetch the top FTS5
+  hit's full body. Complements `memory_query`'s 24-word snippets when an agent
+  needs to read an entire decision page end-to-end. Also exposed as
+  `GET /admin/read-page?workspace=…&project=…&path=…` (admin HTTP) and the new
+  `ai-memory read-page` CLI subcommand (thin HTTP client). All three surfaces
+  scope to the current project by default and route user-supplied paths through
+  `PagePath::new`, so traversal attempts (`../etc/passwd`) are rejected with
+  400. ARCHITECTURE.md's MCP-tool table grows from 12 to 13 rows ([#49]).
 - `_slots/*.md` pages can now declare `slot_kind: state` or
   `slot_kind: invariant` frontmatter. `state` remains the default for existing
   slots; `invariant` marks high-resistance project context or preferences that
