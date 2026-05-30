@@ -91,6 +91,8 @@ async fn seed_two_projects(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectI
         pinned: false,
         title: Some("Keep page".into()),
         admission_ctx: None,
+        author_id: None,
+        actor: ai_memory_core::ActorContext::anonymous(),
     })
     .await
     .unwrap();
@@ -105,6 +107,8 @@ async fn seed_two_projects(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectI
         pinned: false,
         title: Some("Doomed page".into()),
         admission_ctx: None,
+        author_id: None,
+        actor: ai_memory_core::ActorContext::anonymous(),
     })
     .await
     .unwrap();

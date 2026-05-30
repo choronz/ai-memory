@@ -28,9 +28,9 @@ pub use error::{StoreError, StoreResult};
 pub use ops::{EmbeddingWrite, PurgeSummary, ReorgSummary};
 pub use reader::{
     ActivityWindow, BriefingPage, BriefingSnapshot, DecayCandidate, DerivedIndexStatus,
-    EmbeddingTripleCount, HealthDetail, HealthPage, ObservationHit, PageHit, PageHitWithMeta,
-    PageLinks, PageMeta, PageSummary, ProjectSummary, ReaderPool, RelatedPage, StatusCounts,
-    StoredEmbedding, WorkspaceSummary, f32_vec_to_bytes,
+    EmbeddingTripleCount, HealthDetail, HealthPage, ObservationHit, PageAuthor, PageHit,
+    PageHitWithMeta, PageLinks, PageMeta, PageSummary, ProjectSummary, ReaderPool, RelatedPage,
+    StatusCounts, StoredEmbedding, WorkspaceSummary, f32_vec_to_bytes,
 };
 pub use users::{TOKEN_HASH_LEN, TOKEN_RAW_LEN, TokenPepper, generate_token, hash_token};
 pub use writer::WriterHandle;
@@ -112,6 +112,7 @@ mod tests {
             frontmatter_json: serde_json::json!({}),
             pinned: false,
             links: Vec::new(),
+            author_id: None,
         }
     }
 
@@ -780,6 +781,7 @@ mod tests {
             frontmatter_json: serde_json::json!({"kind": "decision"}),
             pinned: true,
             links: Vec::new(),
+            author_id: None,
         };
         store.writer.upsert_page(page).await.unwrap();
 

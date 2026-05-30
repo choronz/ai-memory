@@ -200,6 +200,8 @@ async fn m8_retention_lifecycle_end_to_end() {
                 pinned: false,
                 title: Some(title),
                 admission_ctx: None,
+                author_id: None,
+                actor: ai_memory_core::ActorContext::anonymous(),
             })
             .await
             .expect("write page");

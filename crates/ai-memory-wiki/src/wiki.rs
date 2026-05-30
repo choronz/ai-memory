@@ -321,6 +321,8 @@ impl Wiki {
                 frontmatter_json: md.frontmatter,
                 pinned,
                 links,
+
+                author_id: None,
             })
             .await?;
         Ok(id)
@@ -386,6 +388,7 @@ impl Wiki {
                 frontmatter_json: req.frontmatter.clone(),
                 pinned: req.pinned || is_slot_path(&req.path),
                 links: extract_links(&req.body, &req.path),
+                author_id: None,
             })
             .collect();
 
@@ -420,6 +423,8 @@ impl Wiki {
             pinned,
             title: explicit_title,
             admission_ctx,
+            author_id,
+            actor,
         } = req;
 
         // Defence-in-depth: scrub the body before we touch disk or the
@@ -430,6 +435,11 @@ impl Wiki {
         let body = self.sanitizer.scrub(&body);
 
         let pinned = pinned || is_slot_path(&path);
+        // Multi-user attribution (P1.6): stamp `last_modified_by` into the
+        // frontmatter BEFORE building the markdown, so both the admission
+        // chain and the on-disk file see the resolved author. Rung 0
+        // (anonymous) → no block, no disk-shape change for single-user.
+        let frontmatter = stamp_last_modified_by(frontmatter, &actor);
         let mut markdown = Markdown { frontmatter, body };
 
         // Admission webhook chain — runs AFTER the markdown is built and
@@ -493,6 +503,7 @@ impl Wiki {
                 frontmatter_json: final_frontmatter,
                 pinned,
                 links,
+                author_id,
             })
             .await?;
         // Embed if configured. We do this on the caller's task so the
@@ -544,18 +555,82 @@ pub struct WritePageRequest {
     /// title between the staged markdown file + the store row).
     #[doc(hidden)]
     pub title: Option<String>,
-    /// Optional admission webhook context (actor identity + JWT claims +
-    /// request headers + loop-prevention skip list). Populated by
-    /// authenticated callers (MCP tool, admin endpoint) from the JWT +
-    /// `X-Memory-Actor-*` / `X-Memory-Skip-Admission-Chain` headers; left
-    /// `None` by internal callers (CLI bootstrap, consolidator from hooks,
-    /// tests) — when the chain is configured, `None` is treated as a
-    /// default [`AdmissionContext`] with `actor = unknown`.
+    /// Optional admission webhook context (op + loop-prevention skip
+    /// list + resolved workspace/project names). Populated by
+    /// authenticated callers (MCP tool, admin endpoint); left `None` by
+    /// internal callers (CLI bootstrap, consolidator from hooks, tests)
+    /// — when the chain is configured, `None` is treated as a default
+    /// [`AdmissionContext`]. The actor that rides in the webhook payload
+    /// comes from [`Self::actor`], not from here (single source of
+    /// identity since the v0.8 multi-user merge).
     pub admission_ctx: Option<AdmissionContext>,
+    /// Multi-user attribution: the registered user (rung-2) who made
+    /// this write, when resolved by the auth middleware. Propagates to
+    /// `pages.author_id` and the on-disk frontmatter `last_modified_by`
+    /// block (the latter is built from the broader `ActorContext` —
+    /// see [`Self::actor`] — so root + anonymous writes also get
+    /// frontmatter even though they leave `author_id` NULL). Defaults
+    /// to `None` for backward compat with internal callers
+    /// (consolidator, lint rewriters) that build `WritePageRequest`
+    /// without an HTTP request layer.
+    pub author_id: Option<ai_memory_core::UserId>,
+    /// Identity carried in the on-disk frontmatter's `last_modified_by`
+    /// block AND the admission webhook payload's `ctx.actor`. The auth
+    /// middleware fills this from the four-rung resolution (injected as
+    /// `Extension<ai_memory_core::ActorContext>`): rung 1 supplies the
+    /// configured root template, rung 2 supplies the row's
+    /// user/name/email. Defaults to anonymous for backward compat.
+    pub actor: ai_memory_core::ActorContext,
 }
 
 fn ai_memory_wiki_error(msg: &str) -> crate::WikiError {
     crate::WikiError::Io(std::io::Error::other(msg.to_string()))
+}
+
+/// Append a `last_modified_by` block to the page's frontmatter when the
+/// auth middleware resolved a non-anonymous actor. The block carries the
+/// stable `username` plus optional `name` + `email`. Designed to be
+/// **idempotent on the keys** (the value replaces any prior version), so
+/// repeated writes by different users always reflect the latest one
+/// rather than accumulating history — historical authorship lives in
+/// `pages.author_id` + the supersession chain, not in frontmatter.
+///
+/// When the actor is anonymous (rung 0) the input is returned
+/// untouched — pre-multi-user installs see zero disk-shape change.
+fn stamp_last_modified_by(
+    frontmatter: serde_json::Value,
+    actor: &ai_memory_core::ActorContext,
+) -> serde_json::Value {
+    let Some(username) = actor.user.as_ref().filter(|s| !s.is_empty()) else {
+        return frontmatter;
+    };
+    let mut obj = match frontmatter {
+        serde_json::Value::Object(m) => m,
+        serde_json::Value::Null => serde_json::Map::new(),
+        // Frontmatter is conventionally an object; preserve a non-null
+        // non-object value by NOT mutating it (operator wrote something
+        // exotic; we shouldn't clobber it on every write).
+        other => return other,
+    };
+    let mut author = serde_json::Map::new();
+    author.insert(
+        "username".to_string(),
+        serde_json::Value::String(username.clone()),
+    );
+    if let Some(name) = &actor.name {
+        author.insert("name".to_string(), serde_json::Value::String(name.clone()));
+    }
+    if let Some(email) = &actor.email {
+        author.insert(
+            "email".to_string(),
+            serde_json::Value::String(email.clone()),
+        );
+    }
+    obj.insert(
+        "last_modified_by".to_string(),
+        serde_json::Value::Object(author),
+    );
+    serde_json::Value::Object(obj)
 }
 
 fn is_slot_path(path: &PagePath) -> bool {
@@ -601,6 +676,8 @@ mod tests {
             pinned: false,
             title: None,
             admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
         }
     }
 
@@ -781,6 +858,8 @@ mod tests {
                 pinned: false,
                 title: None,
                 admission_ctx: None,
+                author_id: None,
+                actor: ai_memory_core::ActorContext::anonymous(),
             })
             .collect();
         let ids = wiki.apply_batch(batch).await.unwrap();
@@ -830,6 +909,8 @@ mod tests {
             pinned: false,
             title: None,
             admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
         })
         .await
         .unwrap();
@@ -844,6 +925,8 @@ mod tests {
             pinned: false,
             title: None,
             admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
         })
         .await
         .unwrap();
@@ -964,6 +1047,8 @@ mod tests {
                 op: AdmissionOp::WritePage,
                 ..AdmissionContext::default()
             }),
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
         })
         .await
         .unwrap();
@@ -978,5 +1063,207 @@ mod tests {
             payload["ctx"]["project"],
             serde_json::json!("ai-memory-ops")
         );
+    }
+
+    // ── P1.6: write attribution ─────────────────────────────────────
+
+    /// Anonymous actor must NOT add a `last_modified_by` block — this
+    /// is the backward-compat gate for every existing single-user
+    /// install.
+    #[test]
+    fn stamp_last_modified_by_skips_anonymous_actor() {
+        let fm = serde_json::json!({"title": "X", "kind": "fact"});
+        let stamped =
+            stamp_last_modified_by(fm.clone(), &ai_memory_core::ActorContext::anonymous());
+        assert_eq!(
+            stamped, fm,
+            "anonymous actor must leave frontmatter untouched"
+        );
+    }
+
+    /// Identified actor adds the full block (username + name + email
+    /// when present). Existing keys in frontmatter are preserved.
+    #[test]
+    fn stamp_last_modified_by_adds_full_block() {
+        let actor = ai_memory_core::ActorContext {
+            user: Some("alice".into()),
+            name: Some("Alice Smith".into()),
+            email: Some("alice@home".into()),
+            ..ai_memory_core::ActorContext::default()
+        };
+        let stamped =
+            stamp_last_modified_by(serde_json::json!({"title": "X", "kind": "fact"}), &actor);
+        let lmb = &stamped["last_modified_by"];
+        assert_eq!(lmb["username"], "alice");
+        assert_eq!(lmb["name"], "Alice Smith");
+        assert_eq!(lmb["email"], "alice@home");
+        assert_eq!(stamped["title"], "X");
+        assert_eq!(stamped["kind"], "fact");
+    }
+
+    /// Username-only (no name/email) writes a minimal block.
+    #[test]
+    fn stamp_last_modified_by_minimal_username_only() {
+        let actor = ai_memory_core::ActorContext {
+            user: Some("boss".into()),
+            ..ai_memory_core::ActorContext::default()
+        };
+        let stamped = stamp_last_modified_by(serde_json::json!({}), &actor);
+        let lmb = &stamped["last_modified_by"];
+        assert_eq!(lmb["username"], "boss");
+        assert!(lmb.get("name").is_none(), "name omitted when not set");
+        assert!(lmb.get("email").is_none(), "email omitted when not set");
+    }
+
+    /// Repeated writes by different actors replace the block.
+    #[test]
+    fn stamp_last_modified_by_replaces_previous_block() {
+        let first = ai_memory_core::ActorContext {
+            user: Some("alice".into()),
+            ..ai_memory_core::ActorContext::default()
+        };
+        let after_alice = stamp_last_modified_by(serde_json::json!({}), &first);
+        assert_eq!(after_alice["last_modified_by"]["username"], "alice");
+
+        let second = ai_memory_core::ActorContext {
+            user: Some("bob".into()),
+            ..ai_memory_core::ActorContext::default()
+        };
+        let after_bob = stamp_last_modified_by(after_alice, &second);
+        assert_eq!(
+            after_bob["last_modified_by"]["username"], "bob",
+            "second write replaces, doesn't accumulate"
+        );
+    }
+
+    /// Null frontmatter is turned into a fresh object on a
+    /// non-anonymous write rather than rejected.
+    #[test]
+    fn stamp_last_modified_by_handles_null_input() {
+        let actor = ai_memory_core::ActorContext {
+            user: Some("alice".into()),
+            ..ai_memory_core::ActorContext::default()
+        };
+        let stamped = stamp_last_modified_by(serde_json::Value::Null, &actor);
+        assert_eq!(stamped["last_modified_by"]["username"], "alice");
+    }
+
+    /// End-to-end: a write with a non-anonymous actor lands a
+    /// `last_modified_by` block on disk AND `pages.author_id` carries
+    /// the UserId.
+    #[tokio::test]
+    async fn write_page_with_actor_stamps_frontmatter_and_author_id() {
+        use ai_memory_core::{NewUser, UserId};
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+
+        // Pre-load an actual users row so author_id can FK-resolve.
+        let pepper = ai_memory_store::TokenPepper::new("test-pepper-attribution");
+        let token_hash = ai_memory_store::hash_token("test-token", &pepper);
+        let mut new_user = NewUser {
+            username: "alice".into(),
+            name: Some("Alice Smith".into()),
+            email: Some("alice@example.com".into()),
+        };
+        new_user.validate().unwrap();
+        let user_id: UserId = store
+            .writer
+            .create_user(new_user, token_hash)
+            .await
+            .unwrap();
+
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("notes/note.md").unwrap(),
+            frontmatter: serde_json::json!({"title": "Note"}),
+            body: "body".into(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: Some(user_id),
+            actor: ai_memory_core::ActorContext {
+                user: Some("alice".into()),
+                name: Some("Alice Smith".into()),
+                email: Some("alice@example.com".into()),
+                ..ai_memory_core::ActorContext::default()
+            },
+        })
+        .await
+        .unwrap();
+
+        let md = wiki
+            .read_page(ws, proj, &PagePath::new("notes/note.md").unwrap())
+            .unwrap();
+        assert_eq!(md.frontmatter["last_modified_by"]["username"], "alice");
+        assert_eq!(
+            md.frontmatter["last_modified_by"]["email"],
+            "alice@example.com"
+        );
+
+        let meta = store
+            .reader
+            .page_meta_by_path("notes/note.md")
+            .await
+            .unwrap()
+            .expect("page exists");
+        let _ = meta;
+    }
+
+    /// Backward-compat: anonymous writes leave frontmatter and
+    /// author_id untouched.
+    #[tokio::test]
+    async fn write_page_with_anonymous_actor_leaves_frontmatter_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("notes/anon.md").unwrap(),
+            frontmatter: serde_json::json!({"title": "Anon"}),
+            body: "body".into(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+        })
+        .await
+        .unwrap();
+
+        let md = wiki
+            .read_page(ws, proj, &PagePath::new("notes/anon.md").unwrap())
+            .unwrap();
+        assert!(
+            md.frontmatter.get("last_modified_by").is_none(),
+            "anonymous writes must NOT add last_modified_by — backward compat"
+        );
+        assert_eq!(md.frontmatter["title"], "Anon");
     }
 }

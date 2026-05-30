@@ -108,6 +108,18 @@ pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
         .or_else(|| config.auth.bearer_token.clone())
         .or_else(|| inferred.as_ref().and_then(|mcp| mcp.auth_token.clone()));
     let auth = auth_token_owned.as_deref();
+    // P1.8 multi-user attribution: `--as-user` is metadata only — the
+    // token stamped into the hook env block is whatever the operator
+    // passed via `--auth-token` (typically the per-user token from
+    // `ai-memory user add`). We surface the username to stderr so the
+    // operator can confirm which identity their writes will attribute
+    // to. Mismatch between `--as-user` and the actual token's owner is
+    // the operator's concern; we don't reach back to the server to
+    // verify (keeps install-hooks offline-capable).
+    validate_as_user(args.as_user.as_deref(), auth)?;
+    if let Some(user) = args.as_user.as_deref().filter(|s| !s.trim().is_empty()) {
+        eprintln!("[ai-memory] hooks installing for user: {user}");
+    }
     if args.apply {
         return match args.agent {
             AgentChoice::OpenCode => apply_to_opencode_plugin(&server_url, auth, &args),
@@ -169,6 +181,30 @@ pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
 struct InferredMcpConfig {
     hook_server_url: Option<String>,
     auth_token: Option<String>,
+}
+
+/// Reject `--as-user X` without a usable `--auth-token`. P1.8
+/// metadata flag — without a token, the hook scripts would still
+/// authenticate anonymously (or as root if the operator reused the
+/// config bearer), so the `--as-user X` label would be misleading.
+/// Trims whitespace; empty / whitespace-only `--as-user` is treated
+/// as not-set so an accidental `--as-user ""` doesn't bail.
+///
+/// # Errors
+/// Returns an error when `as_user` is set but `auth_token` is `None`
+/// (or whitespace-only). The error message names the user so
+/// operators see which arg they meant to pair with `--auth-token`.
+fn validate_as_user(as_user: Option<&str>, auth_token: Option<&str>) -> Result<()> {
+    let Some(user) = as_user.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    if auth_token.map(str::trim).is_none_or(str::is_empty) {
+        anyhow::bail!(
+            "--as-user '{user}' requires --auth-token \
+             (the token printed by `ai-memory user add --username {user}`)"
+        );
+    }
+    Ok(())
 }
 
 fn effective_hook_server_url(
@@ -1588,9 +1624,51 @@ mod tests {
             hooks_dir: None,
             server_url: DEFAULT_SERVER_URL.into(),
             auth_token: None,
+            as_user: None,
             apply: true,
             config_file: None,
         }
+    }
+
+    // ── P1.8 validate_as_user ────────────────────────────────────────
+
+    /// No `--as-user` at all → always OK.
+    #[test]
+    fn validate_as_user_passes_when_not_set() {
+        assert!(validate_as_user(None, None).is_ok());
+        assert!(validate_as_user(None, Some("tok")).is_ok());
+    }
+
+    /// Empty / whitespace-only `--as-user` is treated as not-set.
+    /// Defensive: an accidental `--as-user ""` shouldn't bail.
+    #[test]
+    fn validate_as_user_treats_blank_as_unset() {
+        assert!(validate_as_user(Some(""), None).is_ok());
+        assert!(validate_as_user(Some("   "), None).is_ok());
+    }
+
+    /// `--as-user` with no `--auth-token` is the error case the v0.8
+    /// docs warn about — without a token the hook scripts authenticate
+    /// anonymously / as root, making the `--as-user X` label misleading.
+    #[test]
+    fn validate_as_user_bails_without_auth_token() {
+        let err = validate_as_user(Some("alice"), None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--as-user 'alice'") && msg.contains("--auth-token"),
+            "error must name both flags: {msg}"
+        );
+        // Empty auth token is treated the same as missing.
+        assert!(validate_as_user(Some("alice"), Some("")).is_err());
+        assert!(validate_as_user(Some("alice"), Some("   ")).is_err());
+    }
+
+    /// `--as-user X --auth-token <something>` passes — the install
+    /// proceeds with X as metadata and the supplied token as the
+    /// bearer.
+    #[test]
+    fn validate_as_user_passes_with_both_flags() {
+        assert!(validate_as_user(Some("alice"), Some("some-token")).is_ok());
     }
 
     #[test]
@@ -2097,6 +2175,7 @@ model = "gpt-5"
             hooks_dir: None,
             server_url: "http://127.0.0.1:49374".into(),
             auth_token: None,
+            as_user: None,
             apply: true,
             config_file: Some(tmp.path().join("extensions").join("ai-memory.ts")),
         };

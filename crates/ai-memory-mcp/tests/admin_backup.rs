@@ -66,6 +66,8 @@ async fn seed_page(state: &AdminState, store: &Store, path: &str, body: &str) {
             pinned: false,
             title: Some("Test".into()),
             admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
         })
         .await
         .unwrap();

@@ -55,6 +55,7 @@ async fn seed_page(store: &Store, title: &str, path: &str, body: &str) {
         frontmatter_json: serde_json::json!({}),
         pinned: false,
         links: Vec::new(),
+        author_id: None,
     };
     store.writer.upsert_page(page).await.unwrap();
 }

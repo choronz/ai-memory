@@ -507,6 +507,8 @@ async fn process(state: &HookState, env: HookEnvelope) -> anyhow::Result<()> {
                 pinned: new_page.pinned,
                 title: None,
                 admission_ctx: None,
+                author_id: None,
+                actor: ai_memory_core::ActorContext::anonymous(),
             })
             .await?;
         state.writer.end_session(session_id, Some(page_id)).await?;
@@ -704,6 +706,8 @@ async fn consolidate_or_synth(
             pinned: new_page.pinned,
             title: None,
             admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
         })
         .await?;
     let _ = state.wiki.commit_all(&format!(

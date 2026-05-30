@@ -1033,6 +1033,8 @@ impl AiMemoryServer {
                 pinned: args.pinned,
                 title: args.title,
                 admission_ctx,
+                author_id: None,
+                actor: ai_memory_core::ActorContext::anonymous(),
             })
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -1575,6 +1577,7 @@ mod tests {
                 frontmatter_json: serde_json::json!({}),
                 pinned: false,
                 links: Vec::new(),
+                author_id: None,
             })
             .await
             .unwrap();
@@ -1824,6 +1827,7 @@ mod tests {
                 frontmatter_json: serde_json::json!({}),
                 pinned: false,
                 links: Vec::new(),
+                author_id: None,
             })
             .await
             .unwrap();
@@ -1883,6 +1887,7 @@ mod tests {
                 frontmatter_json: serde_json::json!({}),
                 pinned: false,
                 links: Vec::new(),
+                author_id: None,
             })
             .await
             .unwrap();
@@ -1898,6 +1903,7 @@ mod tests {
                 frontmatter_json: serde_json::json!({}),
                 pinned: false,
                 links: Vec::new(),
+                author_id: None,
             })
             .await
             .unwrap();
@@ -1913,6 +1919,7 @@ mod tests {
                 frontmatter_json: serde_json::json!({}),
                 pinned: false,
                 links: Vec::new(),
+                author_id: None,
             })
             .await
             .unwrap();
@@ -1986,6 +1993,7 @@ mod tests {
                     frontmatter_json: serde_json::json!({}),
                     pinned: false,
                     links: Vec::new(),
+                    author_id: None,
                 })
                 .await
                 .unwrap();

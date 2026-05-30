@@ -80,6 +80,8 @@ async fn seed_page(store: &Store, wiki: &Wiki, project: &str) -> String {
         pinned: false,
         title: Some(project.into()),
         admission_ctx: None,
+        author_id: None,
+        actor: ai_memory_core::ActorContext::anonymous(),
     })
     .await
     .unwrap();

@@ -317,6 +317,8 @@ async fn write_report_page(
             op: AdmissionOp::Consolidate,
             ..Default::default()
         }),
+        author_id: None,
+        actor: ai_memory_core::ActorContext::anonymous(),
     })
     .await?;
     Ok(())

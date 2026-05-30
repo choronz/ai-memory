@@ -57,6 +57,17 @@ pub struct NewPage {
     /// project for a cross-project `[[project:path]]` link) and keeps
     /// unresolved forward links as `to_page_id = NULL`.
     pub links: Vec<LinkTarget>,
+    /// Multi-user attribution: the registered user (v0.8 `users` table)
+    /// that made this write, when resolved by the auth middleware.
+    /// `None` for rung-0 (anonymous) and rung-1 (root token — root
+    /// isn't a `users` row; the human-readable identity goes into the
+    /// frontmatter `last_modified_by` block instead). `Some` for
+    /// rung-2 (DB user) writes; persists to `pages.author_id`
+    /// via V15. Defaults to `None` for backward compat — every existing
+    /// call site that constructs `NewPage` without filling this field
+    /// gets the pre-multi-user behaviour.
+    #[serde(default)]
+    pub author_id: Option<crate::UserId>,
 }
 
 /// A link target discovered in a page body.

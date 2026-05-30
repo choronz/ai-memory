@@ -221,8 +221,9 @@ fn upsert_page_in_tx(
         tx.execute(
             "INSERT INTO pages \
              (id, workspace_id, project_id, path, title, tier, body, body_sha256, \
-              frontmatter_json, is_latest, supersedes, pinned, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12, ?12)",
+              frontmatter_json, is_latest, supersedes, pinned, author_id, \
+              created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12, ?13, ?13)",
             params![
                 new_id.as_bytes(),
                 page.workspace_id.as_bytes(),
@@ -235,6 +236,7 @@ fn upsert_page_in_tx(
                 frontmatter_str,
                 &existing.id,
                 i64::from(page.pinned),
+                page.author_id.map(|id| id.as_bytes().to_vec()),
                 now,
             ],
         )?;
@@ -246,6 +248,9 @@ fn upsert_page_in_tx(
             Some(page.workspace_id.as_bytes()),
             Some(page.project_id.as_bytes()),
             Some(new_id.as_bytes()),
+            page.author_id
+                .as_ref()
+                .map(ai_memory_core::UserId::as_bytes),
             now,
         )?;
         return Ok(new_id);
@@ -254,8 +259,8 @@ fn upsert_page_in_tx(
     tx.execute(
         "INSERT INTO pages \
          (id, workspace_id, project_id, path, title, tier, body, body_sha256, \
-          frontmatter_json, is_latest, pinned, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?11)",
+          frontmatter_json, is_latest, pinned, author_id, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12, ?12)",
         params![
             new_id.as_bytes(),
             page.workspace_id.as_bytes(),
@@ -267,6 +272,7 @@ fn upsert_page_in_tx(
             body_sha256.as_slice(),
             frontmatter_str,
             i64::from(page.pinned),
+            page.author_id.map(|id| id.as_bytes().to_vec()),
             now,
         ],
     )?;
@@ -278,6 +284,9 @@ fn upsert_page_in_tx(
         Some(page.workspace_id.as_bytes()),
         Some(page.project_id.as_bytes()),
         Some(new_id.as_bytes()),
+        page.author_id
+            .as_ref()
+            .map(ai_memory_core::UserId::as_bytes),
         now,
     )?;
     Ok(new_id)
@@ -637,6 +646,9 @@ pub fn soft_delete_for_decay(conn: &mut Connection, page_ids: &[PageId]) -> Stor
         None,
         None,
         None,
+        // Decay sweep is a system op (scheduled / admin-triggered) — no
+        // user-attributable actor at the row level.
+        None,
         Timestamp::now().as_microsecond(),
     )?;
     tx.commit()?;
@@ -750,17 +762,19 @@ fn audit(
     workspace_id: Option<&[u8; 16]>,
     project_id: Option<&[u8; 16]>,
     page_id: Option<&[u8; 16]>,
+    author_id: Option<&[u8; 16]>,
     at: i64,
 ) -> StoreResult<()> {
     tx.execute(
-        "INSERT INTO audit_log (at, op, workspace_id, project_id, page_id, detail) \
-         VALUES (?1, ?2, ?3, ?4, ?5, '{}')",
+        "INSERT INTO audit_log (at, op, workspace_id, project_id, page_id, author_id, detail) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, '{}')",
         params![
             at,
             op,
             workspace_id.map(|b| &b[..]),
             project_id.map(|b| &b[..]),
-            page_id.map(|b| &b[..])
+            page_id.map(|b| &b[..]),
+            author_id.map(|b| &b[..]),
         ],
     )?;
     Ok(())
@@ -1072,6 +1086,7 @@ mod tests {
             frontmatter_json: serde_json::json!({}),
             pinned: false,
             links: Vec::new(),
+            author_id: None,
         }
     }
 
@@ -1079,6 +1094,114 @@ mod tests {
     /// produce a NEW row and mark the previous row `is_latest = 0`.
     /// This is the M7 supersession chain — the entire wiki versioning
     /// guarantee rides on it.
+    /// V16: every page write lands an `audit_log` row whose
+    /// `author_id` mirrors the NewPage's. Anonymous writes leave it
+    /// NULL (the entire audit-log-by-author query pattern relies on
+    /// the partial index covering only the non-NULL minority).
+    #[test]
+    fn audit_log_records_author_for_attributed_create_page() {
+        use ai_memory_core::UserId;
+
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+
+        // Seed a synthetic user row so the FK on author_id resolves.
+        let user_id = UserId::new();
+        let now = jiff::Timestamp::now().as_microsecond();
+        conn.execute(
+            "INSERT INTO users \
+             (id, username, name, email, token_hash, created_at) \
+             VALUES (?1, 'alice', NULL, NULL, X'00', ?2)",
+            params![user_id.as_bytes(), now],
+        )
+        .unwrap();
+
+        let mut np = page(ws, proj, "notes/by-alice.md", "alice body");
+        np.author_id = Some(user_id);
+        let page_id = upsert_page(&mut conn, &np).unwrap();
+
+        let author_bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT author_id FROM audit_log \
+                 WHERE op = 'create_page' AND page_id = ?1",
+                params![page_id.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let recorded = UserId::from_slice(&author_bytes).unwrap();
+        assert_eq!(
+            recorded, user_id,
+            "create_page audit row must carry the writer's user_id"
+        );
+    }
+
+    /// Backward-compat gate (and the headline of the "no behaviour
+    /// change for legacy installs" promise): anonymous writes leave
+    /// audit_log.author_id NULL — the partial index stays empty for
+    /// pre-multi-user history.
+    #[test]
+    fn audit_log_records_null_author_for_anonymous_create_page() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let np = page(ws, proj, "notes/anon.md", "anon body");
+        assert!(np.author_id.is_none());
+        let page_id = upsert_page(&mut conn, &np).unwrap();
+
+        let author: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT author_id FROM audit_log \
+                 WHERE op = 'create_page' AND page_id = ?1",
+                params![page_id.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            author.is_none(),
+            "anonymous writes must record audit_log.author_id = NULL"
+        );
+    }
+
+    /// Supersession rows carry the SUPERSEDING author, not the
+    /// original. Two consecutive attributed writes (alice then bob)
+    /// yield a create_page row tagged alice and a supersede_page row
+    /// tagged bob — point-in-time truth, not "latest author".
+    #[test]
+    fn audit_log_supersede_records_new_authors_identity() {
+        use ai_memory_core::UserId;
+
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let now = jiff::Timestamp::now().as_microsecond();
+        let alice = UserId::new();
+        let bob = UserId::new();
+        conn.execute(
+            "INSERT INTO users (id, username, name, email, token_hash, created_at) \
+             VALUES (?1, 'alice', NULL, NULL, X'01', ?2), \
+                    (?3, 'bob',   NULL, NULL, X'02', ?2)",
+            params![alice.as_bytes(), now, bob.as_bytes()],
+        )
+        .unwrap();
+
+        let mut np1 = page(ws, proj, "notes/shared.md", "v1");
+        np1.author_id = Some(alice);
+        upsert_page(&mut conn, &np1).unwrap();
+
+        let mut np2 = page(ws, proj, "notes/shared.md", "v2 — different body");
+        np2.author_id = Some(bob);
+        let v2_id = upsert_page(&mut conn, &np2).unwrap();
+
+        let bob_bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT author_id FROM audit_log \
+                 WHERE op = 'supersede_page' AND page_id = ?1",
+                params![v2_id.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            UserId::from_slice(&bob_bytes).unwrap(),
+            bob,
+            "supersede_page audit row must carry the SUPERSEDING author"
+        );
+    }
+
     #[test]
     fn upsert_page_supersedes_on_body_change() {
         let (_tmp, mut conn, ws, proj) = fresh_db();

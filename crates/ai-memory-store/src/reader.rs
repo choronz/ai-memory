@@ -243,6 +243,27 @@ pub struct PageSummary {
     pub updated_at: String,
 }
 
+/// Page author surfaced alongside read responses (P1.7).
+/// JOINed from the `users` table when `pages.author_id IS NOT NULL`;
+/// `None` for anonymous + root writes (where attribution lives only in
+/// the on-disk frontmatter `last_modified_by` block from P1.6).
+///
+/// Repeated here rather than reused from `ai_memory_core::User` because
+/// the response shape intentionally omits internal fields (id,
+/// created_at, last_seen_at, token_expired_at) — only the human-facing
+/// identity is part of the API contract.
+#[derive(Debug, Clone, Serialize)]
+pub struct PageAuthor {
+    /// Stable username (the attribution key recorded on writes).
+    pub username: String,
+    /// Optional display name (`Alice Smith`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Optional email surfaced alongside the username in UIs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+}
+
 /// Full page metadata for the page-view template.
 /// Returned by [`ReaderPool::page_meta`].
 #[derive(Debug, Clone, Serialize)]
@@ -271,6 +292,11 @@ pub struct PageMeta {
     pub updated_at: String,
     /// Path of the page this one supersedes, if any.
     pub supersedes: Option<String>,
+    /// Multi-user attribution (P1.7). `None` for pre-multi-user pages
+    /// and for root / anonymous writes (where `pages.author_id IS
+    /// NULL`); `Some` when JOIN resolves a `users` row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<PageAuthor>,
 }
 
 /// One resolved cross-project edge (a link whose endpoints live in
@@ -2096,11 +2122,13 @@ impl ReaderPool {
                                 END \
                             ), \
                             pg.tier, pg.pinned, pg.created_at, pg.updated_at, \
-                            sp.path AS supersedes_path \
+                            sp.path AS supersedes_path, \
+                            au.username, au.name, au.email \
                      FROM pages pg \
                      JOIN projects p ON p.id = pg.project_id \
                      JOIN workspaces w ON w.id = pg.workspace_id \
                      LEFT JOIN pages sp ON sp.id = pg.supersedes \
+                     LEFT JOIN users au ON au.id = pg.author_id \
                      WHERE pg.id = ?1 AND pg.is_latest = 1",
                     params![page_id.as_bytes()],
                     page_meta_from_row,
@@ -2135,13 +2163,15 @@ impl ReaderPool {
                                 END \
                             ), \
                             pg.tier, pg.pinned, pg.created_at, pg.updated_at, \
-                            sp.path AS supersedes_path \
+                            sp.path AS supersedes_path, \
+                            au.username, au.name, au.email \
                      FROM pages pg \
                      JOIN projects p ON p.id = pg.project_id \
                      JOIN workspaces w ON w.id = pg.workspace_id \
                      LEFT JOIN pages sp ON sp.id = pg.supersedes \
-                      WHERE pg.path = ?1 AND pg.is_latest = 1 \
-                      LIMIT 1",
+                     LEFT JOIN users au ON au.id = pg.author_id \
+                     WHERE pg.path = ?1 AND pg.is_latest = 1 \
+                     LIMIT 1",
                     params![path],
                     page_meta_from_row,
                 )
@@ -2551,12 +2581,14 @@ impl ReaderPool {
                                 END \
                             ), \
                             pg.tier, pg.pinned, pg.created_at, pg.updated_at, \
-                            sp.path AS supersedes_path \
+                            sp.path AS supersedes_path, \
+                            au.username, au.name, au.email \
                      FROM pages pg \
                      JOIN projects p ON p.id = pg.project_id \
                      JOIN workspaces w ON w.id = pg.workspace_id \
-                      LEFT JOIN pages sp ON sp.id = pg.supersedes \
-                      WHERE w.name = ?1 AND p.name = ?2 AND pg.path = ?3 AND pg.is_latest = 1",
+                     LEFT JOIN pages sp ON sp.id = pg.supersedes \
+                     LEFT JOIN users au ON au.id = pg.author_id \
+                     WHERE w.name = ?1 AND p.name = ?2 AND pg.path = ?3 AND pg.is_latest = 1",
                     params![workspace, project, page_path],
                     page_meta_from_row,
                 )
@@ -2850,6 +2882,17 @@ fn page_meta_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<P
     let created_us: i64 = row.get(9)?;
     let updated_us: i64 = row.get(10)?;
     let supersedes: Option<String> = row.get(11)?;
+    // P1.7: author columns LEFT JOIN'd from `users`. NULL when the
+    // page was written anonymously / by root, or when the user row
+    // has been hard-deleted (FK `ON DELETE SET NULL`).
+    let author_username: Option<String> = row.get(12)?;
+    let author_name: Option<String> = row.get(13)?;
+    let author_email: Option<String> = row.get(14)?;
+    let author = author_username.map(|username| PageAuthor {
+        username,
+        name: author_name,
+        email: author_email,
+    });
 
     let workspace_id = WorkspaceId::from_slice(&ws_id_bytes)
         .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, 0))?;
@@ -2876,6 +2919,7 @@ fn page_meta_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<P
         created_at,
         updated_at,
         supersedes,
+        author,
     }))
 }
 

@@ -161,6 +161,8 @@ impl Consolidator {
                     op: AdmissionOp::Consolidate,
                     ..Default::default()
                 }),
+                author_id: None,
+                actor: ai_memory_core::ActorContext::anonymous(),
             })
             .await?;
         // Auto-commit the result so the supersession lands in git.
@@ -398,6 +400,8 @@ fn build_update(
             op: AdmissionOp::Consolidate,
             ..Default::default()
         }),
+        author_id: None,
+        actor: ai_memory_core::ActorContext::anonymous(),
     };
     let outcome = ConsolidationOutcome {
         path,
