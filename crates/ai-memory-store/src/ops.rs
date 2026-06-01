@@ -1765,4 +1765,37 @@ mod tests {
             .unwrap();
         assert_eq!(body_hit, 1, "body must remain searchable");
     }
+
+    #[test]
+    fn pages_fts_path_migration_preserves_accent_folding() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let mut p = page(ws, proj, "notes/descricao.md", "descrição do projeto");
+        p.title = "Descrição".into();
+        upsert_page(&mut conn, &p).unwrap();
+
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pages_fts WHERE pages_fts MATCH 'descricao'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "page FTS should remain accent-insensitive");
+    }
+
+    #[test]
+    fn pages_fts_update_trigger_ignores_access_counter_updates() {
+        let (_tmp, conn, _ws, _proj) = fresh_db();
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'pages_fts_au'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            sql.contains("AFTER UPDATE OF title, body, path_search ON pages"),
+            "pages_fts_au must not fire on access_count/last_accessed_at updates: {sql}"
+        );
+    }
 }

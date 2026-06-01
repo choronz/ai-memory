@@ -33,7 +33,7 @@ CREATE VIRTUAL TABLE pages_fts USING fts5(
     title, body, path_search,
     content='pages',
     content_rowid='rowid',
-    tokenize="unicode61 tokenchars '/_-'"
+    tokenize="unicode61 remove_diacritics 2 tokenchars '/_-'"
 );
 
 CREATE TRIGGER pages_fts_ai AFTER INSERT ON pages BEGIN
@@ -46,7 +46,7 @@ CREATE TRIGGER pages_fts_ad AFTER DELETE ON pages BEGIN
         VALUES ('delete', old.rowid, old.title, old.body, old.path_search);
 END;
 
-CREATE TRIGGER pages_fts_au AFTER UPDATE ON pages BEGIN
+CREATE TRIGGER pages_fts_au AFTER UPDATE OF title, body, path_search ON pages BEGIN
     INSERT INTO pages_fts(pages_fts, rowid, title, body, path_search)
         VALUES ('delete', old.rowid, old.title, old.body, old.path_search);
     INSERT INTO pages_fts(rowid, title, body, path_search)
