@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Added
+- The read-only web browser now renders `[[wiki links]]` as clickable internal
+  links to the target page. Supports `[[path]]`, `[[path|label]]`,
+  `[[project:path]]`, and `[[workspace/project:path]]`, resolved against the
+  current page's project unless the target carries its own scope; bare targets
+  get a `.md` suffix. External schemes, path traversal, and links inside fenced
+  or inline code are left as literal text ([#68]).
 - `ai-memory serve --transport http` can host the entire HTTP surface under a
   configurable subpath with `--base-path` / `AI_MEMORY_BASE_PATH`; `/mcp`,
   `/hook`, `/admin/*`, `/api/v1`, and the web UI all move under that prefix.
