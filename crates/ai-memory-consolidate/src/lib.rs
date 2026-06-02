@@ -16,8 +16,9 @@ pub mod types;
 
 pub use bootstrap::{
     Bootstrap, BootstrapConfig, BootstrapError, BootstrapOutcome, BootstrapSource,
-    DEFAULT_CHUNK_INPUT_TOKENS, SourceCounts, SourceKind, collect_sources, discover_main_repo_root,
-    discover_repo_root, effective_chunk_budget, plan_bootstrap_chunks, prune_sources_to_budget,
+    DEFAULT_CHUNK_INPUT_TOKENS, ProjectNameStrategy, SourceCounts, SourceKind, collect_sources,
+    derive_project_name, discover_main_repo_root, discover_repo_root, effective_chunk_budget,
+    plan_bootstrap_chunks, prune_sources_to_budget,
 };
 pub use consolidator::{
     BATCH_SYSTEM_PROMPT, Consolidator, ConsolidatorError, ConsolidatorResult, build_batch_request,

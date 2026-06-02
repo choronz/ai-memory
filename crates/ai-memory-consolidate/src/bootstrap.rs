@@ -574,6 +574,58 @@ pub fn discover_main_repo_root(start: &Path) -> Result<PathBuf, BootstrapError> 
         .ok_or_else(|| BootstrapError::NotARepo(start.to_path_buf()))
 }
 
+/// Strategy for [`derive_project_name`]: which path "wins" when a
+/// `cwd` lives inside a git repo. Both the CLI's `resolve_project_name`
+/// and the hook router's `resolve_project_ids` call through this
+/// helper, so a single config-driven choice keeps the two surfaces
+/// aligned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectNameStrategy {
+    /// Take the basename of `cwd` directly. Worktrees and subdirs of
+    /// a repo each become a different project.
+    Basename,
+    /// Walk up to the **main** repo root (via
+    /// [`discover_main_repo_root`]) and take its basename so all
+    /// worktrees / subdirs of the same repo collapse to a stable
+    /// project identity. Falls back to [`ProjectNameStrategy::Basename`]
+    /// semantics when no git repo is found at or above `cwd`.
+    MainRepoRoot,
+}
+
+/// Derive the project name for a working-directory path under the
+/// chosen [`ProjectNameStrategy`]. The optional second tuple value
+/// is the canonical repo root when the strategy was
+/// [`ProjectNameStrategy::MainRepoRoot`] and a git repo was found —
+/// callers that want to register the resolved `repo_path` against
+/// the project record use it; CLI callers ignore it.
+///
+/// `None` is returned only for degenerate paths that cannot be
+/// reduced to a non-empty basename (e.g. `/`, `""`).
+#[must_use]
+pub fn derive_project_name(
+    cwd: &Path,
+    strategy: ProjectNameStrategy,
+) -> Option<(String, Option<PathBuf>)> {
+    if matches!(strategy, ProjectNameStrategy::MainRepoRoot)
+        && let Ok(root) = discover_main_repo_root(cwd)
+        && let Some(name) = basename_with_alt_separators(&root)
+    {
+        return Some((name, Some(root)));
+    }
+    basename_with_alt_separators(cwd).map(|name| (name, None))
+}
+
+/// Basename tolerant of both `/` and `\` separators. Windows agents
+/// send a Windows path over JSON to a Linux server; the server still
+/// has to land the row under a deterministic project name. `Path::file_name`
+/// alone uses the host's separator and would return `Some("c:\\users\\a")`
+/// for a Windows path on Linux.
+fn basename_with_alt_separators(path: &Path) -> Option<String> {
+    let s = path.to_str()?;
+    let name = s.rsplit(['/', '\\']).find(|seg| !seg.is_empty())?;
+    Some(name.to_string())
+}
+
 /// Read commits, format each as a one-paragraph entry. We include
 /// only commits with a substantive body (more than ~120 chars
 /// total) — drive-by typo-fix commits aren't worth tokens.
@@ -1397,5 +1449,88 @@ mod tests {
         ];
         assert_eq!(next_decision_serial(&paths), 4);
         assert_eq!(next_decision_serial(&[]), 1);
+    }
+
+    /// Basename strategy returns just `basename(cwd)` with no repo
+    /// walk. Used by hook agents that opt out of the worktree
+    /// collapse (`AI_MEMORY_PROJECT_STRATEGY=basename`).
+    #[test]
+    fn derive_project_name_basename_strategy() {
+        let p = Path::new("/home/alice/projects/foo-app");
+        let (name, root) = derive_project_name(p, ProjectNameStrategy::Basename).unwrap();
+        assert_eq!(name, "foo-app");
+        assert!(root.is_none(), "basename never returns a repo path");
+    }
+
+    /// Windows-style path with `\` separators submitted by a Windows
+    /// agent must still resolve to the final component on a Linux
+    /// server. `Path::file_name` alone would treat the whole string
+    /// as a single component.
+    #[test]
+    fn derive_project_name_handles_backslash_separators() {
+        let p = Path::new(r"C:\Users\alice\Projects\my-app");
+        let (name, _) = derive_project_name(p, ProjectNameStrategy::Basename).unwrap();
+        assert_eq!(name, "my-app");
+    }
+
+    /// Degenerate input (root, empty) returns None instead of
+    /// returning an empty project name that would later fail
+    /// `get_or_create_project`'s validation.
+    #[test]
+    fn derive_project_name_rejects_degenerate_paths() {
+        assert!(derive_project_name(Path::new("/"), ProjectNameStrategy::Basename).is_none());
+        assert!(derive_project_name(Path::new(""), ProjectNameStrategy::Basename).is_none());
+    }
+
+    /// `MainRepoRoot` strategy walks up to the main repo and uses its
+    /// basename. The synthetic repo here lives at `<tmp>/repo`, so
+    /// resolving from `<tmp>/repo/sub/dir` returns `"repo"` plus the
+    /// repo path.
+    #[test]
+    fn derive_project_name_main_repo_root_collapses_subdirs() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join("sub").join("dir")).unwrap();
+        // Reuse the in-test git scaffolding so the lookup finds a repo.
+        let run = |args: &[&str]| -> std::io::Result<()> {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .status()?;
+            assert!(status.success(), "git {args:?} failed");
+            Ok(())
+        };
+        run(&["init", "-q", "-b", "main"]).unwrap();
+        run(&["config", "user.email", "t@t"]).unwrap();
+        run(&["config", "user.name", "t"]).unwrap();
+        run(&["commit", "--allow-empty", "-m", "init"]).unwrap();
+
+        let from_sub = repo.join("sub").join("dir");
+        let (name, root) =
+            derive_project_name(&from_sub, ProjectNameStrategy::MainRepoRoot).unwrap();
+        assert_eq!(name, "repo");
+        // git2::Repository::discover follows real-path symlinks; compare
+        // by canonicalised form so a /private/var vs /var prefix on
+        // macOS or similar doesn't trip the assertion.
+        assert_eq!(
+            root.as_ref().and_then(|p| p.canonicalize().ok()),
+            Some(repo.canonicalize().unwrap()),
+        );
+    }
+
+    /// `MainRepoRoot` falls back to `Basename` semantics when no git
+    /// repo lives at or above the path — never errors, never returns
+    /// `("", None)`.
+    #[test]
+    fn derive_project_name_main_repo_root_falls_back_to_basename() {
+        let tmp = TempDir::new().unwrap();
+        let plain = tmp.path().join("plain-dir");
+        std::fs::create_dir_all(&plain).unwrap();
+        let (name, root) = derive_project_name(&plain, ProjectNameStrategy::MainRepoRoot).unwrap();
+        assert_eq!(name, "plain-dir");
+        assert!(
+            root.is_none(),
+            "no git repo found ⇒ no repo path in the tuple"
+        );
     }
 }

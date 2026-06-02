@@ -345,22 +345,24 @@ async fn resolve_project_ids(
         cwd: &str,
         strategy: ProjectStrategy,
     ) -> Option<(String, Option<String>)> {
+        // Delegate to the shared helper so the CLI's `resolve_project_name`
+        // and this resolver agree on what "the project for this cwd"
+        // resolves to. Map our wire-format `ProjectStrategy` onto the
+        // shared library's `ProjectNameStrategy`.
         let path = std::path::Path::new(cwd);
-        if matches!(strategy, ProjectStrategy::RepoRoot)
-            && let Ok(root) = ai_memory_consolidate::discover_main_repo_root(path)
-            && let Some(name) = basename(&root)
-        {
-            return Some((name, Some(root.to_string_lossy().into_owned())));
-        }
-        basename(path).map(|name| (name, Some(cwd.to_string())))
-    }
-
-    fn basename(path: &std::path::Path) -> Option<String> {
-        // Split on both `/` and `\` so Windows paths sent to a Linux
-        // server still resolve to the final component.
-        let s = path.to_str()?;
-        let name = s.rsplit(['/', '\\']).find(|seg| !seg.is_empty())?;
-        Some(name.to_string())
+        let strat = match strategy {
+            ProjectStrategy::Basename => ai_memory_consolidate::ProjectNameStrategy::Basename,
+            ProjectStrategy::RepoRoot => ai_memory_consolidate::ProjectNameStrategy::MainRepoRoot,
+        };
+        // When the helper returned no repo path (basename strategy or
+        // no repo found), use the original cwd as the repo_path —
+        // `get_or_create_project` records it for future cwd-based
+        // lookups even when the project lives outside a git checkout.
+        ai_memory_consolidate::derive_project_name(path, strat).map(|(name, root)| {
+            let repo_path =
+                root.map_or_else(|| cwd.to_string(), |p| p.to_string_lossy().into_owned());
+            (name, Some(repo_path))
+        })
     }
 
     let ws = state
