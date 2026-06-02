@@ -954,10 +954,7 @@ fn mount_web_router(
     // anchoring the custom SPA gets via its injected index. Default (`/web/`)
     // is byte-equivalent to the previous absolute `/web/…` links.
     let web_router = ai_memory_web::router(reader, wiki).layer(
-        axum::middleware::from_fn_with_state(
-            Arc::new(base_href.to_string()),
-            inject_web_base_href,
-        ),
+        axum::middleware::from_fn_with_state(Arc::new(base_href.to_string()), inject_web_base_href),
     );
     info!(mount, base_href, "read-only wiki browser mounted");
     if slug.is_empty() {
@@ -1009,7 +1006,10 @@ async fn inject_web_base_href(
     let bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(b) => b,
         Err(_) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "response body read error\n")
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "response body read error\n",
+            )
                 .into_response();
         }
     };
@@ -1187,6 +1187,166 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Assemble the web/API surface under `base_path` + `web_slug` exactly the
+    /// way the `serve` handler does (mount, then `nest(&base_path, …)`), with
+    /// no auth/host layers so tests probe routing + injection in isolation.
+    /// Returns the `TempDir` guard too — the caller must keep it alive for the
+    /// router's lifetime (the store's SQLite + wiki files live under it).
+    fn based_web_router(base_path: &str, web_slug: &str) -> (TempDir, axum::Router) {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let base = normalize_prefix(base_path);
+        let base_href = web_base_href(base_path, web_slug);
+        let router = mount_web_router(
+            axum::Router::new(),
+            true,
+            store.reader.clone(),
+            wiki,
+            None,
+            &[],
+            web_slug,
+            &base_href,
+            &base,
+        );
+        let router = if base.is_empty() {
+            router
+        } else {
+            axum::Router::new().nest(&base, router)
+        };
+        (tmp, router)
+    }
+
+    #[tokio::test]
+    async fn base_path_nests_all_surfaces_and_root_404s() {
+        let (_tmp, router) = based_web_router("/wiki", "/web");
+
+        // The web UI is reachable UNDER the prefix…
+        let under = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/wiki/web")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(under.status(), StatusCode::OK);
+
+        // …and the API too.
+        let api = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/wiki/api/v1/projects")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(api.status(), StatusCode::OK);
+
+        // The same paths at the host ROOT must 404 — nothing leaks outside the
+        // prefix (the whole point of base-path hosting behind a shared proxy).
+        for uri in ["/web", "/api/v1/projects"] {
+            let root = router
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                root.status(),
+                StatusCode::NOT_FOUND,
+                "{uri} must 404 at root"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn inject_web_base_href_targets_html_only() {
+        let (_tmp, router) = based_web_router("/wiki", "/web");
+
+        // HTML response carries the injected <base href> under the prefix.
+        let html_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/wiki/web")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(html_resp.status(), StatusCode::OK);
+        let html = axum::body::to_bytes(html_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&html).unwrap();
+        assert!(
+            html.contains(r#"<base href="/wiki/web/">"#),
+            "expected injected base href, got: {html}"
+        );
+
+        // A non-HTML asset passes through untouched (no <base> smuggled in).
+        let css_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/wiki/web/static/tailwind.css")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(css_resp.status(), StatusCode::OK);
+        let css = axum::body::to_bytes(css_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !std::str::from_utf8(&css).unwrap().contains("<base href"),
+            "non-HTML asset must not receive a <base href> injection"
+        );
+    }
+
+    #[tokio::test]
+    async fn trailing_slash_redirect_carries_the_prefix() {
+        let (_tmp, router) = based_web_router("/wiki", "/web");
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/wiki/web/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT);
+        // Location must include the external prefix — the surrounding base nest
+        // does NOT rewrite Location headers, so a bare `/web` would drop `/wiki`.
+        assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/wiki/web",);
+    }
+
+    #[tokio::test]
+    async fn no_base_path_is_byte_equivalent_at_root() {
+        let (_tmp, router) = based_web_router("", "/web");
+        let resp = router
+            .clone()
+            .oneshot(Request::builder().uri("/web").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            std::str::from_utf8(&body)
+                .unwrap()
+                .contains(r#"<base href="/web/">"#),
+            "default mount should inject the root-relative base href"
+        );
     }
 
     #[tokio::test]

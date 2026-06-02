@@ -15,7 +15,11 @@ use askama::Template;
 /// subpath (`/wiki/web/…`), without the templates knowing the prefix.
 #[must_use]
 pub(crate) fn project_href(workspace: &str, project: &str) -> String {
-    format!("w/{}/{}", encode_segment(workspace), encode_segment(project))
+    format!(
+        "w/{}/{}",
+        encode_segment(workspace),
+        encode_segment(project)
+    )
 }
 
 /// Build a `/web` page URL with workspace/project/path percent-encoded.
