@@ -97,7 +97,7 @@ fn mcp_server_url_from_base(server_url: &str) -> String {
 /// unsupported OSes, or when `$HOME` can't be resolved.
 pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> {
     use crate::cli::McpClient;
-    let home = dirs::home_dir().context("could not locate $HOME for config-file auto-detect")?;
+    let home = || dirs::home_dir().context("could not locate $HOME for config-file auto-detect");
     Ok(match client {
         // Claude Code reads MCP-server registrations from `~/.claude.json`
         // (the same file `claude mcp add`/`claude mcp list` operate on).
@@ -107,14 +107,18 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
         // observing that `mcpServers` in settings.json is silently
         // ignored while the same entry under `~/.claude.json` shows up
         // in `claude mcp list`.)
-        McpClient::ClaudeCode => home.join(".claude.json"),
-        McpClient::Codex => home.join(".codex").join("config.toml"),
-        McpClient::OpenCode => home.join(".config").join("opencode").join("opencode.json"),
-        McpClient::Cursor => home.join(".cursor").join("mcp.json"),
+        McpClient::ClaudeCode => home()?.join(".claude.json"),
+        McpClient::Codex => home()?.join(".codex").join("config.toml"),
+        McpClient::OpenCode => home()?
+            .join(".config")
+            .join("opencode")
+            .join("opencode.json"),
+        McpClient::Cursor => home()?.join(".cursor").join("mcp.json"),
         McpClient::ClaudeDesktop => {
             #[cfg(target_os = "macos")]
             {
-                home.join("Library")
+                home()?
+                    .join("Library")
                     .join("Application Support")
                     .join("Claude")
                     .join("claude_desktop_config.json")
@@ -122,7 +126,8 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
             #[cfg(target_os = "windows")]
             {
                 // %APPDATA% is roughly ~/AppData/Roaming.
-                home.join("AppData")
+                home()?
+                    .join("AppData")
                     .join("Roaming")
                     .join("Claude")
                     .join("claude_desktop_config.json")
@@ -135,19 +140,18 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
                 );
             }
         }
-        McpClient::GeminiCli => home.join(".gemini").join("settings.json"),
-        McpClient::Openclaw => home.join(".openclaw").join("config.json"),
-        McpClient::Pi => home.join(".omp").join("agent").join("mcp.json"),
-        McpClient::AntigravityCli => home
+        McpClient::GeminiCli => home()?.join(".gemini").join("settings.json"),
+        McpClient::Openclaw => home()?.join(".openclaw").join("config.json"),
+        McpClient::Pi => home()?.join(".omp").join("agent").join("mcp.json"),
+        McpClient::AntigravityCli => home()?
             .join(".gemini")
             .join("antigravity-cli")
             .join("mcp_config.json"),
         // VS Code MCP is workspace-scoped by default: `.vscode/mcp.json`
-        // at the current workspace root. The user-level alternative is
-        // managed through VS Code's `MCP: Add server` palette and not
-        // a single canonical file path, so we don't try to detect it
-        // here — `--config-file` is the escape hatch for users who
-        // want to target a non-standard location.
+        // at the current workspace root. The user-profile alternative
+        // lives under VS Code's profile-specific data dir; use VS
+        // Code's `MCP: Open User Configuration` command to open it,
+        // then pass that concrete path via `--config-file`.
         McpClient::VsCodeCopilot => std::env::current_dir()
             .context("could not resolve current dir for .vscode/mcp.json default")?
             .join(".vscode")
@@ -630,7 +634,8 @@ fn render_vscode_copilot(args: &InstallMcpArgs) -> Result<String> {
         "# VS Code GitHub Copilot (agent mode) — write to one of:\n\
          #   - .vscode/mcp.json   (workspace, recommended — matches\n\
          #                         ai-memory's per-cwd auto-scoping)\n\
-         #   - ~/.vscode/mcp.json (user-level, all workspaces)\n\
+         #   - the user-profile mcp.json opened by VS Code's\n\
+         #     `MCP: Open User Configuration` command\n\
          #\n\
          # VS Code's MCP framework uses `servers` (NOT `mcpServers`) as the\n\
          # top-level key, `type: \"http\"` for streamable-HTTP endpoints, and\n\

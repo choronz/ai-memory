@@ -27,10 +27,11 @@ files for OpenClaw / OpenCode / OMP) and are covered in the
 Git Bash `.sh` hooks rather than the PowerShell default used by other
 script-hook agents.
 
-Claude Desktop is **MCP-only** here: it exposes long-term memory to its
-LLM via ai-memory's MCP tools (`memory_query`, `memory_recent`,
-`memory_handoff_accept`, etc.), but it does not auto-capture session
-events into ai-memory's `/hook` endpoint. The trade-off:
+Claude Desktop and VS Code Copilot are **MCP-only** here: they expose
+long-term memory to their LLMs via ai-memory's MCP tools
+(`memory_query`, `memory_recent`, `memory_handoff_accept`, etc.), but
+they do not auto-capture session events into ai-memory's `/hook`
+endpoint. The trade-off:
 
 | | What you get | What you don't get |
 |---|---|---|
@@ -76,7 +77,7 @@ metadata.
 > **One-shot tip:** every snippet below is also reachable from the
 > CLI:
 > ```bash
-> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / pi|omp / antigravity-cli
+> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / pi|omp / antigravity-cli / vscode-copilot
 > ```
 
 ---
@@ -123,8 +124,10 @@ VS Code — call `memory_query`, `memory_write_page`, etc. from chat).
 **Config file:**
 - Workspace (recommended): `.vscode/mcp.json` in the repo root. Matches
   ai-memory's per-cwd auto-scoping.
-- User-level: `~/.vscode/mcp.json`, or managed through the **MCP: Add
-  server** palette command.
+- User profile: run **MCP: Open User Configuration** in VS Code and use
+  the `mcp.json` file it opens. The exact path is platform- and
+  profile-specific; pass it to `--config-file` if you want ai-memory to
+  write that file directly.
 
 **Schema (verified against VS Code's MCP reference):** top-level key is
 `servers` (NOT `mcpServers`). HTTP endpoints use `type: "http"` and the
@@ -165,6 +168,10 @@ ai-memory install-mcp --client vscode-copilot
 
 # Or write .vscode/mcp.json in the current workspace directly:
 ai-memory install-mcp --client vscode-copilot --apply
+
+# Or write the user-profile mcp.json opened by VS Code directly:
+ai-memory install-mcp --client vscode-copilot \
+  --config-file /path/to/vscode-profile/mcp.json --apply
 ```
 
 Aliases: `copilot`, `github-copilot`.

@@ -1125,6 +1125,23 @@ mod tests {
     }
 
     #[test]
+    fn strip_mcp_vscode_copilot_root_servers() {
+        let content = r#"{"servers":{"ai-memory":{"type":"http","url":"http://127.0.0.1:49374/mcp"},"other":{"type":"http","url":"http://x"}}}"#;
+        let (out, removed) = strip_mcp_json(
+            content,
+            McpClient::VsCodeCopilot,
+            Some("ai-memory"),
+            "http://127.0.0.1:49374/mcp",
+        )
+        .unwrap();
+
+        assert_eq!(removed, vec!["ai-memory".to_string()]);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["servers"].get("ai-memory").is_none());
+        assert!(v["servers"].get("other").is_some());
+    }
+
+    #[test]
     fn strip_mcp_no_match_is_noop() {
         let content = r#"{"mcpServers":{"other":{"url":"http://x"}}}"#;
         let (_out, removed) = strip_mcp_json(
