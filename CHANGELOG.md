@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.7] - 2026-06-15
+
 ### Added
 - Added a dry-run-only auto-improvement reviewer: `ai-memory auto-improve
   --dry-run --session-id <uuid>` calls `POST /admin/auto-improve`, reads one
@@ -1067,7 +1069,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.0.6...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.0.7...HEAD
+[1.0.7]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.0.7
 [1.0.6]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.0.6
 [1.0.5]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.0.5
 [1.0.4]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.0.4
