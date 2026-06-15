@@ -36,10 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to pick up new proactive retrieval and `memory_auto_improve` guidance.
 
 ### Fixed
-- `auto-improve` now tolerates LLM evidence arrays that contain bare quote
-  strings instead of `{ page, quote }` objects. Bare strings are normalized into
-  bounded quote evidence before validation, so one model-format slip no longer
-  turns a dry-run review into a 502 response.
+- `auto-improve` now tolerates common malformed LLM proposal shapes found during
+  live testing: evidence arrays may contain bare quote strings instead of
+  `{ page, quote }` objects, and proposals with missing required fields are
+  rejected by validation instead of turning the whole dry-run review into a 502
+  response.
 - Admin destructive ops (`/admin/purge-project`, `/admin/move-project`) now
   propagate the authenticated actor (from the auth middleware's
   `Extension<ActorContext>`) into the admission context, so a `scope-guard`

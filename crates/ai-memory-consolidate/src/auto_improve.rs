@@ -104,7 +104,12 @@ impl<'de> Deserialize<'de> for AutoImproveEvidence {
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum EvidenceInput {
-            Object { page: String, quote: String },
+            Object {
+                #[serde(default)]
+                page: String,
+                #[serde(default)]
+                quote: String,
+            },
             Quote(String),
         }
 
@@ -122,21 +127,28 @@ impl<'de> Deserialize<'de> for AutoImproveEvidence {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AutoImproveProposal {
     /// Currently only `create_or_update` is supported.
+    #[serde(default)]
     pub operation: String,
     /// Relative wiki path that would be created or updated.
+    #[serde(default)]
     pub path: String,
     /// Human title for the proposed page.
+    #[serde(default)]
     pub title: String,
     /// Semantic kind: gotcha, decision, concept, procedure, rule, fact, note, or slot.
+    #[serde(default)]
     pub kind: String,
     /// Model confidence from 0.0 to 1.0.
+    #[serde(default)]
     pub confidence: f32,
     /// Why the lesson is durable enough to propose.
+    #[serde(default)]
     pub rationale: String,
     /// Evidence quotes that justify the proposal.
     #[serde(default)]
     pub evidence: Vec<AutoImproveEvidence>,
     /// Markdown body without frontmatter.
+    #[serde(default)]
     pub body_markdown: String,
 }
 
@@ -144,8 +156,10 @@ pub struct AutoImproveProposal {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AutoImproveRejectedCandidate {
     /// Machine-readable-ish reason for rejection.
+    #[serde(default)]
     pub reason: String,
     /// Evidence label or short detail.
+    #[serde(default)]
     pub evidence: String,
 }
 
@@ -153,6 +167,7 @@ pub struct AutoImproveRejectedCandidate {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AutoImproveLlmResponse {
     /// Short summary of the review.
+    #[serde(default)]
     pub summary: String,
     /// Candidate edits.
     #[serde(default)]
@@ -1022,6 +1037,38 @@ mod tests {
             validate_response(raw, &cfg(), &ExistingPageIndex::default());
         assert_eq!(accepted.len(), 1);
         assert!(rejected.is_empty());
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn malformed_proposal_missing_operation_is_rejected_not_parse_fatal() {
+        let raw: AutoImproveLlmResponse = serde_json::from_value(serde_json::json!({
+            "summary": "ok",
+            "proposals": [{
+                "path": "procedures/release.md",
+                "title": "Release Procedure",
+                "kind": "procedure",
+                "confidence": 0.91,
+                "rationale": "The session repeated a release workflow with verification.",
+                "evidence": [{"quote": "run the full gate before release"}],
+                "body_markdown": "# Release Procedure\n\nRun the full gate before release."
+            }],
+            "rejected_candidates": []
+        }))
+        .unwrap();
+
+        assert_eq!(raw.proposals[0].operation, "");
+        assert_eq!(raw.proposals[0].evidence[0].page, "");
+        assert_eq!(
+            raw.proposals[0].evidence[0].quote,
+            "run the full gate before release"
+        );
+
+        let (accepted, rejected, warnings) =
+            validate_response(raw, &cfg(), &ExistingPageIndex::default());
+        assert!(accepted.is_empty());
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].reason, "unsupported_operation");
         assert!(warnings.is_empty());
     }
 
