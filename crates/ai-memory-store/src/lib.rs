@@ -148,6 +148,15 @@ mod tests {
         }
     }
 
+    fn delete_scheduler_state(store: &Store, ws: WorkspaceId, proj: ProjectId) {
+        let conn = Connection::open(store.db_path()).unwrap();
+        conn.execute(
+            "DELETE FROM auto_improve_scheduler_state WHERE workspace_id = ?1 AND project_id = ?2",
+            params![ws.as_bytes(), proj.as_bytes()],
+        )
+        .unwrap();
+    }
+
     fn stage_input(
         ws: WorkspaceId,
         proj: ProjectId,
@@ -1537,6 +1546,7 @@ mod tests {
             .get_or_create_project(ws, "ai-memory", None)
             .await
             .unwrap();
+        delete_scheduler_state(&store, ws, proj);
 
         let historical = SessionId::new();
         store
@@ -1690,6 +1700,121 @@ mod tests {
                 .is_empty(),
             "any recorded run row suppresses scheduler retry for v1"
         );
+    }
+
+    #[tokio::test]
+    async fn auto_improve_scheduler_state_and_candidates_are_per_project() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let first_project = store
+            .writer
+            .get_or_create_project(ws, "first", None)
+            .await
+            .unwrap();
+        let second_project = store
+            .writer
+            .get_or_create_project(ws, "second", None)
+            .await
+            .unwrap();
+        for project_id in [first_project, second_project] {
+            delete_scheduler_state(&store, ws, project_id);
+        }
+
+        for project_id in [first_project, second_project] {
+            let historical = SessionId::new();
+            store
+                .writer
+                .begin_session(NewSession {
+                    id: historical,
+                    workspace_id: ws,
+                    project_id,
+                    agent_kind: AgentKind::OpenCode,
+                    cwd: None,
+                })
+                .await
+                .unwrap();
+            store.writer.end_session(historical, None).await.unwrap();
+        }
+
+        for scope in store.reader.list_all_scopes().await.unwrap() {
+            store
+                .writer
+                .ensure_auto_improve_scheduler_state(scope.workspace_id, scope.project_id)
+                .await
+                .unwrap();
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        let mut expected = Vec::new();
+        for project_id in [first_project, second_project] {
+            let session_id = SessionId::new();
+            store
+                .writer
+                .begin_session(NewSession {
+                    id: session_id,
+                    workspace_id: ws,
+                    project_id,
+                    agent_kind: AgentKind::OpenCode,
+                    cwd: None,
+                })
+                .await
+                .unwrap();
+            store.writer.end_session(session_id, None).await.unwrap();
+            expected.push((project_id, session_id));
+        }
+
+        for (project_id, session_id) in expected {
+            let candidates = store
+                .reader
+                .auto_improve_candidate_sessions(ws, project_id, 0, 10)
+                .await
+                .unwrap();
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].session_id, session_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn get_or_create_project_initializes_scheduler_state_before_first_session() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "brand-new", None)
+            .await
+            .unwrap();
+
+        let first_session = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: first_session,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::OpenCode,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        store.writer.end_session(first_session, None).await.unwrap();
+
+        let candidates = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].session_id, first_session);
     }
 
     #[tokio::test]

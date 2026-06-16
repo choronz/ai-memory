@@ -140,9 +140,9 @@ Decay/forget runs as a separate `memory_forget_sweep` job: applies the retention
 Auto-improvement work stays separate from normal session consolidation. The
 reviewer notes and staged design are in
 [`docs/auto-improvement-loop.md`](auto-improvement-loop.md). The short version:
-learning review is scheduled for newly completed sessions when an LLM provider
-is configured, and manual CLI/admin/MCP runs remain available for catch-up or
-targeted reruns. Scheduling and approval are separate: `[auto_improve.scheduler]`
+learning review is scheduled for newly completed sessions in every project when
+an LLM provider is configured, and manual CLI/admin/MCP runs remain available for
+catch-up or targeted reruns. Scheduling and approval are separate: `[auto_improve.scheduler]`
 controls background review, while `[auto_improve] require_approval = true` keeps
 scheduled and manual proposals pending for human approval instead of applying
 them automatically. All writes remain scoped through the shared resolver/auth

@@ -29,9 +29,11 @@ background reconciliation or provider-backed maintenance. The core invariant is
 unchanged: the markdown wiki is the source of truth, and SQLite is the derived
 index for search, sessions, observations, handoffs, audit, and embeddings.
 Auto-improvement sits on the provider-backed maintenance side: the server
-schedules reviews for newly completed sessions, records validated proposals in
-the pending-writes audit trail, and auto-approves them through the normal wiki
-write path by default. Scheduling and approval are separate. Admins can set
+schedules reviews for newly completed sessions in every project, records
+validated proposals in the pending-writes audit trail, and auto-approves them
+through the normal wiki write path by default. Scheduler ticks are
+non-overlapping; long all-project review passes delay the next tick instead of
+starting another copy. Scheduling and approval are separate. Admins can set
 `[auto_improve.scheduler] enabled = false` to stop background review, or
 `[auto_improve] require_approval = true` to leave scheduled and manual proposals
 pending for review.
@@ -59,7 +61,7 @@ pending for review.
    that summary into a richer durable page or fans out into a
    multi-page batch under `concepts/`, `decisions/`, `gotchas/`.
 5. When an LLM provider is configured, the auto-improvement scheduler reviews
-   newly completed sessions outside hook latency. It records validated
+   newly completed sessions across all projects outside hook latency. It records validated
    `concepts/`, `decisions/`, `gotchas/`, `procedures/`, and `_rules/` proposals
    in the pending-writes audit trail, then approves them through the wiki
    mutation path by default. The scheduler initializes a per-project first-run
@@ -340,7 +342,7 @@ pending_path = "_pending/auto-improve"
 [auto_improve.scheduler]           # background review; separate from approval
 enabled = true
 interval_secs = 3600
-max_sessions_per_tick = 1
+max_sessions_per_tick = 1        # per project; scheduler ticks do not overlap
 min_session_age_secs = 600
 ```
 

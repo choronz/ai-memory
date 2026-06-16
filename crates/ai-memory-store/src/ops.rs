@@ -139,7 +139,21 @@ pub fn get_or_create_project(
         id
     };
     tx.commit()?;
+    if scheduler_state_table_exists(conn)? {
+        crate::auto_improve::ensure_scheduler_state(conn, *workspace_id, id)?;
+    }
     Ok(id)
+}
+
+fn scheduler_state_table_exists(conn: &Connection) -> StoreResult<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'auto_improve_scheduler_state'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 /// Insert a workspace with an **explicit id**, idempotent. Unlike

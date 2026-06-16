@@ -403,7 +403,7 @@ pub struct AutoImproveSchedulerSettings {
     pub enabled: bool,
     /// Scheduler cadence. `0` disables the scheduler while keeping manual runs.
     pub interval_secs: u64,
-    /// Maximum sessions reviewed per scheduler tick. `0` disables the scheduler.
+    /// Maximum sessions reviewed per project in one scheduler tick. `0` disables the scheduler.
     pub max_sessions_per_tick: usize,
     /// Minimum age after SessionEnd before a session becomes eligible.
     pub min_session_age_secs: u64,

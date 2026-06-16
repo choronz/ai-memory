@@ -193,7 +193,8 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         ws,
         proj,
         config.decay,
-    );
+    )
+    .await;
 
     match args.transport {
         TransportKind::Stdio => {
@@ -431,7 +432,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn start_maintenance_scheduler(
+async fn start_maintenance_scheduler(
     settings: MaintenanceSettings,
     auto_improve: AutoImproveSettings,
     reader: ReaderPool,
@@ -541,101 +542,40 @@ fn start_maintenance_scheduler(
         let reader = reader.clone();
         let writer = writer.clone();
         let wiki = wiki.clone();
+        match initialize_auto_improve_scheduler_scopes(&reader, &writer).await {
+            Ok((scopes, errors)) => info!(
+                scopes,
+                errors, "auto-improve scheduler startup scope initialization completed"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "auto-improve scheduler startup scope initialization failed"
+            ),
+        }
         tasks.push(tokio::spawn(async move {
             let interval = std::time::Duration::from_secs(scheduler.interval_secs);
-            if let Err(e) = writer
-                .ensure_auto_improve_scheduler_state(workspace_id, project_id)
-                .await
-            {
-                tracing::warn!(error = %e, "scheduled auto-improve state init failed");
-            }
+            // Sleep after each complete tick instead of driving work from a
+            // fixed-rate interval. If reviewing all projects takes longer than
+            // `interval`, the next tick is delayed rather than overlapping the
+            // still-running one.
             loop {
                 tokio::time::sleep(interval).await;
-                if let Err(e) = writer
-                    .ensure_auto_improve_scheduler_state(workspace_id, project_id)
+                let started = std::time::Instant::now();
+                match run_auto_improve_scheduler_tick(&reader, &writer, &wiki, &llm, &auto_improve)
                     .await
                 {
-                    tracing::warn!(error = %e, "scheduled auto-improve state init failed");
-                    continue;
-                }
-                let candidates = match reader
-                    .auto_improve_candidate_sessions(
-                        workspace_id,
-                        project_id,
-                        scheduler.min_session_age_secs,
-                        scheduler.max_sessions_per_tick,
-                    )
-                    .await
-                {
-                    Ok(candidates) => candidates,
+                    Ok(outcome) => info!(
+                        scopes = outcome.scopes,
+                        scopes_with_candidates = outcome.scopes_with_candidates,
+                        reviewed = outcome.reviewed,
+                        errors = outcome.errors,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "scheduled auto-improve tick completed"
+                    ),
                     Err(e) => {
-                        tracing::warn!(error = %e, "scheduled auto-improve candidate query failed");
-                        continue;
+                        tracing::warn!(error = %e, "scheduled auto-improve tick failed")
                     }
                 };
-                if candidates.is_empty() {
-                    tracing::debug!("scheduled auto-improve found no eligible sessions");
-                    continue;
-                }
-                let mut reviewed = 0usize;
-                let ctx = ScheduledAutoImproveContext {
-                    reader: &reader,
-                    writer: &writer,
-                    wiki: &wiki,
-                    llm: &llm,
-                    workspace_id,
-                    project_id,
-                    settings: &auto_improve,
-                };
-                for candidate in candidates {
-                    let claimed = match ctx
-                        .writer
-                        .claim_auto_improve_scheduler_session(
-                            ctx.workspace_id,
-                            ctx.project_id,
-                            candidate.session_id,
-                            candidate.ended_at,
-                        )
-                        .await
-                    {
-                        Ok(claimed) => claimed,
-                        Err(e) => {
-                            tracing::warn!(
-                                session_id = %candidate.session_id,
-                                error = %e,
-                                "scheduled auto-improve claim failed"
-                            );
-                            continue;
-                        }
-                    };
-                    if !claimed {
-                        tracing::debug!(
-                            session_id = %candidate.session_id,
-                            "scheduled auto-improve candidate already claimed or reviewed"
-                        );
-                        continue;
-                    }
-                    match run_scheduled_auto_improve(&ctx, candidate.session_id).await {
-                        Ok(outcome) => {
-                            reviewed += 1;
-                            info!(
-                                session_id = %candidate.session_id,
-                                run_id = %outcome.run_id,
-                                proposals = outcome.proposals,
-                                approved = outcome.approved,
-                                pending = outcome.pending,
-                                conflicts = outcome.conflicts,
-                                "scheduled auto-improve completed"
-                            );
-                        }
-                        Err(e) => tracing::warn!(
-                            session_id = %candidate.session_id,
-                            error = %e,
-                            "scheduled auto-improve failed"
-                        ),
-                    }
-                }
-                info!(reviewed, "scheduled auto-improve tick completed");
             }
         }));
     } else {
@@ -648,6 +588,30 @@ fn start_maintenance_scheduler(
         info!(jobs = tasks.len(), "scheduled maintenance started");
     }
     tasks
+}
+
+async fn initialize_auto_improve_scheduler_scopes(
+    reader: &ReaderPool,
+    writer: &WriterHandle,
+) -> Result<(usize, usize)> {
+    let scopes = reader.list_all_scopes().await?;
+    let total = scopes.len();
+    let mut errors = 0usize;
+    for scope in scopes {
+        if let Err(e) = writer
+            .ensure_auto_improve_scheduler_state(scope.workspace_id, scope.project_id)
+            .await
+        {
+            errors += 1;
+            tracing::warn!(
+                workspace = %scope.workspace_name,
+                project = %scope.project_name,
+                error = %e,
+                "auto-improve scheduler startup state init failed"
+            );
+        }
+    }
+    Ok((total, errors))
 }
 
 async fn run_embedding_backfill(
@@ -739,6 +703,14 @@ struct ScheduledAutoImproveOutcome {
     conflicts: usize,
 }
 
+#[derive(Debug, Default)]
+struct ScheduledAutoImproveTickOutcome {
+    scopes: usize,
+    scopes_with_candidates: usize,
+    reviewed: usize,
+    errors: usize,
+}
+
 struct ScheduledAutoImproveContext<'a> {
     reader: &'a ReaderPool,
     writer: &'a WriterHandle,
@@ -747,6 +719,134 @@ struct ScheduledAutoImproveContext<'a> {
     workspace_id: WorkspaceId,
     project_id: ProjectId,
     settings: &'a AutoImproveSettings,
+}
+
+async fn run_auto_improve_scheduler_tick(
+    reader: &ReaderPool,
+    writer: &WriterHandle,
+    wiki: &Wiki,
+    llm: &Arc<dyn LlmProvider>,
+    settings: &AutoImproveSettings,
+) -> Result<ScheduledAutoImproveTickOutcome> {
+    let scopes = reader.list_all_scopes().await?;
+    let mut outcome = ScheduledAutoImproveTickOutcome {
+        scopes: scopes.len(),
+        ..ScheduledAutoImproveTickOutcome::default()
+    };
+
+    for scope in scopes {
+        if let Err(e) = writer
+            .ensure_auto_improve_scheduler_state(scope.workspace_id, scope.project_id)
+            .await
+        {
+            outcome.errors += 1;
+            tracing::warn!(
+                workspace = %scope.workspace_name,
+                project = %scope.project_name,
+                error = %e,
+                "scheduled auto-improve state init failed"
+            );
+            continue;
+        }
+
+        let candidates = match reader
+            .auto_improve_candidate_sessions(
+                scope.workspace_id,
+                scope.project_id,
+                settings.scheduler.min_session_age_secs,
+                settings.scheduler.max_sessions_per_tick,
+            )
+            .await
+        {
+            Ok(candidates) => candidates,
+            Err(e) => {
+                outcome.errors += 1;
+                tracing::warn!(
+                    workspace = %scope.workspace_name,
+                    project = %scope.project_name,
+                    error = %e,
+                    "scheduled auto-improve candidate query failed"
+                );
+                continue;
+            }
+        };
+        if candidates.is_empty() {
+            continue;
+        }
+
+        outcome.scopes_with_candidates += 1;
+        let ctx = ScheduledAutoImproveContext {
+            reader,
+            writer,
+            wiki,
+            llm,
+            workspace_id: scope.workspace_id,
+            project_id: scope.project_id,
+            settings,
+        };
+        for candidate in candidates {
+            let claimed = match ctx
+                .writer
+                .claim_auto_improve_scheduler_session(
+                    ctx.workspace_id,
+                    ctx.project_id,
+                    candidate.session_id,
+                    candidate.ended_at,
+                )
+                .await
+            {
+                Ok(claimed) => claimed,
+                Err(e) => {
+                    outcome.errors += 1;
+                    tracing::warn!(
+                        workspace = %scope.workspace_name,
+                        project = %scope.project_name,
+                        session_id = %candidate.session_id,
+                        error = %e,
+                        "scheduled auto-improve claim failed"
+                    );
+                    continue;
+                }
+            };
+            if !claimed {
+                tracing::debug!(
+                    workspace = %scope.workspace_name,
+                    project = %scope.project_name,
+                    session_id = %candidate.session_id,
+                    "scheduled auto-improve candidate already claimed or reviewed"
+                );
+                continue;
+            }
+            match run_scheduled_auto_improve(&ctx, candidate.session_id).await {
+                Ok(run) => {
+                    outcome.reviewed += 1;
+                    info!(
+                        workspace = %scope.workspace_name,
+                        project = %scope.project_name,
+                        session_id = %candidate.session_id,
+                        run_id = %run.run_id,
+                        proposals = run.proposals,
+                        approved = run.approved,
+                        pending = run.pending,
+                        conflicts = run.conflicts,
+                        "scheduled auto-improve completed"
+                    );
+                }
+                Err(e) => {
+                    outcome.errors += 1;
+                    tracing::warn!(
+                        workspace = %scope.workspace_name,
+                        project = %scope.project_name,
+                        session_id = %candidate.session_id,
+                        error = %e,
+                        "scheduled auto-improve failed"
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(outcome)
 }
 
 async fn run_scheduled_auto_improve(
@@ -1625,12 +1725,49 @@ fn host_without_port(host: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_memory_core::{PagePath, Tier};
-    use ai_memory_llm::SyntheticEmbedder;
+    use ai_memory_core::{AgentKind, NewSession, PagePath, Tier};
+    use ai_memory_llm::{ChatRequest, ChatResponse, LlmResult, SyntheticEmbedder};
     use ai_memory_wiki::WritePageRequest;
     use axum::http::Request;
+    use std::future::Future;
+    use std::pin::Pin;
     use tempfile::TempDir;
     use tower::ServiceExt;
+
+    struct PanicLlm;
+
+    impl LlmProvider for PanicLlm {
+        fn name(&self) -> &'static str {
+            "panic"
+        }
+
+        fn model(&self) -> &str {
+            "panic"
+        }
+
+        fn complete<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<ChatResponse>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move { panic!("preflight-skipped scheduler test must not call LLM") })
+        }
+
+        fn complete_structured_raw<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<serde_json::Value>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move { panic!("preflight-skipped scheduler test must not call LLM") })
+        }
+    }
 
     #[test]
     fn host_allowed_accepts_host_with_port() {
@@ -2299,6 +2436,100 @@ mod tests {
             provider_health.snapshot().embedding.status,
             ai_memory_llm::ProviderHealthStatus::Unknown
         );
+    }
+
+    #[tokio::test]
+    async fn auto_improve_scheduler_startup_init_preserves_first_interval_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let first_project = store
+            .writer
+            .get_or_create_project(ws, "first", None)
+            .await
+            .unwrap();
+        let second_project = store
+            .writer
+            .get_or_create_project(ws, "second", None)
+            .await
+            .unwrap();
+
+        for project_id in [first_project, second_project] {
+            let before_startup_init = SessionId::new();
+            store
+                .writer
+                .begin_session(NewSession {
+                    id: before_startup_init,
+                    workspace_id: ws,
+                    project_id,
+                    agent_kind: AgentKind::OpenCode,
+                    cwd: None,
+                })
+                .await
+                .unwrap();
+            store
+                .writer
+                .end_session(before_startup_init, None)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            initialize_auto_improve_scheduler_scopes(&store.reader, &store.writer)
+                .await
+                .unwrap(),
+            (2, 0)
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        let mut first_interval_sessions = Vec::new();
+        for project_id in [first_project, second_project] {
+            let session_id = SessionId::new();
+            store
+                .writer
+                .begin_session(NewSession {
+                    id: session_id,
+                    workspace_id: ws,
+                    project_id,
+                    agent_kind: AgentKind::OpenCode,
+                    cwd: None,
+                })
+                .await
+                .unwrap();
+            store.writer.end_session(session_id, None).await.unwrap();
+            first_interval_sessions.push((project_id, session_id));
+        }
+
+        let mut settings = AutoImproveSettings::default();
+        settings.scheduler.min_session_age_secs = 0;
+        settings.scheduler.max_sessions_per_tick = 10;
+        let llm: Arc<dyn LlmProvider> = Arc::new(PanicLlm);
+        let outcome =
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+                .await
+                .unwrap();
+
+        assert_eq!(outcome.scopes, 2);
+        assert_eq!(outcome.scopes_with_candidates, 2);
+        assert_eq!(outcome.reviewed, 4);
+        assert_eq!(outcome.errors, 0);
+
+        for (project_id, session_id) in first_interval_sessions {
+            let candidates = store
+                .reader
+                .auto_improve_candidate_sessions(ws, project_id, 0, 10)
+                .await
+                .unwrap();
+            assert!(
+                candidates.iter().all(|c| c.session_id != session_id),
+                "first-interval session should have been reviewed or claimed"
+            );
+        }
     }
 
     // ── Part B: CORS validation tests ──────────────────────────────────────

@@ -130,14 +130,16 @@ priors are at the [bottom](#influences-and-prior-art).
   build on top.
 - **"What durable lesson did that session teach?"**
   When an LLM provider is configured, ai-memory runs a background
-  auto-improvement scheduler for newly completed sessions. It records proposed
-  wiki edits in the pending-writes audit trail, then approves them immediately
-  through the normal wiki write path by default. Scheduling and approval are
-  separate: set `[auto_improve.scheduler] enabled = false` to stop automatic
-  review, or set `[auto_improve] require_approval = true` to keep both scheduled
-  and manual proposals pending for human review. `ai-memory auto-improve
-  --session-id <uuid>` and MCP `memory_auto_improve` remain available for manual
-  catch-up or targeted reruns.
+  auto-improvement scheduler for newly completed sessions in every project. It
+  records proposed wiki edits in the pending-writes audit trail, then approves
+  them immediately through the normal wiki write path by default. Scheduler ticks
+  are non-overlapping: if reviewing all projects takes longer than the interval,
+  the next tick is delayed until the current one finishes. Scheduling and
+  approval are separate: set `[auto_improve.scheduler] enabled = false` to stop
+  automatic review, or set `[auto_improve] require_approval = true` to keep both
+  scheduled and manual proposals pending for human review. `ai-memory
+  auto-improve --session-id <uuid>` and MCP `memory_auto_improve` remain
+  available for manual catch-up or targeted reruns.
 
   Existing installs do not need per-project migration. The scheduler initializes
   a per-project first-run watermark so historical sessions are not reviewed

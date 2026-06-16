@@ -1,7 +1,7 @@
 # Optional Auto-Improvement Loop Research
 
 > Status: research plus implemented production notes. The server schedules
-> auto-improvement for newly completed sessions when an LLM provider is
+> auto-improvement for newly completed sessions in every project when an LLM provider is
 > configured. Manual CLI/admin/MCP auto-improvement remains available for
 > targeted runs and catch-up. Both paths record validated proposals in the
 > pending-writes audit trail and auto-approve them through the normal wiki write
@@ -251,7 +251,8 @@ Default-available auto-improvement must not surprise existing installs:
    contain an `[auto_improve] mode = ...` key; current ai-memory ignores that
    legacy key. Operators can remove the line when convenient.
 2. Session-end triggering stays off; the bounded background scheduler runs
-   outside hook latency and sleeps for its configured interval between ticks.
+   outside hook latency and sleeps for its configured interval after each
+   non-overlapping all-project tick.
 3. The scheduler initializes a first-run watermark per workspace/project and
    records a per-session claim before scheduled LLM work. Historical sessions are
    not reviewed automatically on upgrade, and failed scheduled reviews are not
@@ -286,7 +287,7 @@ pending_path = "_pending/auto-improve"
 [auto_improve.scheduler]
 enabled = true                # false disables background review only
 interval_secs = 3600          # 0 disables background review only
-max_sessions_per_tick = 1
+max_sessions_per_tick = 1       # per project; ticks process projects sequentially
 min_session_age_secs = 600
 ```
 
@@ -440,11 +441,11 @@ Tests:
 ### Phase 3: Background Scheduler
 
 Status: implemented as a server-side scheduler, not a SessionEnd hook trigger.
-The scheduler is enabled by default when an LLM provider exists, sleeps for its
-configured interval, and reviews only newly completed sessions after the
-persisted first-run watermark. It records a per-session claim before calling the
-LLM, so scheduled review is at-most-once per completed session unless an admin
-reruns auto-improve manually.
+The scheduler is enabled by default when an LLM provider exists, sleeps after
+each non-overlapping tick, and reviews newly completed sessions across every
+project after each project's persisted first-run watermark. It records a
+per-session claim before calling the LLM, so scheduled review is at-most-once per
+completed session unless an admin reruns auto-improve manually.
 
 Tests:
 

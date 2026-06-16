@@ -77,11 +77,13 @@ allowlist = []
 
 # Auto-improvement reviewer.
 #
-# The background scheduler reviews newly-completed sessions when an LLM provider
-# is configured. Approval is a separate stage: by default proposals are staged
-# for audit and immediately approved through the normal wiki write path. Set
-# `require_approval = true` to keep scheduler and manual-run proposals pending
-# until an admin runs `ai-memory pending-writes approve <id>`.
+# The background scheduler reviews newly-completed sessions in every project
+# when an LLM provider is configured. Ticks are non-overlapping: long all-project
+# review passes delay the next tick instead of starting another copy. Approval is
+# a separate stage: by default proposals are staged for audit and immediately
+# approved through the normal wiki write path. Set `require_approval = true` to
+# keep scheduler and manual-run proposals pending until an admin runs
+# `ai-memory pending-writes approve <id>`.
 #
 # Older configs may still contain an `[auto_improve] mode = ...` line. That key
 # is ignored by current ai-memory and can be removed when convenient.
@@ -99,5 +101,5 @@ pending_path = "_pending/auto-improve"
 [auto_improve.scheduler]
 enabled = true
 interval_secs = 3600
-max_sessions_per_tick = 1
+max_sessions_per_tick = 1 # per project
 min_session_age_secs = 600

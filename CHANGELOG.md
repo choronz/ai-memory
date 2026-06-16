@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Auto-improvement scheduling now scans every known project each tick instead of
+  only the server's startup/default project. Scheduler ticks remain
+  non-overlapping; if reviewing all projects takes longer than the configured
+  interval, the next tick is delayed until the current tick finishes.
+
 ## [1.0.11] - 2026-06-15
 
 ### Added

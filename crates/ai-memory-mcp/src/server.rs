@@ -94,7 +94,7 @@ the conversation calls for them:\n\
 - `memory_auto_improve` — when the user asks what durable lessons \
 should be proposed from a completed session, or at explicit wrap-up \
   when learning review is useful. It is the manual version of the server's \
-  scheduled auto-improvement loop, reads the latest completed session by \
+  all-project scheduled auto-improvement loop, reads the latest completed session by \
   default, and applies or stages validated edits through the auto-improvement \
   approval path. Admins can set `[auto_improve.scheduler] enabled = false` \
   to stop scheduling, or `[auto_improve] require_approval = true` to leave \
@@ -1165,7 +1165,7 @@ impl AiMemoryServer {
 
     /// Stage durable wiki edit proposals for a completed session.
     #[tool(
-        description = "Run manual auto-improvement for one completed session and apply or stage validated wiki edit proposals through the auto-improvement approval path. Use when the user asks what durable lessons should be captured, what memory pages this session suggests, or at explicit wrap-up when a learning review is useful. Omit `session_id` to review the latest completed session in the current project. The server also schedules background review for newly completed sessions when an LLM provider is configured. Admins can set `[auto_improve.scheduler] enabled = false` to stop automatic review, or `[auto_improve] require_approval = true` to leave scheduled and manual proposals pending for review."
+        description = "Run manual auto-improvement for one completed session and apply or stage validated wiki edit proposals through the auto-improvement approval path. Use when the user asks what durable lessons should be captured, what memory pages this session suggests, or at explicit wrap-up when a learning review is useful. Omit `session_id` to review the latest completed session in the current project. The server also schedules background review for newly completed sessions in every project when an LLM provider is configured. Admins can set `[auto_improve.scheduler] enabled = false` to stop automatic review, or `[auto_improve] require_approval = true` to leave scheduled and manual proposals pending for review."
     )]
     async fn memory_auto_improve(
         &self,
