@@ -670,8 +670,9 @@ The `serve` subcommand also accepts:
 | `--web-ui-dir <path>` | `AI_MEMORY_WEB_UI_DIR` | Serve a custom SPA from `<path>` instead of the built-in browser. ai-memory injects `<base href>` and `<meta name="ai-memory-base-path">` so the SPA can build relative URLs and API calls under the configured prefix. |
 | `--cors-allow-origin <origin>` | `AI_MEMORY_CORS_ALLOW_ORIGINS` (CSV) | Allow listed origins to call `/api/v1`. Layer is scoped only to that route — `/mcp`, `/hook`, `/admin`, and `/web` remain origin-locked. |
 
-On macOS, use the archive matching your architecture: `aarch64` for Apple
-Silicon, `x86_64` for Intel. On Windows, see [`docs/windows.md`](windows.md).
+On macOS, see [`docs/macos.md`](macos.md); use the archive matching your
+architecture: `aarch64` for Apple Silicon, `x86_64` for Intel. On Windows, see
+[`docs/windows.md`](windows.md).
 The short version: run the install commands from the same environment that
 launches the agent. WSL2-launched agents need WSL paths and POSIX `.sh` hooks.
 Native Windows agents can use the tagged `ai-memory-windows-x86_64.zip`, the
