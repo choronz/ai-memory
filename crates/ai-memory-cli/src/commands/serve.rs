@@ -297,6 +297,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 data_dir: config.data_dir.clone(),
                 db_path: store.db_path().to_path_buf(),
                 bind: bind.clone(),
+                home_dir: config.home_dir.clone(),
                 bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
                 token_pepper: config
                     .auth

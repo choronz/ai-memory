@@ -75,7 +75,7 @@ async fn audit_flags_wrong_bucket_session_and_drifted_observation() {
     let store = Store::open(tmp.path()).unwrap();
     seed(store.db_path());
 
-    let report = store.reader.audit_contamination(None).await.unwrap();
+    let report = store.reader.audit_contamination(None, None).await.unwrap();
 
     assert_eq!(
         report.summary.sessions_misbucketed, 1,
@@ -134,10 +134,58 @@ async fn audit_clean_db_returns_no_findings() {
     .unwrap();
     drop(conn);
 
-    let report = store.reader.audit_contamination(None).await.unwrap();
+    let report = store.reader.audit_contamination(None, None).await.unwrap();
     assert_eq!(report.summary.sessions_misbucketed, 0);
     assert_eq!(report.summary.observations_drifted, 0);
     assert!(report.findings.is_empty());
+}
+
+#[tokio::test]
+async fn audit_ignores_home_repo_path_when_home_is_provided() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let conn = Connection::open(store.db_path()).unwrap();
+    let now = 1_700_000_000_000_i64;
+    let (ws, home_proj, app_proj, session) = (id(1), id(2), id(3), id(4));
+
+    conn.execute(
+        "INSERT INTO workspaces (id, name, created_at) VALUES (?1, 'w', ?2)",
+        params![&ws[..], now],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO projects (id, workspace_id, name, repo_path, created_at) \
+         VALUES (?1, ?2, 'home', '/home/tester', ?3)",
+        params![&home_proj[..], &ws[..], now],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO projects (id, workspace_id, name, repo_path, created_at) \
+         VALUES (?1, ?2, 'app', NULL, ?3)",
+        params![&app_proj[..], &ws[..], now],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sessions (id, workspace_id, project_id, agent_kind, cwd, started_at) \
+         VALUES (?1, ?2, ?3, 'claude-code', '/home/tester/projects/app', ?4)",
+        params![&session[..], &ws[..], &app_proj[..], now],
+    )
+    .unwrap();
+    drop(conn);
+
+    let without_home = store.reader.audit_contamination(None, None).await.unwrap();
+    assert_eq!(
+        without_home.summary.sessions_misbucketed, 1,
+        "without the home guard, the home repo_path looks like the expected project"
+    );
+
+    let with_home = store
+        .reader
+        .audit_contamination(None, Some("/home/tester"))
+        .await
+        .unwrap();
+    assert_eq!(with_home.summary.sessions_misbucketed, 0);
+    assert!(with_home.findings.is_empty());
 }
 
 #[tokio::test]
@@ -153,7 +201,7 @@ async fn audit_scope_restricts_to_landed_bucket() {
         WorkspaceId::from_slice(&ws).unwrap(),
         ProjectId::from_slice(&a).unwrap(),
     ));
-    let report = store.reader.audit_contamination(scope).await.unwrap();
+    let report = store.reader.audit_contamination(scope, None).await.unwrap();
     assert_eq!(report.summary.sessions_misbucketed, 1);
     assert_eq!(
         report.summary.observations_drifted, 0,

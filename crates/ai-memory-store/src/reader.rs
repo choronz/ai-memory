@@ -3358,8 +3358,10 @@ impl ReaderPool {
     pub async fn audit_contamination(
         &self,
         scope: Option<(WorkspaceId, ProjectId)>,
+        home: Option<&str>,
     ) -> StoreResult<ContaminationReport> {
         let scoped = scope.is_some();
+        let home = home.map(str::to_owned);
         let scope_params: Vec<Value> = match &scope {
             Some((ws, proj)) => vec![
                 Value::Blob(ws.as_bytes().to_vec()),
@@ -3487,6 +3489,9 @@ impl ReaderPool {
                         })?;
                         for r in rows {
                             let (ws_b, proj_b, name, repo_path) = r?;
+                            if home.as_deref() == Some(repo_path.as_str()) {
+                                continue;
+                            }
                             prefixes.push((
                                 WorkspaceId::from_slice(&ws_b)?,
                                 ProjectId::from_slice(&proj_b)?,
@@ -3505,6 +3510,9 @@ impl ReaderPool {
                         })?;
                         for r in rows {
                             let (ws_b, proj_b, name, repo_path) = r?;
+                            if home.as_deref() == Some(repo_path.as_str()) {
+                                continue;
+                            }
                             prefixes.push((
                                 WorkspaceId::from_slice(&ws_b)?,
                                 ProjectId::from_slice(&proj_b)?,

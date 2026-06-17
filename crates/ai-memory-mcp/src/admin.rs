@@ -95,6 +95,9 @@ pub struct AdminState {
     pub db_path: PathBuf,
     /// Server's bind address — informational, surfaced in /admin/status.
     pub bind: String,
+    /// Server home directory resolved once at config load. Used to keep admin
+    /// audits consistent with the hook router's cwd-prefix guard.
+    pub home_dir: Option<String>,
     /// Serialises concurrent bootstrap requests. Bootstrap fans out
     /// into an LLM call + a multi-page wiki write + a git commit;
     /// running two in parallel would race the `commit_all` git ops and
@@ -545,7 +548,11 @@ async fn handle_audit_contamination(
         }
         _ => None,
     };
-    match state.reader.audit_contamination(scope).await {
+    match state
+        .reader
+        .audit_contamination(scope, state.home_dir.as_deref())
+        .await
+    {
         Ok(report) => (
             StatusCode::OK,
             Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
@@ -1794,7 +1801,7 @@ async fn build_reorg_plan(
             .unwrap_or_else(|| "unknown".to_string());
         let proj = state
             .writer
-            .get_or_create_project(ws, project_name.clone(), Some(cwd.clone()))
+            .get_or_create_project(ws, project_name.clone(), repo_path_from_reorg_cwd(cwd))
             .await?;
         cwd_to_proj.insert(cwd.clone(), (ws, proj, project_name));
     }
@@ -1819,6 +1826,20 @@ async fn build_reorg_plan(
         writer_plan.iter().map(|(_, pid)| *pid).collect();
 
     Ok((plan_entries, writer_plan, distinct_new_projects.len()))
+}
+
+fn repo_path_from_reorg_cwd(cwd: &str) -> Option<String> {
+    let path = std::path::Path::new(cwd);
+    let repo_root = ai_memory_consolidate::discover_repo_root(path).ok()?;
+    cwd_is_repo_root(path, &repo_root).then(|| repo_root.to_string_lossy().into_owned())
+}
+
+fn cwd_is_repo_root(cwd: &std::path::Path, repo_root: &std::path::Path) -> bool {
+    if let (Ok(a), Ok(b)) = (std::fs::canonicalize(cwd), std::fs::canonicalize(repo_root)) {
+        return a == b;
+    }
+    let strip = |p: &std::path::Path| p.to_string_lossy().trim_end_matches('/').to_string();
+    strip(cwd) == strip(repo_root)
 }
 
 async fn handle_reorg(
@@ -4251,6 +4272,7 @@ mod tests {
             data_dir: tmp.path().to_path_buf(),
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
@@ -4292,6 +4314,7 @@ mod tests {
             data_dir: tmp.path().to_path_buf(),
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
@@ -4322,6 +4345,7 @@ mod tests {
             data_dir: tmp.path().to_path_buf(),
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
@@ -5271,6 +5295,7 @@ mod tests {
             data_dir: tmp.path().to_path_buf(),
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
@@ -5377,6 +5402,7 @@ mod tests {
             data_dir: tmp.path().to_path_buf(),
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
@@ -5476,6 +5502,7 @@ mod tests {
             data_dir: tmp.path().to_path_buf(),
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
@@ -5581,6 +5608,7 @@ mod tests {
             data_dir: tmp.path().to_path_buf(),
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
@@ -5665,6 +5693,7 @@ mod tests {
             data_dir: tmp.path().to_path_buf(),
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: Some(pepper),
             active_project: ai_memory_core::ActiveProject::new(),
@@ -6168,6 +6197,7 @@ mod tests {
             data_dir: tmp.path().to_path_buf(),
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),

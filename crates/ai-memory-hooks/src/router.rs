@@ -436,7 +436,8 @@ async fn resolve_project_ids(
         .to_string();
 
     let (project_name, repo_path) = match (project_override, cwd_norm.as_deref()) {
-        (Some(p), _) => (p.to_string(), cwd_norm.clone()),
+        (Some(p), Some(c)) => (p.to_string(), repo_path_from_cwd(c)),
+        (Some(p), None) => (p.to_string(), None),
         (None, Some(c)) => match derive_project_from_cwd(c, project_strategy) {
             Some(resolved) => resolved,
             None => {
@@ -493,13 +494,16 @@ async fn resolve_project_ids(
         // (issue #103). A subdir cwd therefore stores None.
         ai_memory_consolidate::derive_project_name(path, strat).map(|(name, root)| {
             let repo_path = root
-                .or_else(|| {
-                    let repo_root = ai_memory_consolidate::discover_repo_root(path).ok()?;
-                    cwd_is_repo_root(path, &repo_root).then_some(repo_root)
-                })
-                .map(|p| p.to_string_lossy().into_owned());
+                .map(|p| p.to_string_lossy().into_owned())
+                .or_else(|| repo_path_from_cwd(cwd));
             (name, repo_path)
         })
+    }
+
+    fn repo_path_from_cwd(cwd: &str) -> Option<String> {
+        let path = std::path::Path::new(cwd);
+        let repo_root = ai_memory_consolidate::discover_repo_root(path).ok()?;
+        cwd_is_repo_root(path, &repo_root).then(|| repo_root.to_string_lossy().into_owned())
     }
 
     fn cwd_is_repo_root(cwd: &std::path::Path, repo_root: &std::path::Path) -> bool {
@@ -1514,6 +1518,55 @@ mod tests {
         assert_ne!(
             proj_app, proj_home,
             "a cwd inside a real repo must not resolve to the non-git ancestor it sits under"
+        );
+        assert_eq!(
+            state
+                .reader
+                .find_project(ws_app, "app".to_string())
+                .await
+                .unwrap(),
+            Some(proj_app),
+            "nested repo cwd must resolve to its own 'app' project",
+        );
+    }
+
+    /// Regression for the explicit project override path of #103: a marker or
+    /// query override in a non-git ancestor must not persist that ancestor as a
+    /// catch-all `repo_path`.
+    #[tokio::test]
+    async fn project_override_nongit_ancestor_does_not_become_repo_path_catch_all() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let (_ws_h, proj_home_override) = resolve_project_ids(
+            &state,
+            Some(home.to_str().unwrap()),
+            None,
+            Some("home-override"),
+            ProjectStrategy::Basename,
+            &ai_memory_core::ActorKey::default(),
+        )
+        .await
+        .unwrap();
+
+        let app = home.join("projects").join("app");
+        init_repo_with_commit(&app);
+        let (ws_app, proj_app) = resolve_project_ids(
+            &state,
+            Some(app.to_str().unwrap()),
+            None,
+            None,
+            ProjectStrategy::Basename,
+            &ai_memory_core::ActorKey::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(
+            proj_app, proj_home_override,
+            "a non-git override cwd must not capture nested real repos via repo_path prefix"
         );
         assert_eq!(
             state
