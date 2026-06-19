@@ -111,6 +111,50 @@ sources to the running server. It requires an LLM provider on the
 server. See [Installation cookbook - bootstrap mid-project](install.md#bootstrap-mid-project)
 for flags, token budgets, and source priority.
 
+## Migrate from another memory tool
+
+When replacing an existing memory system, treat the old data as untrusted
+historical input until you curate it. Do not pipe raw transcripts or old memory
+stores directly into ai-memory.
+
+Migration checklist:
+
+1. Export the old memory or history before changing hooks.
+2. Keep the raw export as an archive, not as current project truth.
+3. Scrub secrets, tokens, credentials, API keys, and raw logs that should not
+   become durable memory.
+4. Curate the useful material into reviewed Markdown pages under a temporary
+   docs directory or directly into `concepts/`, `decisions/`, `gotchas/`,
+   `procedures/`, `notes/`, or `_rules/`.
+5. If this checkout might be ambiguous, add `.ai-memory.toml` to pin the intended
+   workspace/project before importing or installing hooks.
+6. Start `ai-memory serve` locally and confirm `ai-memory status` can reach the
+   server before touching existing client configs.
+7. Import curated material first; avoid importing the full legacy raw history.
+8. Verify expected pages are searchable with `memory_query` or `ai-memory search`.
+9. Configure MCP and lifecycle hooks for one client at a time.
+10. Only after ai-memory capture and retrieval work, disable the old memory
+    hooks, plugins, or MCP servers.
+11. Search each client config for stale references to the old tool and remove
+    stale `Authorization` headers or env vars if bearer auth changed.
+12. Restart each agent CLI after changing hooks, plugins, or MCP config.
+
+Client cleanup hints:
+
+- Claude Code: check plugins, hooks, old SessionStart injection, and MCP servers.
+- Codex: check MCP config plus session/user-prompt/tool/compaction/stop hooks.
+- Gemini CLI and Antigravity CLI: check `settings.json` or equivalent hook/MCP
+  config files.
+- OpenCode, OpenClaw, and OMP: check MCP config and plugin/extension directories;
+  move old memory plugins to a disabled/quarantine directory before deleting.
+- VS Code Copilot and Claude Desktop: these are usually MCP-only, so confirm
+  whether the old tool was providing capture hooks elsewhere.
+
+If you want a visible startup reminder during the transition, keep it small. A
+rules-file note such as “Active memory: ai-memory; legacy export is historical
+reference only; use memory_query for retrieval” is safer than dumping large
+legacy context into every session.
+
 If you use the ChatGPT/Codex OAuth provider, sign in once before starting the
 server with `AI_MEMORY_LLM_PROVIDER=openai-oauth`:
 

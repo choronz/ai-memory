@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Documented a migration checklist for users replacing another memory tool:
+  export first, scrub secrets, curate legacy material into reviewed Markdown,
+  configure one client at a time, and remove stale hooks/plugins/MCP servers only
+  after ai-memory capture and retrieval are verified. (issue #115)
+
 ### Fixed
 - Handoff selection no longer strands a detailed manual handoff behind a vague
   auto one. A manual handoff (`memory_handoff_begin`) typically has no cwd while

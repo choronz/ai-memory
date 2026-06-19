@@ -1112,7 +1112,7 @@ write to `~/.local/share/ai-memory/hooks/`.
 - [`docs/deploy.md`](deploy.md) - homelab deploy walkthrough
   (`bin/deploy`, cloudflared TLS, env-file management)
 - [`docs/usage.md`](usage.md) - handoffs, proactive querying, web UI,
-  routing snippet, and raw-wiki inspection
+  routing snippet, migration from other memory tools, and raw-wiki inspection
 - [`docs/mcp-install.md`](mcp-install.md) - per-client MCP config
   reference for Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, OpenClaw, OMP, VS Code Copilot
 - [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) - what's actually
