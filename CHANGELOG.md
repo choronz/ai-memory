@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recovers on the next session without re-running `install-hooks`), and future
   spool enqueue failures emit a sanitized stderr warning instead of staying fully
   silent. (issue #116)
+- `bin/release` now handles changelog entries containing backslashes, so Windows
+  path examples cannot abort the release after the version files are updated.
 
 ## [1.1.2] - 2026-06-19
 
