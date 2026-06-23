@@ -30,7 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added read-only auto-improvement telemetry reporting via
   `POST /admin/auto-improve/report` and `ai-memory auto-improve-report`, with
   JSON and human CLI output for recent run counts, proposal outcomes, terminal
-  rates, and operational findings without staging pending proposals.
+  rates, and operational findings without staging pending proposals; optional
+  `--stage` / `stage: true` creates one pending audit report page for approval.
 - Added `docs/auto-improve-eval-gates.md` plus dependency-free Python and shell
   scorer templates for `[auto_improve.eval]` proposal gates.
 - Hook spool drains now use `POST /hook/batch` when the server supports it,

@@ -2,7 +2,7 @@
 
 use ai_memory_consolidate::AutoImproveTelemetryReport;
 use anyhow::Result;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::cli::AutoImproveReportArgs;
 use crate::config::Config;
@@ -14,6 +14,15 @@ struct AutoImproveReportRequest {
     project: String,
     since_days: u32,
     limit: usize,
+    stage: bool,
+}
+
+#[derive(Deserialize, Serialize)]
+struct AutoImproveReportStageResponse {
+    run_id: String,
+    proposal_ids: Vec<String>,
+    sidecar_paths: Vec<String>,
+    report: AutoImproveTelemetryReport,
 }
 
 /// Run the `auto-improve-report` subcommand.
@@ -28,7 +37,25 @@ pub async fn run(config: &Config, args: AutoImproveReportArgs) -> Result<()> {
         project: project.clone(),
         since_days: args.days,
         limit: args.limit,
+        stage: args.stage,
     };
+
+    if args.stage {
+        let response: AutoImproveReportStageResponse =
+            post_json(&endpoint, "/admin/auto-improve/report", &request).await?;
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        } else {
+            println!("\nStaged auto-improve telemetry report for {project}\n");
+            println!("Run: {}", response.run_id);
+            println!("Proposals: {}", response.proposal_ids.join(", "));
+            println!("Sidecars: {}", response.sidecar_paths.join(", "));
+            println!("Summary: {}", response.report.summary);
+            println!("\n--- machine-readable ---");
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        }
+        return Ok(());
+    }
 
     let report: AutoImproveTelemetryReport =
         post_json(&endpoint, "/admin/auto-improve/report", &request).await?;

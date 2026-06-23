@@ -33,7 +33,9 @@ use tower::ServiceExt;
 /// Build a minimal `AdminState` with no LLM and no embedder.
 async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
     let store = Store::open(tmp.path()).unwrap();
-    let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+    let wiki = Wiki::new(tmp.path(), store.writer.clone())
+        .unwrap()
+        .with_store_reader(store.reader.clone());
     let db_path = store.db_path().to_path_buf();
     let state = AdminState {
         writer: store.writer.clone(),
@@ -149,8 +151,9 @@ async fn auto_improve_report_returns_telemetry_without_creating_proposals() {
         json!({ "workspace": "default", "project": "scratch", "since_days": 30, "limit": 3 }),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::OK);
+    let status = resp.status();
     let body = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
     assert!(body["summary"].as_str().unwrap().contains("run(s)"));
     assert_eq!(body["aggregate"]["run_count"].as_u64().unwrap(), 1);
     assert_eq!(
@@ -199,6 +202,117 @@ async fn auto_improve_report_missing_scope_fails_closed() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn auto_improve_report_stage_creates_one_report_proposal_and_approval_writes_page() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+
+    let before = store
+        .reader
+        .list_auto_improve_proposals(ws, proj, None, 50)
+        .await
+        .unwrap()
+        .len();
+    let resp = post(
+        state.clone(),
+        "/admin/auto-improve/report",
+        json!({ "workspace": "default", "project": "scratch", "since_days": 30, "limit": 3, "stage": true }),
+    )
+    .await;
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let proposal_ids = body["proposal_ids"].as_array().unwrap();
+    assert_eq!(proposal_ids.len(), 1);
+    assert_eq!(body["sidecar_paths"].as_array().unwrap().len(), 1);
+
+    let proposals = store
+        .reader
+        .list_auto_improve_proposals(ws, proj, None, 50)
+        .await
+        .unwrap();
+    assert_eq!(proposals.len(), before + 1);
+    let staged = proposals
+        .iter()
+        .find(|p| p.id.to_string() == proposal_ids[0].as_str().unwrap())
+        .unwrap();
+    assert_eq!(staged.status, AutoImproveProposalStatus::Pending);
+    assert_eq!(staged.kind, "auto_improve_report");
+    let target_path = staged.target_path.as_str().to_string();
+    assert!(target_path.starts_with("notes/auto-improve-report-"));
+    assert!(target_path.ends_with(".md"));
+    assert!(
+        store
+            .reader
+            .page_body_by_ids(ws, proj, &target_path)
+            .await
+            .unwrap()
+            .is_none(),
+        "staging must not write the target page before approval"
+    );
+
+    let approve_resp = post(
+        state.clone(),
+        &format!(
+            "/admin/pending-writes/{}/approve?workspace=default&project=scratch",
+            staged.id
+        ),
+        json!({}),
+    )
+    .await;
+    assert_eq!(approve_resp.status(), StatusCode::OK);
+    let report_page = store
+        .reader
+        .page_body_by_ids(ws, proj, &target_path)
+        .await
+        .unwrap()
+        .expect("approval writes report page");
+    assert!(report_page.body.contains("# Auto-Improve Telemetry Report"));
+    assert_eq!(
+        store
+            .reader
+            .list_auto_improve_proposals(ws, proj, None, 50)
+            .await
+            .unwrap()
+            .len(),
+        before + 1,
+        "approval must not create extra proposals"
+    );
+
+    let telemetry_resp = post(
+        state,
+        "/admin/auto-improve/report",
+        json!({ "workspace": "default", "project": "scratch", "since_days": 30, "limit": 10 }),
+    )
+    .await;
+    assert_eq!(telemetry_resp.status(), StatusCode::OK);
+    let telemetry = body_json(telemetry_resp).await;
+    let maintenance = telemetry["aggregate"]["maintenance_proposals_by_kind"]
+        .as_array()
+        .unwrap();
+    assert!(maintenance.iter().any(|row| {
+        row["key"].as_str() == Some("auto_improve_report") && row["count"].as_u64() == Some(1)
+    }));
+    assert_eq!(
+        telemetry["aggregate"]["proposals_by_kind"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0,
+        "report proposals are maintenance, not learning proposals"
+    );
 }
 
 // ---------------------------------------------------------------------------

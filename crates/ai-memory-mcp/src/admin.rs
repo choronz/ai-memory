@@ -34,10 +34,11 @@ use std::io::Seek;
 use std::path::PathBuf;
 
 use ai_memory_consolidate::{
-    AutoImproveReviewConfig, AutoImproveTelemetryParams, Bootstrap, BootstrapConfig,
-    BootstrapOutcome, BootstrapSource, CuratorParams, CuratorReport, SourceCounts,
-    prune_sources_to_budget, render_curator_report_markdown, run_auto_improve_review,
-    run_auto_improve_telemetry_report, run_curator_report, run_lint, run_sweep,
+    AutoImproveReviewConfig, AutoImproveTelemetryParams, AutoImproveTelemetryReport, Bootstrap,
+    BootstrapConfig, BootstrapOutcome, BootstrapSource, CuratorParams, CuratorReport, SourceCounts,
+    prune_sources_to_budget, render_auto_improve_telemetry_report_markdown,
+    render_curator_report_markdown, run_auto_improve_review, run_auto_improve_telemetry_report,
+    run_curator_report, run_lint, run_sweep,
 };
 use ai_memory_core::{
     ActiveProject, AutoImproveProposalId, Capability, DEFAULT_PROJECT_NAME, DEFAULT_WORKSPACE_NAME,
@@ -287,6 +288,17 @@ struct AutoImproveTelemetryReportRequest {
     /// Maximum rows in each top-N count table.
     #[serde(default = "default_auto_improve_telemetry_top_limit")]
     limit: usize,
+    /// Stage one pending telemetry report page instead of returning a read-only report.
+    #[serde(default)]
+    stage: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AutoImproveTelemetryReportStageResponse {
+    run_id: String,
+    proposal_ids: Vec<String>,
+    sidecar_paths: Vec<String>,
+    report: AutoImproveTelemetryReport,
 }
 
 /// JSON request body for `POST /admin/curator`.
@@ -1488,8 +1500,41 @@ async fn stage_auto_improve_report(
         })
         .await
         .map_err(|e| internal_err(e.to_string()))?;
-    let mut sidecar_paths = Vec::with_capacity(staged.proposal_ids.len());
-    for id in &staged.proposal_ids {
+    let sidecar_paths = write_auto_improve_sidecars(state, ws, proj, &staged.proposal_ids).await?;
+    Ok(StagedAutoImproveData {
+        run_id: staged.run_id,
+        proposal_ids: staged.proposal_ids,
+        sidecar_paths,
+    })
+}
+
+async fn target_operation_for_page(
+    state: &AdminState,
+    ws: WorkspaceId,
+    proj: ProjectId,
+    target: &PagePath,
+) -> Result<AutoImproveProposalOperation, (StatusCode, Json<serde_json::Value>)> {
+    if state
+        .reader
+        .page_body_by_ids(ws, proj, target.as_str())
+        .await
+        .map_err(|e| internal_err(e.to_string()))?
+        .is_some()
+    {
+        Ok(AutoImproveProposalOperation::Update)
+    } else {
+        Ok(AutoImproveProposalOperation::Create)
+    }
+}
+
+async fn write_auto_improve_sidecars(
+    state: &AdminState,
+    ws: WorkspaceId,
+    proj: ProjectId,
+    proposal_ids: &[AutoImproveProposalId],
+) -> Result<Vec<String>, (StatusCode, Json<serde_json::Value>)> {
+    let mut sidecar_paths = Vec::with_capacity(proposal_ids.len());
+    for id in proposal_ids {
         let path = state
             .wiki
             .write_auto_improve_sidecar(ws, proj, *id)
@@ -1497,11 +1542,7 @@ async fn stage_auto_improve_report(
             .map_err(|e| internal_err(e.to_string()))?;
         sidecar_paths.push(path.display().to_string());
     }
-    Ok(StagedAutoImproveData {
-        run_id: staged.run_id,
-        proposal_ids: staged.proposal_ids,
-        sidecar_paths,
-    })
+    Ok(sidecar_paths)
 }
 
 fn auto_improve_error_response(
@@ -1538,10 +1579,80 @@ async fn handle_auto_improve_report(
         proj,
         &req.workspace,
         &req.project,
-        params,
+        params.clone(),
     )
     .await
     .map_err(|e| internal_err(e.to_string()))?;
+    if req.stage {
+        let body_markdown = render_auto_improve_telemetry_report_markdown(&report);
+        let target_path = auto_improve_report_target_path();
+        let target = PagePath::new(target_path).map_err(|e| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({ "error": format!("invalid auto-improve report target path: {e}") })),
+            )
+        })?;
+        let operation = target_operation_for_page(&state, ws, proj, &target).await?;
+        let staged = state
+            .writer
+            .stage_auto_improve_run(StageAutoImproveRun {
+                workspace_id: ws,
+                project_id: proj,
+                session_id: None,
+                provider: None,
+                model: None,
+                summary: Some(format!("Auto-improve telemetry report: {}", report.summary)),
+                warnings_json: serde_json::json!([]),
+                rejected_candidates_json: serde_json::json!([]),
+                config_json: serde_json::json!({
+                    "mode": "stage",
+                    "auto_improve_report": true,
+                    "params": params,
+                }),
+                proposal_actor: ai_memory_core::ActorContext {
+                    agent: Some("auto_improve_report".into()),
+                    ..ai_memory_core::ActorContext::default()
+                },
+                proposals: vec![NewAutoImproveProposal {
+                    operation,
+                    target_path: target,
+                    kind: "auto_improve_report".into(),
+                    title: "Auto-improve Telemetry Report".into(),
+                    confidence: 1.0,
+                    rationale: "Telemetry report only; approval writes the report page and performs no learning-memory changes.".into(),
+                    evidence_json: serde_json::json!({
+                        "summary": report.summary.clone(),
+                        "findings": report.findings.clone(),
+                        "params": report.params.clone(),
+                    }),
+                    body_markdown,
+                    artifact_sha256: None,
+                    edit_mode: None,
+                    patch_json: None,
+                    expected_base_body_sha256: None,
+                }],
+            })
+            .await
+            .map_err(|e| internal_err(e.to_string()))?;
+        let sidecar_paths =
+            write_auto_improve_sidecars(&state, ws, proj, &staged.proposal_ids).await?;
+        return Ok((
+            StatusCode::OK,
+            Json(
+                serde_json::to_value(AutoImproveTelemetryReportStageResponse {
+                    run_id: staged.run_id.to_string(),
+                    proposal_ids: staged
+                        .proposal_ids
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                    sidecar_paths,
+                    report,
+                })
+                .unwrap_or_else(|_| serde_json::json!({})),
+            ),
+        ));
+    }
     Ok((
         StatusCode::OK,
         Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
@@ -1600,17 +1711,7 @@ async fn handle_curator(
             Json(serde_json::json!({ "error": format!("invalid curator target path: {e}") })),
         )
     })?;
-    let operation = if state
-        .reader
-        .page_body_by_ids(ws, proj, target.as_str())
-        .await
-        .map_err(|e| internal_err(e.to_string()))?
-        .is_some()
-    {
-        AutoImproveProposalOperation::Update
-    } else {
-        AutoImproveProposalOperation::Create
-    };
+    let operation = target_operation_for_page(&state, ws, proj, &target).await?;
 
     let staged = state
         .writer
@@ -1652,15 +1753,7 @@ async fn handle_curator(
         })
         .await
         .map_err(|e| internal_err(e.to_string()))?;
-    let mut sidecar_paths = Vec::with_capacity(staged.proposal_ids.len());
-    for id in &staged.proposal_ids {
-        let path = state
-            .wiki
-            .write_auto_improve_sidecar(ws, proj, *id)
-            .await
-            .map_err(|e| internal_err(e.to_string()))?;
-        sidecar_paths.push(path.display().to_string());
-    }
+    let sidecar_paths = write_auto_improve_sidecars(&state, ws, proj, &staged.proposal_ids).await?;
     Ok((
         StatusCode::OK,
         Json(
@@ -1683,6 +1776,11 @@ fn curator_target_path() -> String {
     let now = jiff::Timestamp::now().to_string();
     let date = now.get(0..10).unwrap_or("latest");
     format!("notes/curator-{date}.md")
+}
+
+fn auto_improve_report_target_path() -> String {
+    let stamp = jiff::Timestamp::now().as_microsecond();
+    format!("notes/auto-improve-report-{stamp}.md")
 }
 
 async fn handle_pending_writes_list(

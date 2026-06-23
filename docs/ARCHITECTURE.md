@@ -275,6 +275,9 @@ uninstall            auth                 user
 
 Run `ai-memory --help` for the full tree.
 
+`auto-improve-report` is read-only by default; `--stage` creates one pending
+telemetry report page for audit/approval without staging learning-memory edits.
+
 ## Cross-cutting invariants
 
 Carved in M0/M1; every milestone has to respect them. Each comes from

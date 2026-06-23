@@ -915,6 +915,9 @@ pub struct AutoImproveReportArgs {
     /// Maximum rows in each top-N count table.
     #[arg(long, default_value_t = ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_TELEMETRY_TOP_LIMIT)]
     pub limit: usize,
+    /// Stage one pending telemetry report page for later approval.
+    #[arg(long)]
+    pub stage: bool,
     /// Emit only machine-readable JSON.
     #[arg(long)]
     pub json: bool,
@@ -1376,6 +1379,7 @@ mod tests {
             "14",
             "--limit",
             "3",
+            "--stage",
             "--json",
         ])
         .expect("auto-improve-report parses");
@@ -1386,6 +1390,7 @@ mod tests {
         assert_eq!(args.project.as_deref(), Some("scratch"));
         assert_eq!(args.days, 14);
         assert_eq!(args.limit, 3);
+        assert!(args.stage);
         assert!(args.json);
     }
 

@@ -143,7 +143,8 @@ priors are at the [bottom](#influences-and-prior-art).
   available for manual catch-up or targeted reruns. `ai-memory
   auto-improve-report --workspace <w> --project <p>` returns a read-only
   telemetry report for recent auto-improvement outcomes without staging or
-  creating proposals. See
+  creating proposals; add `--stage` to create one pending report page for
+  audit/approval. See
   [`docs/auto-improve-eval-gates.md`](docs/auto-improve-eval-gates.md) for
   example executable eval scorers.
 
