@@ -40,6 +40,12 @@ did we decide in the `other-app` project?"). Phrases like "this project",
 "here", "we", "our work", and "where did we leave off" all mean the
 *current* project, so call tools with no scoping args.
 
+This default assumes the MCP client can identify the current agent
+session. Static MCP clients in parallel sessions for the same user cannot
+forward the real agent session id automatically; pass explicit
+`workspace` + `project` / `scopes`, or use a session-aware bridge that
+forwards the lifecycle-hook session id on MCP calls.
+
 **Lifecycle hooks already capture every prompt and tool call
 automatically.** Do not manually write routine notes. Only write durable
 memory when the user explicitly asks to remember or annotate something
