@@ -1,3 +1,5 @@
+//! Integration tests for installing ai-memory managed skills.
+
 use std::process::Command;
 
 fn bin() -> &'static str {

@@ -1,3 +1,5 @@
+//! Integration tests for installing ai-memory instructions.
+
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
