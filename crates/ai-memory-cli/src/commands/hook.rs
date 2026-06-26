@@ -105,6 +105,27 @@ fn should_incremental_drain(event: &str, spool_len: usize, threshold: usize) -> 
     event == "post-tool-use" && spool_len >= threshold
 }
 
+/// When the `session-end` flush leaves events queued, meaning the budget elapsed
+/// before the spool backlog cleared (the heavy-session condition in issue #130),
+/// return a concise, actionable note. `None` when nothing was deferred, so a normal
+/// session stays silent. The caller writes this to **stderr** (never stdout,
+/// which carries the hook's JSON protocol): mirroring the spool's at-capacity
+/// warning, an expected-but-noteworthy backlog is surfaced rather than left
+/// silent, and the message names the two knobs the operator can turn instead of
+/// the bare, scary cancelled-hook symptom.
+fn session_end_deferred_note(result: &hook_spool::DrainResult) -> Option<String> {
+    if result.remaining == 0 {
+        return None;
+    }
+    Some(format!(
+        "ai-memory: session-end flushed {} event(s); {} deferred to the next \
+         session boundary (the spool backlog exceeded the flush budget; no data \
+         is lost, they drain on a later boundary). Raise {END_BUDGET_ENV} (whole \
+         minutes) or lower {INCREMENTAL_THRESHOLD_ENV} to keep the backlog bounded.",
+        result.sent, result.remaining,
+    ))
+}
+
 fn env_lookup(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }
@@ -220,7 +241,11 @@ pub async fn run(data_dir: Option<PathBuf>, args: HookArgs) -> anyhow::Result<()
     // session-end: the main delivery point — flush the session's spooled
     // observations (oldest-first) so the server has them before it consolidates.
     if args.event == "session-end" {
-        let _ = hook_spool::drain(&spool, &dd, end_drain_budget(), drain_event_timeout()).await;
+        let result =
+            hook_spool::drain(&spool, &dd, end_drain_budget(), drain_event_timeout()).await;
+        if let Some(note) = session_end_deferred_note(&result) {
+            eprintln!("{note}");
+        }
     }
 
     println!("{{}}");
