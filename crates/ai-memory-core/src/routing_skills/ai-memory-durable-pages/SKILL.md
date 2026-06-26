@@ -1,6 +1,6 @@
 ---
 name: ai-memory-durable-pages
-description: Use when the user explicitly asks to remember something permanently, save a durable project note, add an annotation, create a wiki page, delete a memory page, or record a project rule.
+description: Use this skill for any explicit durable wiki mutation in ai-memory: saving project knowledge, recording a rule or annotation, updating a permanent note, or deleting a memory page. Trigger by semantic intent rather than exact wording; routine session capture is not a durable-page request.
 ---
 <!-- ai-memory-managed: routing-skill -->
 

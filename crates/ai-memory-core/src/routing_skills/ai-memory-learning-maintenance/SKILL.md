@@ -1,6 +1,6 @@
 ---
 name: ai-memory-learning-maintenance
-description: Use when the user asks to consolidate memory, review what was learned, propose durable lessons, audit the wiki, find contradictions, prune old memory, or run auto-improvement maintenance.
+description: Use this skill for any ai-memory knowledge-base maintenance request: consolidating observations, reviewing session lessons, proposing durable learnings, auditing or linting the wiki, finding contradictions, pruning stale memory, or running auto-improvement. Trigger by semantic intent rather than exact wording.
 ---
 <!-- ai-memory-managed: routing-skill -->
 

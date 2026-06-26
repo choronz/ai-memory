@@ -1,6 +1,6 @@
 ---
 name: ai-memory-routing-install
-description: Use when the user asks to install, refresh, update, repair, or remove ai-memory routing instructions or Agent Skills in CLAUDE.md, AGENTS.md, .claude/skills, or .agents/skills.
+description: Use this skill for any request to install, refresh, repair, inspect, or remove ai-memory's agent-facing routing: managed instruction snippets, Agent Skills, CLAUDE.md/AGENTS.md integration, or local/global skill roots. Trigger by semantic intent rather than exact wording.
 ---
 <!-- ai-memory-managed: routing-skill -->
 

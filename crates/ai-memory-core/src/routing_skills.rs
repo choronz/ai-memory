@@ -6,11 +6,11 @@
 /// Stable ownership marker embedded in every managed ai-memory skill file.
 pub const MANAGED_MARKER: &str = "<!-- ai-memory-managed: routing-skill -->";
 
-const RETRIEVAL_DESCRIPTION: &str = "Use when the user asks to search memory, catch up, inspect recent activity, read wiki pages, get ai-memory stats, query prior decisions, or apply remembered rules before design or debugging.";
-const HANDOFF_DESCRIPTION: &str = "Use when the user asks where we left off, whether there is a pending handoff, to save context for the next session, to end or wrap up a session, or to discard a mistaken handoff.";
-const DURABLE_PAGES_DESCRIPTION: &str = "Use when the user explicitly asks to remember something permanently, save a durable project note, add an annotation, create a wiki page, delete a memory page, or record a project rule.";
-const LEARNING_MAINTENANCE_DESCRIPTION: &str = "Use when the user asks to consolidate memory, review what was learned, propose durable lessons, audit the wiki, find contradictions, prune old memory, or run auto-improvement maintenance.";
-const ROUTING_INSTALL_DESCRIPTION: &str = "Use when the user asks to install, refresh, update, repair, or remove ai-memory routing instructions or Agent Skills in CLAUDE.md, AGENTS.md, .claude/skills, or .agents/skills.";
+const RETRIEVAL_DESCRIPTION: &str = "Use this skill for any request whose goal is read-only retrieval from ai-memory: project history, prior context, decisions, rules, gotchas, recent activity, full wiki pages, or status/briefing. Trigger by semantic intent rather than exact wording, including when ai-memory is not named.";
+const HANDOFF_DESCRIPTION: &str = "Use this skill for any request whose goal is session continuity across agents or time: finding a pending handoff, resuming previous work, saving next-session context, wrapping up, or discarding a mistaken handoff. Trigger by semantic intent rather than exact wording.";
+const DURABLE_PAGES_DESCRIPTION: &str = "Use this skill for any explicit durable wiki mutation in ai-memory: saving project knowledge, recording a rule or annotation, updating a permanent note, or deleting a memory page. Trigger by semantic intent rather than exact wording; routine session capture is not a durable-page request.";
+const LEARNING_MAINTENANCE_DESCRIPTION: &str = "Use this skill for any ai-memory knowledge-base maintenance request: consolidating observations, reviewing session lessons, proposing durable learnings, auditing or linting the wiki, finding contradictions, pruning stale memory, or running auto-improvement. Trigger by semantic intent rather than exact wording.";
+const ROUTING_INSTALL_DESCRIPTION: &str = "Use this skill for any request to install, refresh, repair, inspect, or remove ai-memory's agent-facing routing: managed instruction snippets, Agent Skills, CLAUDE.md/AGENTS.md integration, or local/global skill roots. Trigger by semantic intent rather than exact wording.";
 
 /// One ai-memory-managed Agent Skill file bundled by the core crate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

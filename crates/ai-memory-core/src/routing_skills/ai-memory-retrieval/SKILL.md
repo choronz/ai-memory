@@ -1,6 +1,6 @@
 ---
 name: ai-memory-retrieval
-description: Use when the user asks to search memory, catch up, inspect recent activity, read wiki pages, get ai-memory stats, query prior decisions, or apply remembered rules before design or debugging.
+description: Use this skill for any request whose goal is read-only retrieval from ai-memory: project history, prior context, decisions, rules, gotchas, recent activity, full wiki pages, or status/briefing. Trigger by semantic intent rather than exact wording, including when ai-memory is not named.
 ---
 <!-- ai-memory-managed: routing-skill -->
 
