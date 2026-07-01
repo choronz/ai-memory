@@ -23,6 +23,7 @@ use crate::cli::{AgentChoice, InstallHooksArgs, McpClient};
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json};
 use crate::commands::install_mcp;
 use crate::commands::openclaw_plugin;
+use crate::commands::path_util::home_dir;
 use crate::commands::render_shared::{
     CURSOR_PROFILE, GEMINI_PROFILE, build_antigravity_payload_with_data_dir,
     build_claude_code_payload_with_data_dir, build_grok_payload_with_data_dir,
@@ -33,7 +34,7 @@ use crate::config::{Config, DEFAULT_SERVER_URL};
 
 /// `~/.claude/settings.json` — Claude Code hooks live under `hooks`.
 pub(crate) fn claude_settings_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(dirs::home_dir()
+    Ok(home_dir()
         .context("could not locate $HOME for ~/.claude/settings.json")?
         .join(".claude")
         .join("settings.json"))
@@ -41,7 +42,7 @@ pub(crate) fn claude_settings_path() -> anyhow::Result<std::path::PathBuf> {
 
 /// `~/.codex/hooks.json`.
 pub(crate) fn codex_hooks_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(dirs::home_dir()
+    Ok(home_dir()
         .context("could not locate $HOME for ~/.codex/hooks.json")?
         .join(".codex")
         .join("hooks.json"))
@@ -49,7 +50,7 @@ pub(crate) fn codex_hooks_path() -> anyhow::Result<std::path::PathBuf> {
 
 /// `~/.cursor/hooks.json`.
 pub(crate) fn cursor_hooks_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(dirs::home_dir()
+    Ok(home_dir()
         .context("could not locate $HOME for ~/.cursor/hooks.json")?
         .join(".cursor")
         .join("hooks.json"))
@@ -57,7 +58,7 @@ pub(crate) fn cursor_hooks_path() -> anyhow::Result<std::path::PathBuf> {
 
 /// `~/.gemini/settings.json`.
 pub(crate) fn gemini_settings_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(dirs::home_dir()
+    Ok(home_dir()
         .context("could not locate $HOME for ~/.gemini/settings.json")?
         .join(".gemini")
         .join("settings.json"))
@@ -65,7 +66,7 @@ pub(crate) fn gemini_settings_path() -> anyhow::Result<std::path::PathBuf> {
 
 /// `~/.gemini/config/hooks.json` — Antigravity CLI lifecycle hooks.
 pub(crate) fn antigravity_hooks_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(dirs::home_dir()
+    Ok(home_dir()
         .context("could not locate $HOME for ~/.gemini/config/hooks.json")?
         .join(".gemini")
         .join("config")
@@ -74,7 +75,7 @@ pub(crate) fn antigravity_hooks_path() -> anyhow::Result<std::path::PathBuf> {
 
 /// `~/.grok/hooks/ai-memory.json` — Grok Build CLI lifecycle hooks.
 pub(crate) fn grok_hooks_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(dirs::home_dir()
+    Ok(home_dir()
         .context("could not locate $HOME for ~/.grok/hooks/ai-memory.json")?
         .join(".grok")
         .join("hooks")
@@ -83,7 +84,7 @@ pub(crate) fn grok_hooks_path() -> anyhow::Result<std::path::PathBuf> {
 
 /// `~/.config/opencode/plugins/ai-memory.ts` — OpenCode's plugin file.
 pub(crate) fn opencode_plugin_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(dirs::home_dir()
+    Ok(home_dir()
         .context("could not locate $HOME for ~/.config/opencode")?
         .join(".config")
         .join("opencode")
@@ -93,7 +94,7 @@ pub(crate) fn opencode_plugin_path() -> anyhow::Result<std::path::PathBuf> {
 
 /// `~/.omp/agent/extensions/ai-memory.ts` — OMP lifecycle extension.
 pub(crate) fn omp_extension_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(dirs::home_dir()
+    Ok(home_dir()
         .context("could not locate $HOME for ~/.omp/agent/extensions")?
         .join(".omp")
         .join("agent")
@@ -2074,9 +2075,38 @@ mod tests {
     use crate::cli::ProjectStrategyArg;
     use std::collections::BTreeMap;
     use std::fs;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use std::process::Command;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    fn bash_program_for_installer_test() -> Option<std::path::PathBuf> {
+        Some(std::path::PathBuf::from("bash"))
+    }
+
+    #[cfg(windows)]
+    fn bash_program_for_installer_test() -> Option<std::path::PathBuf> {
+        let mut candidates = Vec::new();
+        if let Some(root) = std::env::var_os("EXEPATH") {
+            let root = std::path::PathBuf::from(root);
+            candidates.push(root.join("bin").join("bash.exe"));
+            candidates.push(root.join("usr").join("bin").join("bash.exe"));
+        }
+        for env_key in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+            if let Some(root) = std::env::var_os(env_key) {
+                let root = std::path::PathBuf::from(root).join("Git");
+                candidates.push(root.join("bin").join("bash.exe"));
+                candidates.push(root.join("usr").join("bin").join("bash.exe"));
+            }
+        }
+        candidates.sort();
+        candidates.dedup();
+        let found = candidates.into_iter().find(|candidate| candidate.is_file());
+        if found.is_none() {
+            eprintln!("skipping installer shell contract: Git for Windows bash.exe was not found");
+        }
+        found
+    }
 
     #[test]
     fn overlay_event_hooks_preserves_third_party_and_replaces_own() {
@@ -2927,7 +2957,11 @@ model = "gpt-5"
         );
     }
 
-    #[cfg(unix)]
+    // Windows 11 + Git Bash support matters for regulated enterprise setups
+    // where Git Bash is the approved shell available from the corporate
+    // repository, so this installer contract should be exercised anywhere
+    // Bash is the supported execution surface.
+    #[cfg(any(unix, windows))]
     #[test]
     fn curl_installer_accepts_generated_integration_agents() {
         let script = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2935,9 +2969,12 @@ model = "gpt-5"
             .join("..")
             .join("scripts")
             .join("install-hooks.sh");
+        let Some(bash) = bash_program_for_installer_test() else {
+            return;
+        };
 
         for alias in ["opencode", "openclaw", "pi", "oh-my-pi"] {
-            let output = Command::new("bash")
+            let output = Command::new(&bash)
                 .arg(&script)
                 .arg("--agent")
                 .arg(alias)

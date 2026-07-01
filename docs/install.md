@@ -481,8 +481,9 @@ Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, and OpenClaw have lifecycle
 > bundled scripts to your home dir, (2) `docker run --rm install-hooks`
 > to render the config snippet.
 > On native Windows, Claude Code is the exception to the PowerShell default:
-> it runs hooks through Git Bash, so ai-memory renders `bash -c` commands for
-> the `.sh` scripts.
+> it uses direct `ai-memory.exe hook` commands by default. Set
+> `AI_MEMORY_HOOK_PLATFORM=windows-bash` before `install-hooks` to opt back into
+> Git Bash `bash -c` commands for the `.sh` scripts.
 > OpenClaw, OpenCode, and OMP are different: they use generated
 > TypeScript plugin/extension files, so no shell-script extraction is
 > needed for those clients.

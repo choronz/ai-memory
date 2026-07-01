@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::cli::{InstallSkillsAgent, InstallSkillsArgs, InstallSkillsScope};
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic};
+use crate::commands::path_util::home_dir;
 use crate::config::Config;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -79,7 +80,7 @@ fn print_reports(reports: Vec<InstallReport>) {
 
 fn resolve_target_roots_from_env(args: &InstallSkillsArgs) -> Result<Vec<TargetRoot>> {
     let cwd = std::env::current_dir().context("getting CWD for install-skills target")?;
-    let home = dirs::home_dir();
+    let home = home_dir();
     resolve_target_roots(args, &cwd, home.as_deref())
 }
 

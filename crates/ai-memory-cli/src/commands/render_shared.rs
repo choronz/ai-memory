@@ -885,8 +885,9 @@ mod tests {
             .pointer("/hooks/SessionStart/0/hooks/0/command")
             .and_then(|s| s.as_str())
             .unwrap();
+        let normalized = command.replace('\\', "/");
         assert!(
-            command.contains("/host/hooks/grok/session-start.sh"),
+            normalized.contains("/host/hooks/grok/session-start.sh"),
             "{command}"
         );
         assert!(!command.contains("claude-code"), "{command}");

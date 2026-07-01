@@ -184,7 +184,31 @@ async fn backup_empty_store_still_succeeds() {
     assert!(!bytes.is_empty());
 }
 
+// Windows 11 + Git Bash support matters for regulated enterprise setups where
+// Git Bash is the approved shell available from the corporate repository.
+// Symlink creation can still be denied by Windows policy, so the Windows path
+// skips only when the OS reports the missing privilege.
 #[cfg(unix)]
+fn create_test_symlink_file(target: &std::path::Path, link: &std::path::Path) -> bool {
+    std::os::unix::fs::symlink(target, link).unwrap();
+    true
+}
+
+#[cfg(windows)]
+fn create_test_symlink_file(target: &std::path::Path, link: &std::path::Path) -> bool {
+    match std::os::windows::fs::symlink_file(target, link) {
+        Ok(()) => true,
+        Err(e) if e.raw_os_error() == Some(1314) => {
+            eprintln!(
+                "skipping symlink backup assertion: Windows denied symlink creation privilege"
+            );
+            false
+        }
+        Err(e) => panic!("failed to create test symlink {}: {e}", link.display()),
+    }
+}
+
+#[cfg(any(unix, windows))]
 #[tokio::test]
 async fn backup_does_not_dereference_wiki_symlinks() {
     let tmp = TempDir::new().unwrap();
@@ -195,7 +219,9 @@ async fn backup_does_not_dereference_wiki_symlinks() {
     let secret = tmp.path().join("outside-secret.md");
     let secret_body = "outside secret must not enter backup";
     std::fs::write(&secret, secret_body).unwrap();
-    std::os::unix::fs::symlink(&secret, wiki_dir.join("leak.md")).unwrap();
+    if !create_test_symlink_file(&secret, &wiki_dir.join("leak.md")) {
+        return;
+    }
 
     let router = admin_router(state);
     let resp = router

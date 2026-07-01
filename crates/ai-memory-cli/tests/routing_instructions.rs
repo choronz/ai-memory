@@ -1,4 +1,4 @@
-//! Integration tests for installing ai-memory instructions.
+//! Integration tests for ai-memory routing instructions.
 
 use std::fs;
 use std::path::Path;
@@ -16,6 +16,7 @@ fn run_ai_memory(project: &Path, home: &Path, args: &[&str]) -> Output {
         .args(args)
         .current_dir(project)
         .env("HOME", home)
+        .env("USERPROFILE", home)
         .env("AI_MEMORY_DATA_DIR", home.join(".ai-memory-data"))
         .output()
         .unwrap()
@@ -199,6 +200,8 @@ fn inferred_instruction_targets_select_matching_skill_agents() {
 fn explicit_skill_scope_and_agent_override_instruction_target_inference() {
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
+    let global_skills = home.path().join("global-skills");
+    let global_skills_arg = global_skills.to_string_lossy().to_string();
 
     let output = run_ai_memory(
         project.path(),
@@ -211,15 +214,13 @@ fn explicit_skill_scope_and_agent_override_instruction_target_inference() {
             "global",
             "--skills-agent",
             "claude-code",
+            "--skills-target-dir",
+            &global_skills_arg,
         ],
     );
     assert_success(output);
 
-    assert!(
-        home.path()
-            .join(".claude/skills/ai-memory-retrieval/SKILL.md")
-            .exists()
-    );
+    assert!(global_skills.join("ai-memory-retrieval/SKILL.md").exists());
     assert!(!home.path().join(".agents/skills").exists());
     assert!(!project.path().join(".claude/skills").exists());
     assert!(!project.path().join(".agents/skills").exists());

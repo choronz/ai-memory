@@ -1,6 +1,18 @@
 //! Path helpers shared by command renderers and hook capture.
 
 use std::borrow::Cow;
+use std::path::PathBuf;
+
+/// Resolve the user home used for agent configuration paths.
+///
+/// Tests and scripted wrappers can set `AI_MEMORY_HOME` to exercise the
+/// platform-specific config layout without touching the real user profile.
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("AI_MEMORY_HOME").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(home));
+    }
+    dirs::home_dir()
+}
 
 /// Strip only Windows verbatim path prefixes that are safe to render as plain
 /// paths. Unknown verbatim forms are left unchanged.

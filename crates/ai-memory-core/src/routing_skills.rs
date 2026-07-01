@@ -192,7 +192,8 @@ mod tests {
     }
 
     fn parse_frontmatter(skill: &ManagedSkill) -> Frontmatter {
-        let Some(rest) = skill.content.strip_prefix("---\n") else {
+        let content = skill.content.replace("\r\n", "\n");
+        let Some(rest) = content.strip_prefix("---\n") else {
             panic!("{} must start with frontmatter", skill.name);
         };
         let Some((frontmatter, _body)) = rest.split_once("\n---\n") else {

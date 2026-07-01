@@ -224,6 +224,12 @@ native on an i7-6700HQ). Notes:
   Set the env var before running `install-hooks` so the chosen platform
   is baked into the rendered hook commands.
 
+Project auto-scope treats Windows backslashes and POSIX slashes as the same path
+separator when comparing hook `cwd`, stored `repo_path`, and the home-directory
+catch-all guard. Wrappers or tests that need a host home different from the
+process `HOME` can set `AI_MEMORY_HOME`; it is normalized through the same path
+boundary before startup healing or cwd-prefix matching.
+
 ### Tuning the spool timings (high-latency instances)
 
 The native hook spools events locally and drains them to the server at session

@@ -1583,6 +1583,24 @@ mod tests {
     };
     use tempfile::TempDir;
 
+    #[cfg(windows)]
+    fn create_test_symlink_file(target: &Path, link: &Path) -> bool {
+        match std::os::windows::fs::symlink_file(target, link) {
+            Ok(()) => true,
+            Err(e) if e.raw_os_error() == Some(1314) => {
+                eprintln!("skipping symlink assertion: Windows symlink privilege unavailable");
+                false
+            }
+            Err(e) => panic!("failed to create symlink {}: {e}", link.display()),
+        }
+    }
+
+    #[cfg(unix)]
+    fn create_test_symlink_file(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).unwrap();
+        true
+    }
+
     #[tokio::test]
     async fn project_root_is_wiki_root_joined_with_ws_and_proj() {
         let tmp = TempDir::new().unwrap();
@@ -3166,10 +3184,9 @@ mod tests {
         let outside = tmp.path().join("outside-meta.md");
         std::fs::write(&outside, "---\nproject: webapp\n---\n").unwrap();
         let link = proj_dir.join("_meta.md");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&outside, &link).unwrap();
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_file(&outside, &link).unwrap();
+        if !create_test_symlink_file(&outside, &link) {
+            return;
+        }
 
         let err = wiki.reindex_all().await.unwrap_err();
         assert!(

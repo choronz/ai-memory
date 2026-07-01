@@ -300,8 +300,10 @@ one matching entry.
 ### Install Notes
 
 - **Windows:** use the Linux path inside WSL2, or the native Windows wrapper
-  from PowerShell/cmd. Native Claude Code uses Git Bash `.sh` hooks; other
-  script-hook agents use PowerShell defaults. Do not mix path worlds. See
+  from PowerShell/cmd. Native Claude Code uses direct `ai-memory.exe hook`
+  commands by default, with `AI_MEMORY_HOOK_PLATFORM=windows-bash` available for
+  Git Bash `.sh` hooks; other script-hook agents use PowerShell defaults. Do not
+  mix path worlds. See
   [`docs/windows.md`](docs/windows.md).
 - **Docker compose:** `docker compose -f docker/docker-compose.yml up -d`
   is supported; agent setup is the same as step 3 above.

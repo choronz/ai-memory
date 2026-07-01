@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use git2::{IndexAddOption, ObjectType, Repository, Signature};
+use git2::{ErrorCode, IndexAddOption, ObjectType, Repository, Signature};
 use tracing::{debug, warn};
 
 use crate::error::{WikiError, WikiResult};
@@ -35,6 +35,11 @@ pub struct Checkpoint {
     pub time: i64,
 }
 
+enum CommitGit2Error {
+    Open(git2::Error),
+    Other(git2::Error),
+}
+
 impl GitAdapter {
     /// Open or initialise the repo at `root`. Idempotent: if the
     /// directory is already a git repo, leaves it alone.
@@ -47,7 +52,7 @@ impl GitAdapter {
             Ok(_) => debug!(root = %root.display(), "wiki repo already initialised"),
             Err(_) => {
                 debug!(root = %root.display(), "initialising wiki repo");
-                Repository::init(root).map_err(map_git_err)?;
+                init_repo(root)?;
             }
         }
         Ok(Self {
@@ -68,17 +73,27 @@ impl GitAdapter {
     /// # Errors
     /// Propagates any underlying libgit2 error.
     pub fn commit_all(&self, message: &str) -> WikiResult<Option<git2::Oid>> {
-        let repo = Repository::open(&self.root).map_err(map_git_err)?;
+        match self.commit_all_git2(message) {
+            Ok(result) => Ok(result),
+            Err(CommitGit2Error::Open(e)) if should_try_commit_cli_fallback(&e) => {
+                commit_all_fallback(&self.root, message, e)
+            }
+            Err(CommitGit2Error::Open(e) | CommitGit2Error::Other(e)) => Err(map_git_err(e)),
+        }
+    }
+
+    fn commit_all_git2(&self, message: &str) -> Result<Option<git2::Oid>, CommitGit2Error> {
+        let repo = Repository::open(&self.root).map_err(CommitGit2Error::Open)?;
 
         // Stage everything (including deletions).
-        let mut index = repo.index().map_err(map_git_err)?;
+        let mut index = repo.index().map_err(CommitGit2Error::Other)?;
         index
             .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
-            .map_err(map_git_err)?;
-        index.write().map_err(map_git_err)?;
+            .map_err(CommitGit2Error::Other)?;
+        index.write().map_err(CommitGit2Error::Other)?;
 
         // If the index matches HEAD, there is nothing to commit.
-        let tree_oid = index.write_tree().map_err(map_git_err)?;
+        let tree_oid = index.write_tree().map_err(CommitGit2Error::Other)?;
         if let Ok(head) = repo.head()
             && let Some(target) = head.target()
             && let Ok(parent_commit) = repo.find_commit(target)
@@ -95,12 +110,13 @@ impl GitAdapter {
             debug!("fresh repo, empty index; no commit");
             return Ok(None);
         }
-        let tree = repo.find_tree(tree_oid).map_err(map_git_err)?;
-        let sig = Signature::now(COMMIT_AUTHOR_NAME, COMMIT_AUTHOR_EMAIL).map_err(map_git_err)?;
+        let tree = repo.find_tree(tree_oid).map_err(CommitGit2Error::Other)?;
+        let sig = Signature::now(COMMIT_AUTHOR_NAME, COMMIT_AUTHOR_EMAIL)
+            .map_err(CommitGit2Error::Other)?;
 
         let parents: Vec<git2::Commit<'_>> = match repo.head() {
             Ok(head) => match head.target() {
-                Some(oid) => vec![repo.find_commit(oid).map_err(map_git_err)?],
+                Some(oid) => vec![repo.find_commit(oid).map_err(CommitGit2Error::Other)?],
                 None => Vec::new(),
             },
             Err(_) => Vec::new(),
@@ -108,7 +124,7 @@ impl GitAdapter {
         let parent_refs: Vec<&git2::Commit<'_>> = parents.iter().collect();
         let oid = repo
             .commit(Some("HEAD"), &sig, &sig, message, &tree, &parent_refs)
-            .map_err(map_git_err)?;
+            .map_err(CommitGit2Error::Other)?;
         debug!(oid = %oid, "wiki commit");
         Ok(Some(oid))
     }
@@ -118,7 +134,7 @@ impl GitAdapter {
     #[must_use]
     pub fn commit_count(&self) -> usize {
         let Ok(repo) = Repository::open(&self.root) else {
-            return 0;
+            return commit_count_fallback(&self.root);
         };
         let Ok(mut walk) = repo.revwalk() else {
             return 0;
@@ -139,7 +155,10 @@ impl GitAdapter {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let repo = Repository::open(&self.root).map_err(map_git_err)?;
+        let repo = match Repository::open(&self.root) {
+            Ok(repo) => repo,
+            Err(e) => return recent_checkpoints_fallback(&self.root, limit, map_git_err(e)),
+        };
         let mut walk = repo.revwalk().map_err(map_git_err)?;
         if walk.push_head().is_err() {
             return Ok(Vec::new());
@@ -170,7 +189,10 @@ impl GitAdapter {
     /// # Errors
     /// Returns [`WikiError`] when the revision, path, or blob cannot be read.
     pub fn file_at_rev(&self, rev: &str, path: &Path) -> WikiResult<Vec<u8>> {
-        let repo = Repository::open(&self.root).map_err(map_git_err)?;
+        let repo = match Repository::open(&self.root) {
+            Ok(repo) => repo,
+            Err(e) => return file_at_rev_fallback(&self.root, rev, path, map_git_err(e)),
+        };
         let object = repo.revparse_single(rev).map_err(map_git_err)?;
         let commit = object.peel_to_commit().map_err(map_git_err)?;
         let tree = commit.tree().map_err(map_git_err)?;
@@ -190,6 +212,207 @@ impl GitAdapter {
     }
 }
 
+#[cfg(windows)]
+fn commit_all_fallback(
+    root: &Path,
+    message: &str,
+    original: git2::Error,
+) -> WikiResult<Option<git2::Oid>> {
+    warn!(error = %original, root = %root.display(), "libgit2 commit failed; trying git CLI fallback");
+    run_git(root, ["add", "-A"])?;
+    let diff = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["diff", "--cached", "--quiet", "--exit-code"])
+        .status()
+        .map_err(|e| {
+            WikiError::Io(std::io::Error::other(format!(
+                "{original}; git diff fallback failed to start: {e}"
+            )))
+        })?;
+    if diff.success() {
+        return Ok(None);
+    }
+    run_git(
+        root,
+        [
+            "-c",
+            "user.name=ai-memory",
+            "-c",
+            "user.email=ai-memory@local",
+            "commit",
+            "-q",
+            "-m",
+            message,
+        ],
+    )?;
+    let out = git_output(root, ["rev-parse", "HEAD"])?;
+    let oid = String::from_utf8_lossy(&out.stdout);
+    git2::Oid::from_str(oid.trim())
+        .map(Some)
+        .map_err(map_git_err)
+}
+
+#[cfg(not(windows))]
+fn commit_all_fallback(
+    _root: &Path,
+    _message: &str,
+    original: git2::Error,
+) -> WikiResult<Option<git2::Oid>> {
+    Err(map_git_err(original))
+}
+
+fn should_try_commit_cli_fallback(error: &git2::Error) -> bool {
+    matches!(error.code(), ErrorCode::NotFound)
+}
+
+#[cfg(windows)]
+fn commit_count_fallback(root: &Path) -> usize {
+    let Ok(out) = git_output(root, ["rev-list", "--count", "HEAD"]) else {
+        return 0;
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0)
+}
+
+#[cfg(not(windows))]
+fn commit_count_fallback(_root: &Path) -> usize {
+    0
+}
+
+#[cfg(windows)]
+fn recent_checkpoints_fallback(
+    root: &Path,
+    limit: usize,
+    original: WikiError,
+) -> WikiResult<Vec<Checkpoint>> {
+    warn!(error = %original, root = %root.display(), "libgit2 log failed; trying git CLI fallback");
+    let limit = limit.to_string();
+    let out = git_output(root, ["log", "-n", &limit, "--format=%H%x1f%s%x1f%ct"])?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut checkpoints = Vec::new();
+    for line in text.lines() {
+        let mut fields = line.split('\x1f');
+        let (Some(oid), Some(summary), Some(time)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        checkpoints.push(Checkpoint {
+            oid: oid.to_string(),
+            summary: if summary.is_empty() {
+                "(no summary)".to_string()
+            } else {
+                summary.to_string()
+            },
+            time: time.parse().unwrap_or_default(),
+        });
+    }
+    Ok(checkpoints)
+}
+
+#[cfg(not(windows))]
+fn recent_checkpoints_fallback(
+    _root: &Path,
+    _limit: usize,
+    original: WikiError,
+) -> WikiResult<Vec<Checkpoint>> {
+    Err(original)
+}
+
+#[cfg(windows)]
+fn file_at_rev_fallback(
+    root: &Path,
+    rev: &str,
+    path: &Path,
+    original: WikiError,
+) -> WikiResult<Vec<u8>> {
+    warn!(error = %original, root = %root.display(), "libgit2 show failed; trying git CLI fallback");
+    let rel = path.to_string_lossy().replace('\\', "/");
+    let spec = format!("{rev}:{rel}");
+    let out = git_output(root, ["show", &spec])?;
+    Ok(out.stdout)
+}
+
+#[cfg(not(windows))]
+fn file_at_rev_fallback(
+    _root: &Path,
+    _rev: &str,
+    _path: &Path,
+    original: WikiError,
+) -> WikiResult<Vec<u8>> {
+    Err(original)
+}
+
+fn init_repo(root: &Path) -> WikiResult<()> {
+    match Repository::init(root) {
+        Ok(_) => Ok(()),
+        Err(e) => init_repo_fallback(root, e),
+    }
+}
+
+#[cfg(windows)]
+fn init_repo_fallback(root: &Path, original: git2::Error) -> WikiResult<()> {
+    warn!(error = %original, root = %root.display(), "libgit2 init failed; trying git CLI fallback");
+    let status = std::process::Command::new("git")
+        .arg("init")
+        .arg("-q")
+        .arg(root)
+        .status()
+        .map_err(|io| {
+            WikiError::Io(std::io::Error::other(format!(
+                "{original}; git init fallback failed to start: {io}"
+            )))
+        })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(map_git_err(original))
+    }
+}
+
+#[cfg(not(windows))]
+fn init_repo_fallback(_root: &Path, original: git2::Error) -> WikiResult<()> {
+    Err(map_git_err(original))
+}
+
+#[cfg(windows)]
+fn run_git<const N: usize>(root: &Path, args: [&str; N]) -> WikiResult<()> {
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .status()
+        .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(WikiError::Io(std::io::Error::other(format!(
+            "git fallback exited with status {status}"
+        ))))
+    }
+}
+
+#[cfg(windows)]
+fn git_output<const N: usize>(root: &Path, args: [&str; N]) -> WikiResult<std::process::Output> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))?;
+    if out.status.success() {
+        Ok(out)
+    } else {
+        Err(WikiError::Io(std::io::Error::other(format!(
+            "git fallback exited with status {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        ))))
+    }
+}
+
 fn map_git_err(e: git2::Error) -> WikiError {
     warn!(error = %e, "libgit2 error");
     WikiError::Io(std::io::Error::other(e.to_string()))
@@ -200,9 +423,16 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn tempdir() -> TempDir {
+        tempfile::Builder::new()
+            .prefix("ai-memory-")
+            .tempdir()
+            .unwrap()
+    }
+
     #[test]
     fn init_is_idempotent_and_creates_dotgit() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempdir();
         let root = tmp.path().join("wiki");
         let _adapter = GitAdapter::open_or_init(&root).unwrap();
         assert!(root.join(".git").is_dir());
@@ -212,7 +442,7 @@ mod tests {
 
     #[test]
     fn commit_all_returns_none_when_clean_some_when_dirty() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempdir();
         let root = tmp.path().join("wiki");
         let adapter = GitAdapter::open_or_init(&root).unwrap();
         // No changes: returns None.
@@ -230,7 +460,7 @@ mod tests {
 
     #[test]
     fn commit_all_captures_deletes_too() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempdir();
         let root = tmp.path().join("wiki");
         let adapter = GitAdapter::open_or_init(&root).unwrap();
         std::fs::write(root.join("a.md"), "first").unwrap();
@@ -243,7 +473,7 @@ mod tests {
 
     #[test]
     fn recent_checkpoints_returns_newest_first() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempdir();
         let root = tmp.path().join("wiki");
         let adapter = GitAdapter::open_or_init(&root).unwrap();
 
@@ -261,7 +491,7 @@ mod tests {
 
     #[test]
     fn file_at_rev_reads_historical_blob() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempdir();
         let root = tmp.path().join("wiki");
         let adapter = GitAdapter::open_or_init(&root).unwrap();
 

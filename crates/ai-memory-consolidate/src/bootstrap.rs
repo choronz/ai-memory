@@ -555,8 +555,10 @@ pub fn discover_repo_root(start: &Path) -> Result<PathBuf, BootstrapError> {
 /// Returns `BootstrapError::NotARepo` when no repository is found
 /// at or above `start`.
 pub fn discover_main_repo_root(start: &Path) -> Result<PathBuf, BootstrapError> {
-    let repo = git2::Repository::discover(start)
-        .map_err(|_| BootstrapError::NotARepo(start.to_path_buf()))?;
+    let repo = match git2::Repository::discover(start) {
+        Ok(repo) => repo,
+        Err(_) => return discover_main_repo_root_fallback(start),
+    };
     // Bare repos have no working directory; `commondir()` IS the repo root
     // (there is no `.git/` subdirectory), so `.parent()` would return the
     // grandparent — wrong.  Fall back to basename(cwd) via NotARepo so the
@@ -569,6 +571,56 @@ pub fn discover_main_repo_root(start: &Path) -> Result<PathBuf, BootstrapError> 
     // worktree it points to the *main* repo's `.git/` — so its parent
     // is always the main repository root.
     repo.commondir()
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| BootstrapError::NotARepo(start.to_path_buf()))
+}
+
+#[cfg(windows)]
+fn discover_main_repo_root_fallback(start: &Path) -> Result<PathBuf, BootstrapError> {
+    let is_bare = std::process::Command::new("git")
+        .arg("-C")
+        .arg(start)
+        .args(["rev-parse", "--is-bare-repository"])
+        .output()
+        .map_err(|_| BootstrapError::NotARepo(start.to_path_buf()))?;
+    if !is_bare.status.success() {
+        return Err(BootstrapError::NotARepo(start.to_path_buf()));
+    }
+    let is_bare = String::from_utf8_lossy(&is_bare.stdout).trim() == "true";
+
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(start)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .map_err(|_| BootstrapError::NotARepo(start.to_path_buf()))?;
+    if !output.status.success() {
+        return Err(BootstrapError::NotARepo(start.to_path_buf()));
+    }
+    let common_dir = String::from_utf8_lossy(&output.stdout);
+    let common_dir = common_dir.trim();
+    if common_dir.is_empty() {
+        return Err(BootstrapError::NotARepo(start.to_path_buf()));
+    }
+    main_root_from_common_dir(Path::new(common_dir), is_bare, start)
+}
+
+#[cfg(not(windows))]
+fn discover_main_repo_root_fallback(start: &Path) -> Result<PathBuf, BootstrapError> {
+    Err(BootstrapError::NotARepo(start.to_path_buf()))
+}
+
+#[cfg(any(windows, test))]
+fn main_root_from_common_dir(
+    common_dir: &Path,
+    is_bare: bool,
+    start: &Path,
+) -> Result<PathBuf, BootstrapError> {
+    if is_bare {
+        return Err(BootstrapError::NotARepo(start.to_path_buf()));
+    }
+    common_dir
         .parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| BootstrapError::NotARepo(start.to_path_buf()))
@@ -633,8 +685,17 @@ fn collect_git_commits(
     repo_path: &Path,
     since: Option<&str>,
 ) -> Result<Vec<BootstrapSource>, BootstrapError> {
-    let repo = git2::Repository::open(repo_path)
-        .map_err(|_| BootstrapError::NotARepo(repo_path.to_path_buf()))?;
+    let repo = match git2::Repository::open(repo_path) {
+        Ok(repo) => repo,
+        Err(err) => return collect_git_commits_fallback(repo_path, since, err),
+    };
+    collect_git_commits_git2(&repo, since)
+}
+
+fn collect_git_commits_git2(
+    repo: &git2::Repository,
+    since: Option<&str>,
+) -> Result<Vec<BootstrapSource>, BootstrapError> {
     let mut revwalk = repo.revwalk()?;
     revwalk.set_sorting(git2::Sort::TIME)?;
     revwalk.push_head()?;
@@ -677,6 +738,83 @@ fn collect_git_commits(
     }
     debug!(count = out.len(), "collected git commits");
     Ok(out)
+}
+
+#[cfg(windows)]
+fn collect_git_commits_fallback(
+    repo_path: &Path,
+    since: Option<&str>,
+    original: git2::Error,
+) -> Result<Vec<BootstrapSource>, BootstrapError> {
+    warn!(
+        error = %original,
+        path = %repo_path.display(),
+        "git2 failed to open repository; falling back to git CLI"
+    );
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args([
+            "log",
+            "--date=unix",
+            "--format=%H%x1f%an%x1f%ct%x1f%s%x1f%b%x1e",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(BootstrapError::Git(original));
+    }
+
+    let since_epoch = since.and_then(parse_since_to_epoch);
+    let mut out = Vec::new();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for record in stdout.split('\x1e') {
+        let record = record.trim_matches(['\r', '\n']);
+        if record.is_empty() {
+            continue;
+        }
+        let mut fields = record.splitn(5, '\x1f');
+        let Some(hash) = fields.next() else { continue };
+        let author = fields.next().filter(|s| !s.is_empty()).unwrap_or("unknown");
+        let epoch = fields
+            .next()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+        let summary = fields
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("(no summary)");
+        let body = fields.next().unwrap_or("").trim_start_matches(['\r', '\n']);
+
+        if let Some(cutoff) = since_epoch
+            && epoch < cutoff
+        {
+            break;
+        }
+        let combined_len = summary.len() + body.len();
+        if combined_len < 120 && !is_conventional_substantive(summary) {
+            continue;
+        }
+        let when = jiff::Timestamp::from_second(epoch)
+            .map(|t| t.to_string())
+            .unwrap_or_else(|_| epoch.to_string());
+        let short = hash.chars().take(8).collect::<String>();
+        out.push(BootstrapSource {
+            kind: SourceKind::GitCommit,
+            label: format!("git: {summary}"),
+            text: format!("Commit {short}\nAuthor: {author}\nDate: {when}\n\n{summary}\n\n{body}"),
+        });
+    }
+    debug!(count = out.len(), "collected git commits");
+    Ok(out)
+}
+
+#[cfg(not(windows))]
+fn collect_git_commits_fallback(
+    _repo_path: &Path,
+    _since: Option<&str>,
+    original: git2::Error,
+) -> Result<Vec<BootstrapSource>, BootstrapError> {
+    Err(BootstrapError::Git(original))
 }
 
 /// Parse a `git log --since=<x>` value into a unix epoch. Supports
@@ -1471,6 +1609,20 @@ mod tests {
         let p = Path::new(r"C:\Users\alice\Projects\my-app");
         let (name, _) = derive_project_name(p, ProjectNameStrategy::Basename).unwrap();
         assert_eq!(name, "my-app");
+    }
+
+    #[test]
+    fn main_root_from_common_dir_rejects_bare_repositories() {
+        let start = Path::new("/tmp/repo.git");
+        assert!(main_root_from_common_dir(Path::new("/tmp/repo.git"), true, start).is_err());
+    }
+
+    #[test]
+    fn main_root_from_common_dir_returns_parent_for_worktree_common_dir() {
+        let root =
+            main_root_from_common_dir(Path::new("/tmp/repo/.git"), false, Path::new("/tmp/repo"))
+                .unwrap();
+        assert_eq!(root, PathBuf::from("/tmp/repo"));
     }
 
     /// Degenerate input (root, empty) returns None instead of

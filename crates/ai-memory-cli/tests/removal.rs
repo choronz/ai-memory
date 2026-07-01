@@ -1,4 +1,4 @@
-//! End-to-end: install hooks into a temp HOME, then uninstall, and
+//! End-to-end: add hooks into a temp HOME, then remove them, and
 //! assert the file round-trips (our entries gone, third-party intact).
 
 use std::path::Path;
@@ -17,14 +17,35 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_ai-memory")
 }
 
+fn command_with_home(home: &Path) -> Command {
+    let mut command = Command::new(bin());
+    let config_home = home.join(".config");
+    let data_home = home.join(".local/share");
+    let app_data = home.join("AppData/Roaming");
+    let local_app_data = home.join("AppData/Local");
+    for dir in [&config_home, &data_home, &app_data, &local_app_data] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    command
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("XDG_CONFIG_HOME", config_home)
+        .env("XDG_DATA_HOME", data_home)
+        .env("APPDATA", app_data)
+        .env("LOCALAPPDATA", local_app_data)
+        .env("AI_MEMORY_HOME", home)
+        .env("AI_MEMORY_DATA_DIR", home.join(".ai-memory-data"));
+    command
+}
+
+fn normalize_path_text(value: impl AsRef<str>) -> String {
+    value.as_ref().replace('\\', "/")
+}
+
 fn run_uninstall(project: &Path, home: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(bin())
+    command_with_home(home)
         .args(args)
         .current_dir(project)
-        .env("HOME", home)
-        .env("XDG_CONFIG_HOME", home.join(".config"))
-        .env("XDG_DATA_HOME", home.join(".local/share"))
-        .env("AI_MEMORY_DATA_DIR", home.join(".ai-memory-data"))
         .output()
         .unwrap()
 }
@@ -55,21 +76,15 @@ fn install_then_uninstall_round_trip_claude_hooks() {
     .unwrap();
 
     // Install ai-memory hooks for Claude Code.
-    let status = Command::new(bin())
+    let status = command_with_home(home.path())
         .args(["install-hooks", "--agent", "claude-code", "--apply"])
-        .env("HOME", home.path())
-        .env("XDG_DATA_HOME", home.path().join(".local/share"))
-        .env("AI_MEMORY_DATA_DIR", home.path().join(".ai-memory-data"))
         .status()
         .unwrap();
     assert!(status.success(), "install-hooks failed");
 
     // Uninstall (hooks only) and verify.
-    let status = Command::new(bin())
+    let status = command_with_home(home.path())
         .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
-        .env("HOME", home.path())
-        .env("XDG_DATA_HOME", home.path().join(".local/share"))
-        .env("AI_MEMORY_DATA_DIR", home.path().join(".ai-memory-data"))
         .status()
         .unwrap();
     assert!(status.success(), "uninstall failed");
@@ -109,10 +124,8 @@ fn uninstall_apply_is_idempotent() {
     .unwrap();
 
     let run = || {
-        std::process::Command::new(bin())
+        command_with_home(home.path())
             .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
-            .env("HOME", home.path())
-            .env("AI_MEMORY_DATA_DIR", home.path().join(".ai-memory-data"))
             .status()
             .unwrap()
     };
@@ -148,10 +161,8 @@ fn only_hooks_preserves_mcp_in_same_file() {
     )
     .unwrap();
 
-    let status = std::process::Command::new(bin())
+    let status = command_with_home(home.path())
         .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
-        .env("HOME", home.path())
-        .env("AI_MEMORY_DATA_DIR", home.path().join(".ai-memory-data"))
         .status()
         .unwrap();
     assert!(status.success());
@@ -180,10 +191,8 @@ fn uninstall_preserves_user_opencode_plugin_at_ai_memory_path() {
     let original = "// user-owned plugin that happens to use this filename\nexport default {};\n";
     std::fs::write(&plugin, original).unwrap();
 
-    let status = Command::new(bin())
+    let status = command_with_home(home.path())
         .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
-        .env("HOME", home.path())
-        .env("AI_MEMORY_DATA_DIR", home.path().join(".ai-memory-data"))
         .status()
         .unwrap();
     assert!(status.success(), "uninstall failed");
@@ -206,10 +215,8 @@ fn uninstall_deletes_generated_opencode_plugin_only() {
     let sibling = plugins.join("other.ts");
     std::fs::write(&sibling, "keep me\n").unwrap();
 
-    let status = Command::new(bin())
+    let status = command_with_home(home.path())
         .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
-        .env("HOME", home.path())
-        .env("AI_MEMORY_DATA_DIR", home.path().join(".ai-memory-data"))
         .status()
         .unwrap();
     assert!(status.success(), "uninstall failed");
@@ -228,10 +235,8 @@ fn uninstall_omp_extension_deletes_only_generated_file() {
     let user_content = "// user-owned extension that happens to use this filename\n";
     std::fs::write(&extension, user_content).unwrap();
 
-    let status = Command::new(bin())
+    let status = command_with_home(home.path())
         .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
-        .env("HOME", home.path())
-        .env("AI_MEMORY_DATA_DIR", home.path().join(".ai-memory-data"))
         .status()
         .unwrap();
     assert!(status.success(), "uninstall failed");
@@ -243,10 +248,8 @@ fn uninstall_omp_extension_deletes_only_generated_file() {
     )
     .unwrap();
 
-    let status = Command::new(bin())
+    let status = command_with_home(home.path())
         .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
-        .env("HOME", home.path())
-        .env("AI_MEMORY_DATA_DIR", home.path().join(".ai-memory-data"))
         .status()
         .unwrap();
     assert!(status.success(), "uninstall failed");
@@ -264,11 +267,9 @@ fn uninstall_preserves_user_openclaw_package_at_ai_memory_path() {
     let original = r#"{"name":"@ai-memory/openclaw-plugin","private":true}"#;
     std::fs::write(&package, original).unwrap();
 
-    let status = Command::new(bin())
+    let status = command_with_home(home.path())
         .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
-        .env("HOME", home.path())
         .env("XDG_DATA_HOME", &data)
-        .env("AI_MEMORY_DATA_DIR", home.path().join(".ai-memory-data"))
         .status()
         .unwrap();
     assert!(status.success(), "uninstall failed");
@@ -302,10 +303,8 @@ fn uninstall_antigravity_hooks_preserves_user_entries() {
     )
     .unwrap();
 
-    let status = Command::new(bin())
+    let status = command_with_home(home.path())
         .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
-        .env("HOME", home.path())
-        .env("AI_MEMORY_DATA_DIR", home.path().join(".ai-memory-data"))
         .status()
         .unwrap();
     assert!(status.success(), "uninstall failed");
@@ -343,7 +342,7 @@ fn uninstall_mcp_custom_url_removes_antigravity_only_by_endpoint() {
     )
     .unwrap();
 
-    let status = Command::new(bin())
+    let status = command_with_home(home.path())
         .args([
             "uninstall",
             "--apply",
@@ -353,8 +352,6 @@ fn uninstall_mcp_custom_url_removes_antigravity_only_by_endpoint() {
             "http://lan:49374/mcp",
             "--yes",
         ])
-        .env("HOME", home.path())
-        .env("AI_MEMORY_DATA_DIR", home.path().join(".ai-memory-data"))
         .status()
         .unwrap();
     assert!(status.success(), "uninstall failed");
@@ -385,7 +382,7 @@ fn uninstall_mcp_name_narrows_endpoint_match() {
     )
     .unwrap();
 
-    let status = Command::new(bin())
+    let status = command_with_home(home.path())
         .args([
             "uninstall",
             "--apply",
@@ -395,8 +392,6 @@ fn uninstall_mcp_name_narrows_endpoint_match() {
             "ai-memory",
             "--yes",
         ])
-        .env("HOME", home.path())
-        .env("AI_MEMORY_DATA_DIR", home.path().join(".ai-memory-data"))
         .status()
         .unwrap();
     assert!(status.success(), "uninstall failed");
@@ -416,10 +411,8 @@ fn uninstall_dry_run_changes_nothing() {
     let original = r#"{"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"AI_MEMORY_HOOK_URL=x /a/stop.sh"}]}]}}"#;
     std::fs::write(claude.join("settings.json"), original).unwrap();
 
-    let status = Command::new(bin())
+    let status = command_with_home(home.path())
         .args(["uninstall", "--only", "hooks"]) // no --apply
-        .env("HOME", home.path())
-        .env("AI_MEMORY_DATA_DIR", home.path().join(".ai-memory-data"))
         .status()
         .unwrap();
     assert!(status.success());
@@ -506,13 +499,9 @@ fn install_skills_then_uninstall_only_skills_round_trips() {
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
 
-    let install = Command::new(bin())
+    let install = command_with_home(home.path())
         .args(["install-skills", "--scope", "project", "--agent", "both"])
         .current_dir(project.path())
-        .env("HOME", home.path())
-        .env("XDG_CONFIG_HOME", home.path().join(".config"))
-        .env("XDG_DATA_HOME", home.path().join(".local/share"))
-        .env("AI_MEMORY_DATA_DIR", home.path().join(".ai-memory-data"))
         .output()
         .unwrap();
     assert!(
@@ -558,17 +547,13 @@ fn uninstall_only_skills_leaves_custom_target_dir_for_manual_cleanup() {
     let home = tempfile::tempdir().unwrap();
     let custom_root = project.path().join("custom-skills");
 
-    let install = Command::new(bin())
+    let install = command_with_home(home.path())
         .args([
             "install-skills",
             "--target-dir",
             custom_root.to_str().unwrap(),
         ])
         .current_dir(project.path())
-        .env("HOME", home.path())
-        .env("XDG_CONFIG_HOME", home.path().join(".config"))
-        .env("XDG_DATA_HOME", home.path().join(".local/share"))
-        .env("AI_MEMORY_DATA_DIR", home.path().join(".ai-memory-data"))
         .output()
         .unwrap();
     assert!(
@@ -628,7 +613,8 @@ fn uninstall_skills_dry_run_reports_plan_without_mutating() {
         "stdout was: {stdout}"
     );
     assert!(
-        stdout.contains(&skill_path.display().to_string()),
+        normalize_path_text(&stdout)
+            .contains(&normalize_path_text(skill_path.display().to_string())),
         "stdout was: {stdout}"
     );
     assert_eq!(
@@ -650,9 +636,8 @@ fn uninstall_purge_data_apply_wipes() {
     std::fs::create_dir_all(data.path().join("logs")).unwrap();
     std::fs::write(data.path().join("logs/app.log"), b"l").unwrap();
 
-    let out = Command::new(bin())
+    let out = command_with_home(home.path())
         .args(["uninstall", "--apply", "--yes", "--purge-data"])
-        .env("HOME", home.path())
         .env("AI_MEMORY_DATA_DIR", data.path())
         // Exercises the WIPE, not the live-process guard; opt out so an
         // unrelated `ai-memory` on the machine can't make it flake. The
@@ -688,9 +673,8 @@ fn uninstall_dry_run_previews_purge() {
         std::fs::write(data.path().join(sub).join("f.txt"), b"x").unwrap();
     }
 
-    let out = Command::new(bin())
+    let out = command_with_home(home.path())
         .args(["uninstall", "--purge-data"]) // dry-run: no --apply
-        .env("HOME", home.path())
         .env("AI_MEMORY_DATA_DIR", data.path())
         // Dry-run still hits the purge guard before previewing; opt out so an
         // unrelated live `ai-memory` can't flake the preview.
@@ -715,7 +699,7 @@ fn uninstall_dry_run_previews_purge() {
 /// Best-effort, NOT in the default run (sysinfo reads the real process table;
 /// no injection seam). Spawns a real sibling `ai-memory` process and asserts
 /// `--purge-data` refuses up front, leaving the wiring intact. Run with:
-/// `cargo test -p ai-memory-cli --test uninstall -- --ignored`.
+/// `cargo test -p ai-memory-cli --test removal -- --ignored`.
 #[test]
 #[ignore]
 fn purge_data_refuses_when_sibling_alive() {
@@ -729,17 +713,15 @@ fn purge_data_refuses_when_sibling_alive() {
     std::fs::write(&settings, original).unwrap();
 
     // Long-lived sibling `ai-memory` process.
-    let mut serve = Command::new(bin())
+    let mut serve = command_with_home(home.path())
         .arg("serve")
-        .env("HOME", home.path())
         .env("AI_MEMORY_DATA_DIR", data.path())
         .spawn()
         .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(800));
 
-    let out = Command::new(bin())
+    let out = command_with_home(home.path())
         .args(["uninstall", "--apply", "--yes", "--purge-data"])
-        .env("HOME", home.path())
         .env("AI_MEMORY_DATA_DIR", data.path())
         .output()
         .unwrap();

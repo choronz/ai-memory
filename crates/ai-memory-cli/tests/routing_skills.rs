@@ -1,4 +1,4 @@
-//! Integration tests for installing ai-memory managed skills.
+//! Integration tests for ai-memory managed routing skills.
 
 use std::process::Command;
 

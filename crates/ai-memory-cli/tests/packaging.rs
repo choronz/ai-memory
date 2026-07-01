@@ -17,6 +17,41 @@ fn read_repo(path: &str) -> String {
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
 }
 
+fn shell_script_command(script: &Path) -> Command {
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("bash");
+        command.arg(script);
+        command
+    }
+
+    #[cfg(not(windows))]
+    {
+        Command::new(script)
+    }
+}
+
+fn shell_path(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        let path = path.display().to_string().replace('\\', "/");
+        if path.len() >= 3 && path.as_bytes()[1] == b':' {
+            format!(
+                "/{}/{}",
+                path[..1].to_ascii_lowercase(),
+                path[3..].trim_start_matches('/')
+            )
+        } else {
+            path
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        path.display().to_string()
+    }
+}
+
 fn run_wrapper_on_fake_macos(args: &[&str]) -> String {
     let tmp = tempfile::tempdir().unwrap();
     let docker_args = tmp.path().join("docker-args.txt");
@@ -26,7 +61,7 @@ fn run_wrapper_on_fake_macos(args: &[&str]) -> String {
         &docker,
         format!(
             "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > {}\n",
-            docker_args.display()
+            shell_path(&docker_args)
         ),
     )
     .unwrap();
@@ -40,16 +75,17 @@ fn run_wrapper_on_fake_macos(args: &[&str]) -> String {
 
     let path = format!(
         "{}:{}",
-        tmp.path().display(),
+        shell_path(tmp.path()),
         std::env::var("PATH").unwrap_or_default()
     );
-    let output = Command::new(repo_root().join("bin/ai-memory"))
+    let mut command = shell_script_command(&repo_root().join("bin/ai-memory"));
+    let output = command
         .args(args)
         .env("PATH", path)
-        .env("AI_MEMORY_DOCKER", &docker)
+        .env("AI_MEMORY_DOCKER", shell_path(&docker))
         .env("AI_MEMORY_NO_VERSION_CHECK", "1")
         .env("AI_MEMORY_DATA_VOLUME", "test-ai-memory-data")
-        .env("HOME", tmp.path())
+        .env("HOME", shell_path(tmp.path()))
         .env_remove("AI_MEMORY_SERVER_URL")
         .output()
         .unwrap();

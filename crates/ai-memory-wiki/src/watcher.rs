@@ -531,6 +531,24 @@ mod tests {
     use ai_memory_store::Store;
     use tempfile::TempDir;
 
+    #[cfg(windows)]
+    fn create_test_symlink_file(target: &Path, link: &Path) -> bool {
+        match std::os::windows::fs::symlink_file(target, link) {
+            Ok(()) => true,
+            Err(e) if e.raw_os_error() == Some(1314) => {
+                eprintln!("skipping symlink assertion: Windows symlink privilege unavailable");
+                false
+            }
+            Err(e) => panic!("failed to create symlink {}: {e}", link.display()),
+        }
+    }
+
+    #[cfg(unix)]
+    fn create_test_symlink_file(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).unwrap();
+        true
+    }
+
     async fn setup() -> (TempDir, Store, Wiki, WorkspaceId, ProjectId) {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
@@ -932,10 +950,9 @@ mod tests {
         std::fs::write(&secret, "this is sensitive\n").unwrap();
 
         // Plant a symlink inside proj/ pointing at the outside file.
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&secret, proj_root.join("symlinked.md")).unwrap();
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_file(&secret, proj_root.join("symlinked.md")).unwrap();
+        if !create_test_symlink_file(&secret, &proj_root.join("symlinked.md")) {
+            return;
+        }
 
         let found = walk_markdown(&proj_root).unwrap();
         let names: Vec<_> = found.iter().map(|p| p.as_str().to_string()).collect();
@@ -964,10 +981,9 @@ mod tests {
         std::fs::write(&secret, "directsymlinksecret should not index\n").unwrap();
 
         let symlink = proj_dir.join("symlinked.md");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&secret, &symlink).unwrap();
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_file(&secret, &symlink).unwrap();
+        if !create_test_symlink_file(&secret, &symlink) {
+            return;
+        }
 
         let event = notify_debouncer_full::DebouncedEvent::new(
             notify::Event::new(EventKind::Create(notify::event::CreateKind::File))

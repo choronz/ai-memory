@@ -482,6 +482,15 @@ fn cache_key_for(
     )
 }
 
+fn normalize_project_path_key(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    if normalized.len() > 1 {
+        normalized.trim_end_matches('/').to_string()
+    } else {
+        normalized
+    }
+}
+
 /// Resolve the `(workspace_id, project_id)` pair for a hook event.
 ///
 /// Precedence:
@@ -503,7 +512,9 @@ async fn resolve_project_ids(
     project_strategy: ProjectStrategy,
     actor: &ai_memory_core::ActorKey,
 ) -> anyhow::Result<(WorkspaceId, ProjectId)> {
-    let cwd_norm = cwd.filter(|s| !s.is_empty()).map(str::to_string);
+    let cwd_norm = cwd
+        .filter(|s| !s.is_empty())
+        .map(normalize_project_path_key);
 
     // Without cwd AND without a project override, there's nothing to
     // resolve — fall through to the server defaults.
@@ -598,9 +609,9 @@ async fn resolve_project_ids(
         ai_memory_consolidate::derive_project_name(path, strat).map(|(name, root)| {
             let repo_path = root
                 .map(|p| {
-                    repo_root_in_cwd_namespace(path, &p)
-                        .to_string_lossy()
-                        .into_owned()
+                    normalize_project_path_key(
+                        &repo_root_in_cwd_namespace(path, &p).to_string_lossy(),
+                    )
                 })
                 .or_else(|| repo_path_from_cwd(cwd));
             (name, repo_path)
@@ -611,9 +622,9 @@ async fn resolve_project_ids(
         let path = std::path::Path::new(cwd);
         let repo_root = ai_memory_consolidate::discover_repo_root(path).ok()?;
         cwd_is_repo_root(path, &repo_root).then(|| {
-            repo_root_in_cwd_namespace(path, &repo_root)
-                .to_string_lossy()
-                .into_owned()
+            normalize_project_path_key(
+                &repo_root_in_cwd_namespace(path, &repo_root).to_string_lossy(),
+            )
         })
     }
 
@@ -648,7 +659,7 @@ async fn resolve_project_ids(
             if let Ok(root) = ai_memory_consolidate::discover_main_repo_root(cwd_path) {
                 let visible_root = repo_root_in_cwd_namespace(cwd_path, &root);
                 if visible_root.file_name().and_then(|name| name.to_str()) == Some(project) {
-                    return Some(visible_root.to_string_lossy().into_owned());
+                    return Some(normalize_project_path_key(&visible_root.to_string_lossy()));
                 }
             }
         }
@@ -771,9 +782,13 @@ async fn process(
         // begin_session trips the project foreign key. Evict the stale
         // slot, re-resolve (which recreates the project), and retry once.
         warn!(error = %e, "begin_session failed; evicting stale project cache and retrying");
-        let cwd_norm = env.cwd.as_deref().filter(|s| !s.is_empty());
+        let cwd_norm = env
+            .cwd
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(normalize_project_path_key);
         let key = cache_key_for(
-            cwd_norm,
+            cwd_norm.as_deref(),
             env.workspace_override.as_deref(),
             env.project_override.as_deref(),
             env.project_strategy,
@@ -1135,6 +1150,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     fn init_repo_with_commit(path: &std::path::Path) -> git2::Repository {
         std::fs::create_dir_all(path).unwrap();
         let repo = git2::Repository::init(path).unwrap();
@@ -1148,6 +1164,71 @@ mod tests {
                 .unwrap();
         }
         repo
+    }
+
+    #[cfg(windows)]
+    fn init_repo_with_commit(path: &std::path::Path) {
+        std::fs::create_dir_all(path).unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "-q", "-b", "main"]).arg(path);
+        assert_command_success(init);
+
+        let mut email = std::process::Command::new("git");
+        email
+            .arg("-C")
+            .arg(path)
+            .args(["config", "user.email", "test@example.com"]);
+        assert_command_success(email);
+
+        let mut name = std::process::Command::new("git");
+        name.arg("-C")
+            .arg(path)
+            .args(["config", "user.name", "Test"]);
+        assert_command_success(name);
+
+        let mut commit = std::process::Command::new("git");
+        commit
+            .arg("-C")
+            .arg(path)
+            .args(["commit", "--allow-empty", "-m", "initial"]);
+        assert_command_success(commit);
+    }
+
+    #[cfg(windows)]
+    fn init_bare_repo(path: &std::path::Path) {
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "--bare", "-q"]).arg(path);
+        assert_command_success(init);
+    }
+
+    // Windows 11 + Git Bash support matters for regulated enterprise setups
+    // where Git Bash is the approved shell available from the corporate
+    // repository. Symlink creation can still be denied by Windows policy, so
+    // the Windows path skips only when the OS reports the missing privilege.
+    #[cfg(unix)]
+    fn create_test_symlink_dir(target: &std::path::Path, link: &std::path::Path) -> bool {
+        std::os::unix::fs::symlink(target, link).unwrap();
+        true
+    }
+
+    #[cfg(windows)]
+    fn create_test_symlink_dir(target: &std::path::Path, link: &std::path::Path) -> bool {
+        match std::os::windows::fs::symlink_dir(target, link) {
+            Ok(()) => true,
+            Err(e) if e.raw_os_error() == Some(1314) => {
+                eprintln!(
+                    "skipping symlink repo-path assertion: Windows denied symlink creation privilege"
+                );
+                false
+            }
+            Err(e) => panic!("failed to create test symlink {}: {e}", link.display()),
+        }
+    }
+
+    #[cfg(windows)]
+    fn assert_command_success(mut command: std::process::Command) {
+        let status = command.status().unwrap();
+        assert!(status.success(), "command failed: {command:?}");
     }
 
     /// Two hook events with distinct cwds must land in two distinct projects.
@@ -1525,12 +1606,12 @@ mod tests {
             .get_or_create_workspace(String::from(DEFAULT_WORKSPACE_NAME))
             .await
             .unwrap();
-        // Three poison rows that would each match too broadly without
-        // the safety filters.
+        // Poison rows that would match too broadly without the safety filters.
+        // New trailing-slash repo paths are normalized at the store write
+        // boundary; legacy raw trailing separators are covered in store tests.
         for (name, repo) in [
             ("empty-repo", String::new()),
             ("root-repo", String::from("/")),
-            ("trailing-repo", String::from("/repo/foo/")),
         ] {
             state
                 .writer
@@ -1539,7 +1620,7 @@ mod tests {
                 .unwrap();
         }
 
-        // Resolve a cwd that the three poison rows would each match
+        // Resolve a cwd that the poison rows would each match
         // pre-fix. Expect: a NEW project created by basename.
         let (resolved_ws, resolved) = resolve_project_ids(
             &state,
@@ -2952,7 +3033,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn repo_root_override_stores_repo_path_in_cwd_namespace() {
         let tmp = TempDir::new().unwrap();
@@ -2965,7 +3046,9 @@ mod tests {
         std::fs::create_dir_all(real_repo.join("sibling")).unwrap();
 
         let alias_root = tmp.path().join("alias");
-        std::os::unix::fs::symlink(&real_root, &alias_root).unwrap();
+        if !create_test_symlink_dir(&real_root, &alias_root) {
+            return;
+        }
         let alias_app = alias_root.join("repo/app");
         let alias_sibling = alias_root.join("repo/sibling");
 
@@ -3047,19 +3130,41 @@ mod tests {
 
         // Create a real git repo inside the temp dir.
         let main_dir = tmp.path().join("my-project");
-        let repo = init_repo_with_commit(&main_dir);
 
         // Create a worktree in a sibling directory.
         let wt_dir = tmp.path().join("my-project-feature-branch");
-        let head = repo.head().unwrap().peel_to_commit().unwrap();
-        // Create a branch for the worktree to check out.
-        let branch = repo.branch("feature-branch", &head, false).unwrap();
-        repo.worktree(
-            "feature-branch",
-            &wt_dir,
-            Some(git2::WorktreeAddOptions::new().reference(Some(&branch.into_reference()))),
-        )
-        .unwrap();
+        #[cfg(windows)]
+        {
+            init_repo_with_commit(&main_dir);
+            let mut branch = std::process::Command::new("git");
+            branch
+                .arg("-C")
+                .arg(&main_dir)
+                .args(["branch", "feature-branch"]);
+            assert_command_success(branch);
+
+            let mut worktree = std::process::Command::new("git");
+            worktree
+                .arg("-C")
+                .arg(&main_dir)
+                .args(["worktree", "add", "-q"])
+                .arg(&wt_dir)
+                .arg("feature-branch");
+            assert_command_success(worktree);
+        }
+        #[cfg(not(windows))]
+        {
+            let repo = init_repo_with_commit(&main_dir);
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            // Create a branch for the worktree to check out.
+            let branch = repo.branch("feature-branch", &head, false).unwrap();
+            repo.worktree(
+                "feature-branch",
+                &wt_dir,
+                Some(git2::WorktreeAddOptions::new().reference(Some(&branch.into_reference()))),
+            )
+            .unwrap();
+        }
 
         let main_cwd = main_dir.to_str().unwrap();
         let wt_cwd = wt_dir.to_str().unwrap();
@@ -3158,6 +3263,9 @@ mod tests {
         let state = make_state(&tmp).await;
 
         let bare_dir = tmp.path().join("my-bare-project.git");
+        #[cfg(windows)]
+        init_bare_repo(&bare_dir);
+        #[cfg(not(windows))]
         git2::Repository::init_bare(&bare_dir).unwrap();
         let cwd = bare_dir.to_str().unwrap();
 
@@ -3178,6 +3286,9 @@ mod tests {
         // The project name should come from basename, not from the grandparent.
         // To verify: resolve with a different bare repo name and confirm different project.
         let bare_dir2 = tmp.path().join("other-bare.git");
+        #[cfg(windows)]
+        init_bare_repo(&bare_dir2);
+        #[cfg(not(windows))]
         git2::Repository::init_bare(&bare_dir2).unwrap();
         let (_, proj2) = resolve_project_ids(
             &state,

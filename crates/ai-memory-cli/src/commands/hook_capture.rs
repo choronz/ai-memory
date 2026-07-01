@@ -9,6 +9,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::commands::path_util::home_dir;
+
 /// First top-level `cwd` string in the payload (parity with
 /// `ai_memory_extract_cwd`: take the top-level value, ignore nested
 /// `cwd` fields in tool payloads).
@@ -87,7 +89,7 @@ fn repo_root_project(cwd: &str) -> Option<String> {
 /// user's declaration on shared machines (parity with
 /// `ai_memory_find_marker`).
 fn find_marker(cwd: &str) -> Option<PathBuf> {
-    let home = dirs::home_dir();
+    let home = home_dir();
     let mut dir = Path::new(cwd);
     loop {
         let candidate = dir.join(".ai-memory.toml");

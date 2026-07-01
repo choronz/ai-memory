@@ -21,6 +21,7 @@ use serde_json::json;
 
 use crate::cli::{InstallMcpArgs, McpClient};
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json, mutate_toml};
+use crate::commands::path_util::home_dir;
 use crate::commands::render_shared::bearer_header_value;
 use crate::config::{Config, DEFAULT_MCP_URL};
 
@@ -97,7 +98,7 @@ fn mcp_server_url_from_base(server_url: &str) -> String {
 /// unsupported OSes, or when `$HOME` can't be resolved.
 pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> {
     use crate::cli::McpClient;
-    let home = || dirs::home_dir().context("could not locate $HOME for config-file auto-detect");
+    let home = || home_dir().context("could not locate $HOME for config-file auto-detect");
     Ok(match client {
         // Claude Code reads MCP-server registrations from `~/.claude.json`
         // (the same file `claude mcp add`/`claude mcp list` operate on).

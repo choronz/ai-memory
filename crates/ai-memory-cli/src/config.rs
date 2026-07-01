@@ -66,10 +66,10 @@ pub struct Config {
     #[serde(default)]
     pub base_path: String,
     /// Operator home directory, captured once here (the single config-read
-    /// path) from `$HOME`. Used to keep the cwd->project resolver and the
+    /// path) from `AI_MEMORY_HOME` or `$HOME`. Used to keep the cwd->project resolver and the
     /// startup heal from treating `$HOME` as a prefix-match catch-all
     /// (issue #103) without env reads scattered through the runtime. Not a
-    /// config.toml / env key: always derived from `$HOME` at load.
+    /// config.toml key: always derived from the process environment at load.
     #[serde(skip)]
     pub home_dir: Option<String>,
     /// Per-subsystem log filter (overridable by `RUST_LOG`).
@@ -182,6 +182,7 @@ pub struct Config {
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeEnv {
     data_dir: Option<PathBuf>,
+    home_dir: Option<String>,
     server_url: Option<String>,
     auth_token: Option<String>,
     host_cwd: Option<String>,
@@ -202,6 +203,7 @@ impl RuntimeEnv {
     fn from_process() -> Self {
         Self {
             data_dir: env_path("AI_MEMORY_DATA_DIR"),
+            home_dir: env_string("AI_MEMORY_HOME").or_else(|| env_string("HOME")),
             server_url: env_string("AI_MEMORY_SERVER_URL"),
             auth_token: env_string("AI_MEMORY_AUTH_TOKEN"),
             host_cwd: env_string("AI_MEMORY_HOST_CWD"),
@@ -600,13 +602,11 @@ impl Config {
             config.admission_webhooks = parsed;
         }
 
-        // $HOME read once here (config-read-path invariant); threaded to the
-        // resolver guard and startup heal so neither reads the env directly.
-        // Normalized so a trailing slash can't slip a catch-all past the
-        // exact-match guards.
-        config.home_dir = std::env::var("HOME")
-            .ok()
-            .and_then(|home| normalize_home_dir(&home));
+        // Home is captured once in RuntimeEnv (config-read-path invariant);
+        // threaded to the resolver guard and startup heal so neither reads the
+        // env directly. AI_MEMORY_HOME is accepted for tests/wrappers that need
+        // to emulate a host home distinct from the process HOME.
+        config.home_dir = runtime_env.home_dir.as_deref().and_then(normalize_home_dir);
 
         // CLI override always wins (figment doesn't see it because clap has
         // already parsed the flag into `cli_data_dir`).
@@ -892,12 +892,14 @@ fn canonicalise_or_keep(p: &Path) -> PathBuf {
     p.to_path_buf()
 }
 
-/// Normalize `$HOME` for prefix-match comparisons: strip trailing separators
+/// Normalize home for prefix-match comparisons: accept either slash spelling,
+/// strip trailing separators,
 /// so a stored `repo_path` of `/home/u` still equals a `$HOME` of `/home/u/`
 /// (the cwd side is trimmed the same way in `find_project_by_cwd_prefix`).
 /// All-separator or empty input yields `None` (no usable home).
 fn normalize_home_dir(home: &str) -> Option<String> {
-    let trimmed = home.trim_end_matches('/');
+    let normalized = home.replace('\\', "/");
+    let trimmed = normalized.trim_end_matches('/');
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
@@ -975,13 +977,15 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cli_dir = tmp.path().join("override");
         let cfg = Config::load(None, Some(cli_dir)).unwrap();
-        // `home_dir` is derived from `$HOME` at load (the single config-read
-        // path), normalized so a trailing slash can't bypass the catch-all
-        // guards. Reading the env in a test is allowed; this fails if the
-        // load-time assignment is dropped while `$HOME` is set.
+        // `home_dir` is derived from AI_MEMORY_HOME or `$HOME` at load (the
+        // single config-read path), normalized so a trailing slash can't bypass
+        // the catch-all guards. Reading the env in a test is allowed; this
+        // fails if the load-time assignment is dropped while either env var is
+        // set.
         assert_eq!(
             cfg.home_dir,
-            std::env::var("HOME")
+            std::env::var("AI_MEMORY_HOME")
+                .or_else(|_| std::env::var("HOME"))
                 .ok()
                 .and_then(|h| normalize_home_dir(&h))
         );
@@ -994,6 +998,10 @@ mod tests {
         assert_eq!(
             normalize_home_dir("/home/u///"),
             Some("/home/u".to_string())
+        );
+        assert_eq!(
+            normalize_home_dir(r"C:\Users\tester\"),
+            Some("C:/Users/tester".to_string())
         );
         // Degenerate inputs yield no usable home rather than an empty or
         // root-collapsing prefix key.

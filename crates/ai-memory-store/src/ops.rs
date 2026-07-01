@@ -113,6 +113,7 @@ pub fn get_or_create_project(
     name: &str,
     repo_path: Option<&str>,
 ) -> StoreResult<ai_memory_core::ProjectId> {
+    let repo_path = repo_path.map(normalize_repo_path_key);
     let tx = conn.transaction()?;
     let existing: Option<Vec<u8>> = tx
         .query_row(
@@ -132,7 +133,7 @@ pub fn get_or_create_project(
                 id.as_bytes(),
                 workspace_id.as_bytes(),
                 name,
-                repo_path,
+                repo_path.as_deref(),
                 Timestamp::now().as_microsecond()
             ],
         )?;
@@ -165,6 +166,7 @@ pub fn get_or_create_project(
 /// temporarily unmounted drive, and destroying it would wipe a valid prefix
 /// key. This safety rule is mandatory.
 pub fn heal_catch_all_repo_paths(conn: &mut Connection, home: Option<&str>) -> StoreResult<u64> {
+    let home = home.map(normalize_repo_path_key);
     let candidates: Vec<(Vec<u8>, String)> = {
         let mut stmt =
             conn.prepare("SELECT id, repo_path FROM projects WHERE repo_path IS NOT NULL")?;
@@ -175,7 +177,7 @@ pub fn heal_catch_all_repo_paths(conn: &mut Connection, home: Option<&str>) -> S
     };
     let to_null: Vec<Vec<u8>> = candidates
         .into_iter()
-        .filter(|(_, repo_path)| should_heal_repo_path(repo_path, home))
+        .filter(|(_, repo_path)| should_heal_repo_path(repo_path, home.as_deref()))
         .map(|(id, _)| id)
         .collect();
     let tx = conn.transaction()?;
@@ -192,7 +194,8 @@ pub fn heal_catch_all_repo_paths(conn: &mut Connection, home: Option<&str>) -> S
 /// Decide whether a non-NULL `repo_path` is a prefix-match catch-all that
 /// should be NULLed. See [`heal_catch_all_repo_paths`] for the full rule.
 fn should_heal_repo_path(repo_path: &str, home: Option<&str>) -> bool {
-    if repo_path == "/" || home == Some(repo_path) {
+    let repo_path_key = normalize_repo_path_key(repo_path);
+    if repo_path_key == "/" || home == Some(repo_path_key.as_str()) {
         return true; // broad sentinels, healed even if they look like git roots
     }
     let p = std::path::Path::new(repo_path);
@@ -202,6 +205,15 @@ fn should_heal_repo_path(repo_path: &str, home: Option<&str>) -> bool {
     // a `.git` file); a `.git` stat error preserves the row, same as the
     // path-existence check above.
     matches!(p.try_exists(), Ok(true)) && matches!(p.join(".git").try_exists(), Ok(false))
+}
+
+fn normalize_repo_path_key(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    if normalized.len() > 1 {
+        normalized.trim_end_matches('/').to_string()
+    } else {
+        normalized
+    }
 }
 
 fn scheduler_state_table_exists(conn: &Connection) -> StoreResult<bool> {
@@ -259,6 +271,7 @@ pub fn ensure_project_with_id(
     name: &str,
     repo_path: Option<&str>,
 ) -> StoreResult<()> {
+    let repo_path = repo_path.map(normalize_repo_path_key);
     conn.execute(
         "INSERT INTO projects (id, workspace_id, name, repo_path, created_at) \
          VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(id) DO NOTHING",
@@ -266,7 +279,7 @@ pub fn ensure_project_with_id(
             id.as_bytes(),
             workspace_id.as_bytes(),
             name,
-            repo_path,
+            repo_path.as_deref(),
             Timestamp::now().as_microsecond()
         ],
     )?;
@@ -282,7 +295,7 @@ pub fn ensure_project_with_id(
         Some((existing_ws, existing_name, existing_repo_path))
             if existing_ws.as_slice() == workspace_id.as_bytes()
                 && existing_name == name
-                && existing_repo_path.as_deref() == repo_path =>
+                && existing_repo_path.as_deref() == repo_path.as_deref() =>
         {
             Ok(())
         }
