@@ -21,7 +21,7 @@
 | Linux | Supported | Primary Docker/server target and CI platform. Published Docker images support `linux/amd64` and `linux/arm64`. Native Arch/AUR packages include system and user systemd units. |
 | macOS | Supported | Workspace tests run in CI; tagged releases publish native `ai-memory-macos-aarch64.tar.gz` and `ai-memory-macos-x86_64.tar.gz` binaries. The native binary is the recommended path on Apple Silicon. See [`docs/macos.md`](docs/macos.md). |
 | Windows via WSL2 | Supported | Use the Linux install path inside WSL2 when the agent runs there. |
-| Native Windows | Experimental | Tagged releases publish `ai-memory-windows-x86_64.zip` with `ai-memory.exe`; Docker Desktop wrapper and source builds are also available. Claude Code uses direct native `ai-memory.exe hook` commands by default; other script-hook agents use the current PowerShell defaults pending harness feedback. See [`docs/windows.md`](docs/windows.md). |
+| Native Windows | Experimental | Tagged releases publish `ai-memory-windows-x86_64.zip` with `ai-memory.exe`; Docker Desktop wrapper and source builds are also available. Claude Code uses Claude exec form with a real native `ai-memory.exe` by default; other script-hook agents use the current PowerShell defaults pending harness feedback. See [`docs/windows.md`](docs/windows.md). |
 | Claude Code | Supported | MCP config + lifecycle hooks. |
 | Codex | Supported | MCP config + lifecycle hooks. |
 | OpenCode | Supported | Remote MCP config + generated TypeScript plugin. |
@@ -303,9 +303,10 @@ one matching entry.
 ### Install Notes
 
 - **Windows:** use the Linux path inside WSL2, or the native Windows wrapper
-  from PowerShell/cmd. Native Claude Code uses direct `ai-memory.exe hook`
-  commands by default, with `AI_MEMORY_HOOK_PLATFORM=windows-bash` available for
-  Git Bash `.sh` hooks; other script-hook agents use PowerShell defaults. Do not
+  from PowerShell/cmd. Native Claude Code uses Claude exec form with a real
+  `ai-memory.exe` by default, with `AI_MEMORY_HOOK_PLATFORM=windows-bash`
+  available for Git Bash `.sh` hooks and older Claude Code builds; other
+  script-hook agents use PowerShell defaults. Do not
   mix path worlds. See
   [`docs/windows.md`](docs/windows.md).
 - **Docker compose:** `docker compose -f docker/docker-compose.yml up -d`

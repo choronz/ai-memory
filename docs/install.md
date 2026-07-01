@@ -483,9 +483,11 @@ Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, and OpenClaw have lifecycle
 > bundled scripts to your home dir, (2) `docker run --rm install-hooks`
 > to render the config snippet.
 > On native Windows, Claude Code is the exception to the PowerShell default:
-> it uses direct `ai-memory.exe hook` commands by default. Set
+> it uses Claude exec form (`command` = real `ai-memory.exe`, `args` = argv
+> tokens for `hook --event ...`) by default. Set
 > `AI_MEMORY_HOOK_PLATFORM=windows-bash` before `install-hooks` to opt back into
-> Git Bash `bash -c` commands for the `.sh` scripts.
+> Git Bash `bash -c` commands for the `.sh` scripts, including for older Claude
+> Code builds that do not support exec form.
 > OpenClaw, OpenCode, and OMP are different: they use generated
 > TypeScript plugin/extension files, so no shell-script extraction is
 > needed for those clients.
@@ -735,8 +737,8 @@ architecture: `aarch64` for Apple Silicon, `x86_64` for Intel. On Windows, see
 The short version: run the install commands from the same environment that
 launches the agent. WSL2-launched agents need WSL paths and POSIX `.sh` hooks.
 Native Windows agents can use the tagged `ai-memory-windows-x86_64.zip`, the
-Docker Desktop wrapper, or a source build. Native Claude Code uses direct
-`ai-memory.exe hook` commands by default; other native Windows script-hook
+Docker Desktop wrapper, or a source build. Native Claude Code uses Claude exec
+form with a real `ai-memory.exe` by default; other native Windows script-hook
 agents use PowerShell `.ps1` defaults.
 
 When run from source, `install-hooks` finds the bundled scripts in

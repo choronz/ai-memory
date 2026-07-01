@@ -17,8 +17,8 @@ launches Claude Code, Codex, Cursor, Gemini CLI, or another agent.
 The difference matters because hook configs contain executable paths.
 WSL2 agents need Linux paths and POSIX `.sh` hooks. Native Windows
 agents need Windows paths, but the hook runner is agent-specific:
-Claude Code invokes its hooks as a direct native binary call
-(`"…ai-memory.exe" hook --event …`) with no shell — see [Native Hook
+Claude Code invokes its hooks with Claude's direct exec form
+(`command: "…ai-memory.exe"`, `args: ["hook", "--event", …]`) with no shell — see [Native Hook
 Command](#native-hook-command-claude-code-on-windows). Set
 `AI_MEMORY_HOOK_PLATFORM=windows-bash` to fall back to the older
 `bash -c` + `.sh` Git Bash commands. Other native Windows script-hook
@@ -104,8 +104,8 @@ the CLI to render hook commands for the native Windows agent:
 
 - Config files are written through the mounted Windows home directory.
 - Hook scripts are staged under `$HOME\.local\share\ai-memory\hooks\`.
-- Claude Code hook commands call the `ai-memory` binary directly
-  (`"…ai-memory.exe" hook --event …`), no shell — set
+- Claude Code hook commands call the `ai-memory` binary directly with Claude's
+  exec form (`command` executable + `args` argv array), no shell — set
   `AI_MEMORY_HOOK_PLATFORM=windows-bash` for the old `bash -c` + `.sh`
   Git Bash path.
 - Other native Windows script-hook agents currently call `powershell.exe` and
@@ -123,7 +123,7 @@ Docker. Each tagged release publishes
 
 ```powershell
 # Download + extract into your user data dir (any stable path works; the
-# native hook command is rendered from wherever ai-memory.exe lives).
+# native hook exec-form command is rendered from wherever ai-memory.exe lives).
 $Dest = "$env:LOCALAPPDATA\ai-memory"
 New-Item -ItemType Directory -Force $Dest | Out-Null
 Invoke-WebRequest `
@@ -187,12 +187,17 @@ event/agent parity between them.
 
 ## Native Hook Command (Claude Code on Windows)
 
-By default on native Windows, Claude Code hooks are rendered as a direct
-call to the `ai-memory` binary instead of a `bash -c` wrapper around a
-`.sh` script:
+By default on native Windows, Claude Code hooks are rendered using Claude's
+exec form: `command` is the real `ai-memory.exe` path and `args` is an argv
+array. This directly spawns the binary instead of sending one quoted string to a
+shell or using a `bash -c` wrapper around a `.sh` script:
 
-```
-"C:\Users\you\.cargo\bin\ai-memory.exe" hook --event pre-tool-use --agent claude-code --server-url "http://host:49374" --auth-token "..."
+```json
+{
+  "type": "command",
+  "command": "C:\\Users\\you\\.cargo\\bin\\ai-memory.exe",
+  "args": ["hook", "--event", "pre-tool-use", "--agent", "claude-code", "--server-url", "http://host:49374", "--auth-token", "..."]
+}
 ```
 
 This avoids spawning Git Bash plus `cat`/`sed`/`curl` child processes on
@@ -203,15 +208,16 @@ native on an i7-6700HQ). Notes:
 - The binary path comes from the `ai-memory` that runs `install-hooks`, so
   `cargo install --path crates/ai-memory-cli` puts it on a stable
   `~/.cargo/bin` path.
-- The command is double-quoted: Claude Code runs hook commands through
-  `cmd.exe`, which rejects POSIX single quotes; double quotes work in both
-  cmd.exe and Git Bash.
+- Exec form requires a real executable path (`.exe`). It does not run `.cmd` or
+  `.bat` shims through a shell. `install-hooks` uses the path of the running
+  `ai-memory.exe`, so release binaries and Cargo-built binaries work directly.
 - The `.sh`/`.ps1` scripts stay bundled as a fallback — the Docker /
   `setup-agent` flow (no local binary) keeps emitting the shell command.
 - `AI_MEMORY_HOOK_PLATFORM` accepts four values:
-  - `windows-native` — direct binary call (default on native Windows).
+  - `windows-native` — Claude exec-form direct binary call (default on native Windows).
   - `windows-bash` — `bash -c` + `.sh` through Git Bash (the previous
-    default; set this to opt back in).
+    default; set this to opt back in, or as a fallback for older Claude Code
+    builds that do not support exec form).
   - `posix` — POSIX `.sh`. The Docker-wrapper default (the host has no local
     binary); set it explicitly to opt a native install back into the scripts.
   - `posix-native` — direct binary call on macOS / Linux (`<exe> hook

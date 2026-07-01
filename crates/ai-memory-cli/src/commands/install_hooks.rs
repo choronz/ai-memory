@@ -440,22 +440,32 @@ fn bearer_token_from_header(header: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-/// True if a hook-array entry belongs to ai-memory — i.e. some command
-/// string inside it mentions the `ai-memory` binary/script. Used to
-/// replace our own entries on re-apply while preserving hooks that other
-/// tools registered under the same event.
+/// True if a hook-array entry belongs to ai-memory — i.e. some command handler
+/// inside it is one of our legacy command strings or one of our exec-form native
+/// hook handlers. Used to replace our own entries on re-apply while preserving
+/// hooks that other tools registered under the same event.
 fn is_ai_memory_hook_entry(entry: &serde_json::Value) -> bool {
     fn mentions_ai_memory(value: &serde_json::Value) -> bool {
-        value
-            .get("command")
-            .and_then(|c| c.as_str())
-            .map(|c| c.to_ascii_lowercase())
-            // Case-insensitive, and matches BOTH the binary/script path
-            // (`ai-memory`) AND the inlined env vars (`AI_MEMORY_HOOK_URL` /
-            // `AI_MEMORY_AUTH_TOKEN`). The env vars are present in every
-            // command shape (native, bash, PowerShell), so detection works
-            // even when the hooks dir path has no "ai-memory" in it.
-            .is_some_and(|c| c.contains("ai-memory") || c.contains("ai_memory"))
+        let Some(command) = value.get("command").and_then(|c| c.as_str()) else {
+            return false;
+        };
+        let lower = command.to_ascii_lowercase();
+        let args = value.get("args").and_then(|a| a.as_array());
+        let Some(args) = args else {
+            // Legacy shell/string form: broad matching is intentional because
+            // old installs may identify us by the binary/script path or by the
+            // inlined AI_MEMORY_* env vars.
+            return lower.contains("ai-memory") || lower.contains("ai_memory");
+        };
+        let tokens: Vec<&str> = args.iter().filter_map(|v| v.as_str()).collect();
+        // Exec form: require both an ai-memory-ish executable and our hook argv
+        // signature so unrelated helpers such as `ai-memory-helper.exe` are not
+        // removed just because their executable name contains ai-memory.
+        (lower.contains("ai-memory") || lower.contains("ai_memory"))
+            && tokens.contains(&"hook")
+            && tokens.contains(&"--event")
+            && tokens.contains(&"--agent")
+            && tokens.contains(&"--server-url")
     }
     // Flat shape (Cursor): `{ "type":"command", "command":"…" }`.
     // Nested shape (Claude Code / Codex / Gemini):
@@ -2521,9 +2531,19 @@ mod tests {
         assert!(is_ai_memory_hook_entry(&serde_json::json!(
             { "type": "command", "command": "bash -c 'AI_MEMORY_HOOK_URL=x /c/x/ai-memory/hooks/pre.sh'" }
         )));
+        // Claude Code exec form
+        assert!(is_ai_memory_hook_entry(&serde_json::json!(
+            { "matcher": "", "hooks": [ { "type": "command", "command": "C:\\bin\\ai-memory.exe", "args": ["hook", "--event", "session-start", "--agent", "claude-code", "--server-url", "http://h"] } ] }
+        )));
         // Third-party must NOT be flagged
         assert!(!is_ai_memory_hook_entry(&serde_json::json!(
             { "hooks": [ { "type": "command", "command": "node context-mode-cache-heal.mjs" } ] }
+        )));
+        assert!(!is_ai_memory_hook_entry(&serde_json::json!(
+            { "hooks": [ { "type": "command", "command": "C:\\bin\\third-party.exe", "args": ["hook", "--event", "session-start", "--agent", "claude-code", "--server-url", "http://h"] } ] }
+        )));
+        assert!(!is_ai_memory_hook_entry(&serde_json::json!(
+            { "hooks": [ { "type": "command", "command": "C:\\bin\\ai-memory-helper.exe", "args": ["--check", "project"] } ] }
         )));
     }
 

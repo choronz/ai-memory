@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Claude Code WindowsNative hook installs now use Claude's exec form
+  (`command` executable plus `args` argv array) for the native `ai-memory.exe`
+  hook, avoiding shell/Git Bash/PowerShell command-string mangling. Set
+  `AI_MEMORY_HOOK_PLATFORM=windows-bash` before `install-hooks` as a fallback for
+  older Claude Code builds; exec form requires a real `.exe`, not `.cmd`/`.bat`
+  shims.
 - Native `session-end` hooks now enqueue and return quickly, then drain the hook
   spool through a hidden detached `hook-drain` process guarded by a real
   single-flight file lock. Background drains use the new bounded

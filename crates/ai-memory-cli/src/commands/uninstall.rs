@@ -499,6 +499,27 @@ fn hook_command_is_ours(command: &str) -> bool {
         && lower.contains(" --server-url ")
 }
 
+fn hook_entry_is_ours(entry: &serde_json::Value) -> bool {
+    let Some(command) = entry.get("command").and_then(|c| c.as_str()) else {
+        return false;
+    };
+    if hook_command_is_ours(command) {
+        return true;
+    }
+    let lower = command.to_ascii_lowercase();
+    if !(lower.contains("ai-memory") || lower.contains("ai_memory")) {
+        return false;
+    }
+    let Some(args) = entry.get("args").and_then(|a| a.as_array()) else {
+        return false;
+    };
+    let tokens: Vec<&str> = args.iter().filter_map(|v| v.as_str()).collect();
+    tokens.contains(&"hook")
+        && tokens.contains(&"--event")
+        && tokens.contains(&"--agent")
+        && tokens.contains(&"--server-url")
+}
+
 /// Result of stripping ai-memory entries from a hooks JSON file.
 struct HookRemoval {
     new_content: String,
@@ -509,18 +530,12 @@ struct HookRemoval {
 /// remove_entry)`. Flat entries are removed whole; nested entries only lose the
 /// matching inner commands and survive when third-party inner hooks remain.
 fn strip_hook_entry(entry: &mut serde_json::Value) -> (bool, bool) {
-    if let Some(cmd) = entry.get("command").and_then(|c| c.as_str())
-        && hook_command_is_ours(cmd)
-    {
+    if hook_entry_is_ours(entry) {
         return (true, true);
     }
     if let Some(inner) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) {
         let before = inner.len();
-        inner.retain(|h| {
-            !h.get("command")
-                .and_then(|c| c.as_str())
-                .is_some_and(hook_command_is_ours)
-        });
+        inner.retain(|h| !hook_entry_is_ours(h));
         let removed = inner.len() != before;
         return (removed, inner.is_empty());
     }
@@ -962,6 +977,53 @@ mod tests {
         assert_eq!(
             inner[0]["command"].as_str(),
             Some("/home/u/scripts/my-stop.sh")
+        );
+    }
+
+    #[test]
+    fn strip_hooks_removes_exec_form_ours_preserves_exec_third_party_and_sibling() {
+        let content = r#"{
+      "hooks": {
+        "SessionStart": [
+          {"matcher":"","hooks":[
+            {"type":"command","command":"C:\\bin\\ai-memory.exe","args":["hook","--event","session-start","--agent","claude-code","--server-url","http://h"]},
+            {"type":"command","command":"C:\\bin\\third-party.exe","args":["hook","--event","session-start","--agent","claude-code","--server-url","http://h"]}
+          ]},
+          {"matcher":"Tool","hooks":[
+            {"type":"command","command":"C:\\bin\\other.exe","args":["--keep"]}
+          ]}
+        ],
+        "Stop": [
+          {"matcher":"","hooks":[{"type":"command","command":"\"C:\\bin\\ai-memory.exe\" hook --event stop --agent claude-code --server-url \"http://h\""}]}
+        ]
+      }
+    }"#;
+
+        let out = strip_ai_memory_hooks(content).unwrap();
+        assert_eq!(
+            out.removed_events,
+            vec!["SessionStart".to_string(), "Stop".to_string()]
+        );
+        let v: serde_json::Value = serde_json::from_str(&out.new_content).unwrap();
+        assert!(
+            v["hooks"].get("Stop").is_none(),
+            "legacy string hook removed"
+        );
+        let entries = v["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "outer sibling group preserved");
+        let first_inner = entries[0]["hooks"].as_array().unwrap();
+        assert_eq!(
+            first_inner.len(),
+            1,
+            "only ai-memory inner exec hook removed"
+        );
+        assert_eq!(
+            first_inner[0]["command"].as_str(),
+            Some(r"C:\bin\third-party.exe")
+        );
+        assert_eq!(
+            entries[1]["hooks"][0]["command"].as_str(),
+            Some(r"C:\bin\other.exe")
         );
     }
 
