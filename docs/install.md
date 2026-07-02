@@ -708,6 +708,18 @@ This path is friction-free when:
 - You don't need to run a local ai-memory server (you're a client of
   a homelab/remote ai-memory)
 
+### Hook command paths across a container boundary
+
+`install-hooks --apply` stages the hook scripts into the data dir and
+writes their absolute paths into the agent's config. When the CLI runs
+inside a container but the agent runs on the host, those staged paths
+would be container paths the host can't see. Set
+`AI_MEMORY_HOOKS_HOST_ROOT` to the *host* directory that the staged
+`hooks/` tree is mounted from and the rendered config uses
+`<host-root>/<agent>/…` command paths instead. The bundled docker
+wrappers (`bin/ai-memory`, `bin/ai-memory.ps1`) forward this variable
+automatically; you only set it by hand for custom container setups.
+
 ---
 
 ## Running ai-memory without docker

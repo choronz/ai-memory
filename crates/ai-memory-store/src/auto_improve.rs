@@ -1,4 +1,26 @@
-#![allow(missing_docs)]
+//! SQLite persistence for the auto-improvement loop.
+//!
+//! The consolidate crate reviews a finished session and produces *proposals*
+//! (create/update a wiki page). This module stores those proposals with a
+//! full audit trail so an operator can approve, reject, or fail them later:
+//!
+//! - `auto_improve_runs` — one row per review pass, with provider/model,
+//!   warnings, and the rejected-candidate list for telemetry.
+//! - `auto_improve_proposals` — staged page edits plus a snapshot of the
+//!   target page at stage time (`*_at_stage` columns). Approval re-checks
+//!   that snapshot and returns [`ApproveAutoImproveProposalResult::Conflict`]
+//!   instead of clobbering a page that changed since staging.
+//! - `auto_improve_proposal_events` — append-only status history per
+//!   proposal (`staged` / `approved` / `rejected` / `failed` / `conflict`).
+//! - `auto_improve_rejections` — normalized rejection records with a
+//!   whitespace/case-insensitive fingerprint so the telemetry report can
+//!   spot the same proposal being re-staged and re-rejected.
+//! - `auto_improve_scheduler_state` / `_claims` — the session-end scheduler
+//!   watermark and per-session claims that make the background reviewer
+//!   idempotent across restarts.
+//!
+//! All mutations run inside a transaction on the caller's connection; the
+//! writer actor owns that connection, so the single-writer invariant holds.
 
 use std::str::FromStr;
 
@@ -15,17 +37,25 @@ use uuid::Uuid;
 use crate::error::{StoreError, StoreResult};
 use crate::ops;
 
+/// Lifecycle status of a staged proposal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AutoImproveProposalStatus {
+    /// Staged and awaiting an operator decision.
     Pending,
+    /// Approved and applied — `applied_page_id` points at the written page.
     Approved,
+    /// Rejected by an operator with a reason.
     Rejected,
+    /// Approval was attempted but the target page changed since staging.
     Conflict,
+    /// Application failed after approval (e.g. the page write errored).
     Failed,
 }
 
 impl AutoImproveProposalStatus {
+    /// Snake-case string stored in the `status` column.
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
@@ -53,14 +83,19 @@ impl FromStr for AutoImproveProposalStatus {
     }
 }
 
+/// What a proposal wants to do to its target page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AutoImproveProposalOperation {
+    /// Create a page that must not exist yet at stage time.
     Create,
+    /// Rewrite a page that must already exist at stage time.
     Update,
 }
 
 impl AutoImproveProposalOperation {
+    /// Snake-case string stored in the `operation` column.
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Create => "create",
@@ -82,109 +117,201 @@ impl FromStr for AutoImproveProposalOperation {
     }
 }
 
+/// One review pass to persist: run metadata plus its staged proposals.
 #[derive(Debug, Clone)]
 pub struct StageAutoImproveRun {
+    /// Owning workspace.
     pub workspace_id: WorkspaceId,
+    /// Owning project.
     pub project_id: ProjectId,
+    /// Session the review covered, when session-scoped. Must belong to the
+    /// same workspace/project or staging fails.
     pub session_id: Option<SessionId>,
+    /// LLM provider name used for the review, for telemetry.
     pub provider: Option<String>,
+    /// LLM model id used for the review, for telemetry.
     pub model: Option<String>,
+    /// Reviewer's one-paragraph run summary.
     pub summary: Option<String>,
+    /// Reviewer warnings (JSON array) surfaced in reports.
     pub warnings_json: serde_json::Value,
+    /// Candidates the reviewer itself rejected (JSON array); each entry with
+    /// a non-empty `reason` also lands in `auto_improve_rejections`.
     pub rejected_candidates_json: serde_json::Value,
+    /// Effective review config snapshot for reproducibility.
     pub config_json: serde_json::Value,
+    /// Actor attribution recorded on the run and its `staged` events.
     pub proposal_actor: ActorContext,
+    /// Page edits to stage as pending proposals.
     pub proposals: Vec<NewAutoImproveProposal>,
 }
 
+/// One page edit to stage, before it gets an id or a status.
 #[derive(Debug, Clone)]
 pub struct NewAutoImproveProposal {
+    /// Create a new page or update an existing one.
     pub operation: AutoImproveProposalOperation,
+    /// Wiki path of the page this proposal targets.
     pub target_path: PagePath,
+    /// Proposal category (e.g. `learning`, maintenance kinds) for telemetry.
     pub kind: String,
+    /// Human-readable proposal title.
     pub title: String,
+    /// Reviewer confidence in `0.0..=1.0`.
     pub confidence: f64,
+    /// Why the reviewer proposes this edit.
     pub rationale: String,
+    /// Supporting evidence (JSON) shown to the deciding operator.
     pub evidence_json: serde_json::Value,
+    /// Full proposed page body (also the materialized result for patches).
     pub body_markdown: String,
+    /// SHA-256 of the staged `_pending/` artifact file, when one was written.
     pub artifact_sha256: Option<[u8; 32]>,
+    /// `full_page` (default when `None`) or `patch`.
     pub edit_mode: Option<String>,
+    /// Patch operations (JSON) — required when `edit_mode == "patch"`.
     pub patch_json: Option<serde_json::Value>,
+    /// SHA-256 of the base body the patch was materialized against —
+    /// required for patches; staging fails if the live target differs.
     pub expected_base_body_sha256: Option<[u8; 32]>,
 }
 
+/// Ids assigned by [`stage_run`].
 #[derive(Debug, Clone, Serialize)]
 pub struct StagedAutoImproveRun {
+    /// Id of the recorded run row.
     pub run_id: AutoImproveRunId,
+    /// Ids of the staged proposals, in input order.
     pub proposal_ids: Vec<AutoImproveProposalId>,
 }
 
+/// List-view projection of a proposal (no bodies or event history).
 #[derive(Debug, Clone, Serialize)]
 pub struct AutoImproveProposalSummary {
+    /// Proposal id.
     pub id: AutoImproveProposalId,
+    /// Run that staged the proposal.
     pub run_id: AutoImproveRunId,
+    /// Owning workspace.
     pub workspace_id: WorkspaceId,
+    /// Owning project.
     pub project_id: ProjectId,
+    /// Current lifecycle status.
     pub status: AutoImproveProposalStatus,
+    /// Create vs update.
     pub operation: AutoImproveProposalOperation,
+    /// Wiki path of the targeted page.
     pub target_path: PagePath,
+    /// Proposal category for telemetry.
     pub kind: String,
+    /// Human-readable proposal title.
     pub title: String,
+    /// Reviewer confidence in `0.0..=1.0`.
     pub confidence: f64,
+    /// Stage time (Unix microseconds).
     pub staged_at: i64,
+    /// Decision time (Unix microseconds), once decided.
     pub decided_at: Option<i64>,
 }
 
+/// Full proposal record: summary plus bodies, stage-time target snapshot,
+/// decision attribution, and the append-only event history.
 #[derive(Debug, Clone, Serialize)]
 pub struct AutoImproveProposalDetail {
+    /// The list-view fields.
     pub summary: AutoImproveProposalSummary,
+    /// Why the reviewer proposed this edit.
     pub rationale: String,
+    /// Supporting evidence (JSON) shown to the deciding operator.
     pub evidence_json: serde_json::Value,
+    /// Full proposed page body.
     pub body_markdown: String,
+    /// SHA-256 of `body_markdown`, computed at stage time.
     pub body_sha256: [u8; 32],
+    /// `_pending/auto-improve/<id>.md` artifact path for this proposal.
     pub artifact_path: String,
+    /// SHA-256 of the staged artifact file, when one was written.
     pub artifact_sha256: Option<[u8; 32]>,
+    /// Latest page id of the target at stage time (`None` for creates).
     pub target_latest_page_id_at_stage: Option<PageId>,
+    /// Target body hash at stage time — approval compares against this to
+    /// detect a page that changed after staging.
     pub target_body_sha256_at_stage: Option<[u8; 32]>,
+    /// Target `updated_at` at stage time (Unix microseconds).
     pub target_updated_at_at_stage: Option<i64>,
+    /// Operator-supplied reason for a reject/fail/conflict decision.
     pub decision_reason: Option<String>,
+    /// Deciding user, when the decision came from an identified account.
     pub decided_by_author_id: Option<UserId>,
+    /// Full actor context (JSON) recorded at decision time.
     pub decided_by_actor_json: Option<serde_json::Value>,
+    /// Page written by an approval.
     pub applied_page_id: Option<PageId>,
+    /// Wiki git checkpoint recorded alongside an approval, when available.
     pub checkpoint: Option<String>,
+    /// `full_page` or `patch`.
     pub edit_mode: String,
+    /// Patch operations (JSON) for `patch` proposals.
     pub patch_json: Option<serde_json::Value>,
+    /// Base body hash the patch was generated against.
     pub expected_base_body_sha256: Option<[u8; 32]>,
+    /// Base body hash the staged `body_markdown` was materialized from.
     pub materialized_base_body_sha256: Option<[u8; 32]>,
+    /// Status history, oldest first.
     pub events: Vec<AutoImproveProposalEvent>,
 }
 
+/// One append-only status-history entry for a proposal.
 #[derive(Debug, Clone, Serialize)]
 pub struct AutoImproveProposalEvent {
+    /// Autoincrement row id (orders events).
     pub id: i64,
+    /// Proposal this event belongs to.
     pub proposal_id: AutoImproveProposalId,
+    /// Event name: `staged`, `approved`, `rejected`, `failed`, or `conflict`.
     pub event: String,
+    /// Actor context (JSON) that caused the event.
     pub actor_json: serde_json::Value,
+    /// Acting user, when identified.
     pub author_id: Option<UserId>,
+    /// Event-specific payload (e.g. `reason`, `applied_page_id`).
     pub detail_json: serde_json::Value,
+    /// Event time (Unix microseconds).
     pub at: i64,
 }
 
+/// Normalized rejection record used by the telemetry report to spot the
+/// same proposal being re-staged and re-rejected.
 #[derive(Debug, Clone, Serialize)]
 pub struct AutoImproveRejectionSummary {
+    /// Rejection row id (UUID string).
     pub id: String,
+    /// Owning workspace.
     pub workspace_id: WorkspaceId,
+    /// Owning project.
     pub project_id: ProjectId,
+    /// Targeted wiki path, when the rejected candidate named one.
     pub target_path: Option<String>,
+    /// Proposal category, when known.
     pub kind: Option<String>,
+    /// Create vs update, when known.
     pub operation: Option<String>,
+    /// `full_page` / `patch`, when known.
     pub edit_mode: Option<String>,
+    /// Why the candidate/proposal was rejected.
     pub reason: String,
+    /// Whitespace/case-insensitive SHA-256 over the identifying fields —
+    /// equal fingerprints mean "the same rejection happened again".
     pub normalized_fingerprint: String,
+    /// One-line description (title, summary, or the reason itself).
     pub summary: String,
+    /// Original candidate/evidence payload (JSON).
     pub evidence_json: serde_json::Value,
+    /// Run the rejection came from, when known.
     pub source_run_id: Option<AutoImproveRunId>,
+    /// Proposal the rejection came from (`None` for reviewer-side rejects).
     pub source_proposal_id: Option<AutoImproveProposalId>,
+    /// Record time (Unix microseconds).
     pub created_at: i64,
 }
 
@@ -224,47 +351,86 @@ pub struct AutoImproveTelemetryCount {
     pub count: usize,
 }
 
+/// Reject a pending proposal with a reason.
 #[derive(Debug, Clone)]
 pub struct RejectAutoImproveProposal {
+    /// Owning workspace (scope check).
     pub workspace_id: WorkspaceId,
+    /// Owning project (scope check).
     pub project_id: ProjectId,
+    /// Proposal to reject; must currently be pending.
     pub proposal_id: AutoImproveProposalId,
+    /// Operator-supplied rejection reason.
     pub reason: String,
+    /// Actor attribution for the decision event.
     pub actor: ActorContext,
+    /// Deciding user, when identified.
     pub author_id: Option<UserId>,
 }
 
+/// Mark a pending proposal failed (its application errored).
 #[derive(Debug, Clone)]
 pub struct FailAutoImproveProposal {
+    /// Owning workspace (scope check).
     pub workspace_id: WorkspaceId,
+    /// Owning project (scope check).
     pub project_id: ProjectId,
+    /// Proposal to fail; must currently be pending.
     pub proposal_id: AutoImproveProposalId,
+    /// What went wrong.
     pub reason: String,
+    /// Actor attribution for the decision event.
     pub actor: ActorContext,
+    /// Deciding user, when identified.
     pub author_id: Option<UserId>,
 }
 
+/// Approve a pending proposal and apply its page in the same transaction.
 #[derive(Debug, Clone)]
 pub struct ApproveAutoImproveProposal {
+    /// Owning workspace (scope check).
     pub workspace_id: WorkspaceId,
+    /// Owning project (scope check).
     pub project_id: ProjectId,
+    /// Proposal to approve; must currently be pending.
     pub proposal_id: AutoImproveProposalId,
+    /// Page to write on approval. Its scope, author, and path must match the
+    /// proposal or approval fails before touching anything.
     pub page: NewPage,
+    /// Actor attribution for the decision event.
     pub actor: ActorContext,
+    /// Deciding user, when identified.
     pub author_id: Option<UserId>,
+    /// Wiki git checkpoint to record alongside the approval.
     pub checkpoint: Option<String>,
 }
 
+/// Outcome of [`approve_proposal`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApproveAutoImproveProposalResult {
-    Approved { page_id: PageId },
+    /// The page was written and the proposal marked approved.
+    Approved {
+        /// Id of the written page version.
+        page_id: PageId,
+    },
+    /// The target changed since staging; the proposal was marked `conflict`
+    /// and nothing was written.
     Conflict,
 }
 
+/// `_pending/auto-improve/<id>.md` — where a staged proposal's body artifact
+/// lives in the wiki tree.
+#[must_use]
 pub fn artifact_path_for(proposal_id: AutoImproveProposalId) -> String {
     format!("_pending/auto-improve/{proposal_id}.md")
 }
 
+/// Ensure a scheduler-state row exists for the scope, seeding the watermark
+/// at the newest already-ended session so pre-existing history is not
+/// retroactively reviewed.
+///
+/// # Errors
+/// Returns an error when the underlying SQLite statements fail.
 pub fn ensure_scheduler_state(
     conn: &mut Connection,
     workspace_id: WorkspaceId,
@@ -292,6 +458,13 @@ pub fn ensure_scheduler_state(
     Ok(())
 }
 
+/// Atomically claim one ended session for background review. Returns `true`
+/// only for the first claimer: the insert requires the session to be past
+/// the scope's watermark and not already covered by a run, so concurrent
+/// schedulers and restarts cannot double-review a session.
+///
+/// # Errors
+/// Returns an error when the underlying SQLite statements fail.
 pub fn claim_scheduler_session(
     conn: &mut Connection,
     workspace_id: WorkspaceId,
@@ -342,6 +515,15 @@ pub fn claim_scheduler_session(
     Ok(inserted == 1)
 }
 
+/// Persist one review run and stage its proposals as `pending`, all in one
+/// transaction. Validates per-proposal preconditions (create targets must
+/// not exist, update/patch targets must exist and — for patches — still
+/// match the expected base hash) and snapshots the target page so approval
+/// can detect later drift.
+///
+/// # Errors
+/// Returns [`StoreError::InvalidState`] when a precondition fails, or an
+/// SQLite error when a statement fails; either way nothing is committed.
 pub fn stage_run(
     conn: &mut Connection,
     input: &StageAutoImproveRun,
@@ -517,6 +699,12 @@ pub fn stage_run(
     })
 }
 
+/// Mark a pending proposal `failed`, record the rejection fingerprint, and
+/// append a `failed` event.
+///
+/// # Errors
+/// Returns [`StoreError::InvalidState`] when the proposal is not pending in
+/// the given scope, or an SQLite error when a statement fails.
 pub fn fail_proposal(conn: &mut Connection, input: &FailAutoImproveProposal) -> StoreResult<()> {
     let now = Timestamp::now().as_microsecond();
     let actor_json = serde_json::to_string(&input.actor)?;
@@ -555,6 +743,12 @@ pub fn fail_proposal(conn: &mut Connection, input: &FailAutoImproveProposal) -> 
     Ok(())
 }
 
+/// Mark a pending proposal `rejected`, record the rejection fingerprint, and
+/// append a `rejected` event.
+///
+/// # Errors
+/// Returns [`StoreError::InvalidState`] when the proposal is not pending in
+/// the given scope, or an SQLite error when a statement fails.
 pub fn reject_proposal(
     conn: &mut Connection,
     input: &RejectAutoImproveProposal,
@@ -596,6 +790,15 @@ pub fn reject_proposal(
     Ok(())
 }
 
+/// Approve a pending proposal: re-check the stage-time target snapshot and,
+/// when it still matches, write the page and mark the proposal `approved`
+/// in the same transaction. A drifted target marks the proposal `conflict`
+/// instead and writes nothing.
+///
+/// # Errors
+/// Returns [`StoreError::InvalidState`] when the approval page's scope,
+/// author, or path disagrees with the proposal, or when the proposal is not
+/// pending in the given scope; or an SQLite error when a statement fails.
 pub fn approve_proposal(
     conn: &mut Connection,
     input: &ApproveAutoImproveProposal,

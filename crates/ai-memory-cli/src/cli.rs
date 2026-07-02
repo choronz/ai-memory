@@ -820,6 +820,42 @@ pub enum AgentChoice {
     Grok,
 }
 
+impl AgentChoice {
+    /// The core [`AgentKind`] this CLI choice selects — the single mapping
+    /// point between the clap surface and the domain enum. Wire strings,
+    /// hook-bundle directory names, and session attribution all derive from
+    /// the returned kind's `as_str()`; adding an agent means extending this
+    /// match once instead of hunting per-command copies.
+    #[must_use]
+    pub const fn kind(self) -> ai_memory_core::AgentKind {
+        use ai_memory_core::AgentKind;
+        match self {
+            Self::ClaudeCode => AgentKind::ClaudeCode,
+            Self::Codex => AgentKind::Codex,
+            Self::Cursor => AgentKind::Cursor,
+            Self::GeminiCli => AgentKind::GeminiCli,
+            Self::OpenCode => AgentKind::OpenCode,
+            Self::Pi => AgentKind::Pi,
+            Self::Omp => AgentKind::Omp,
+            Self::Openclaw => AgentKind::OpenClaw,
+            Self::AntigravityCli => AgentKind::AntigravityCli,
+            Self::Grok => AgentKind::Grok,
+        }
+    }
+
+    /// `hooks/<subdir>` bundle name for agents that install script hooks.
+    /// `None` for agents wired through a generated integration (plugin /
+    /// extension) instead of a script directory. The subdir equals the
+    /// kind's wire string for every script agent.
+    #[must_use]
+    pub const fn script_hook_subdir(self) -> Option<&'static str> {
+        match self {
+            Self::OpenCode | Self::Pi | Self::Omp | Self::Openclaw => None,
+            _ => Some(self.kind().as_str()),
+        }
+    }
+}
+
 /// Arguments for `finalize-session`.
 #[derive(Debug, Args)]
 pub struct FinalizeSessionArgs {

@@ -47,6 +47,26 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-targets
 
+  # The companion importer is deliberately outside the root workspace
+  # (its own [workspace] in companions/ai-memory-importer/Cargo.toml), so
+  # none of the jobs above compile it. Gate it here with the same
+  # fmt/clippy/test trio docs/companion-crates.md prescribes, or a
+  # toolchain bump / convention change rots it silently.
+  companions:
+    name: companions (ai-memory-importer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: companions/ai-memory-importer
+      - run: cargo fmt --check --manifest-path companions/ai-memory-importer/Cargo.toml
+      - run: cargo clippy --manifest-path companions/ai-memory-importer/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --manifest-path companions/ai-memory-importer/Cargo.toml
+
   # Build the release binary on its own so a release-only failure
   # (LTO crash, codegen issue, dead-code-with-debug-assertions) doesn't
   # ship to Docker Hub silently.

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The detached drainer's `logs/hook-drain.log` now rotates once it exceeds
+  1 MiB (previous contents move to `hook-drain.log.old`), so an agent
+  pointed at a chronically unreachable server can no longer grow the log
+  without bound.
+
+### Changed
+- Post-audit cleanup, no behavior change: the `AI_MEMORY_HOOK_PLATFORM`
+  override is parsed in one place instead of three copies, the CLI
+  `AgentChoice` → domain `AgentKind` mapping is a single `kind()` method
+  instead of three per-command match blocks, the companion importer crate
+  is now gated in CI (fmt/clippy/test), and
+  `crates/ai-memory-store/src/auto_improve.rs` is fully documented (its
+  file-wide `missing_docs` allowance is gone). `AI_MEMORY_HOOKS_HOST_ROOT`
+  is now documented in `docs/install.md`.
+
 ## [1.7.1] - 2026-07-02
 
 ### Fixed

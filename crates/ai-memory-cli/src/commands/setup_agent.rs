@@ -66,16 +66,8 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
         emit_extension_setup_hint(&args)?;
         return Ok(());
     }
-    let agent_sub = match args.agent {
-        AgentChoice::ClaudeCode => "claude-code",
-        AgentChoice::Codex => "codex",
-        AgentChoice::Cursor => "cursor",
-        AgentChoice::GeminiCli => "gemini-cli",
-        AgentChoice::AntigravityCli => "antigravity-cli",
-        AgentChoice::Grok => "grok",
-        AgentChoice::OpenCode | AgentChoice::Pi | AgentChoice::Omp | AgentChoice::Openclaw => {
-            bail!("internal: generated integration should have returned before staging hooks")
-        }
+    let Some(agent_sub) = args.agent.script_hook_subdir() else {
+        bail!("internal: generated integration should have returned before staging hooks")
     };
 
     let source = resolve_source(args.source.as_deref(), agent_sub)?;

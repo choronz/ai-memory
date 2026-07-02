@@ -5,7 +5,7 @@ use ai_memory_store::{DB_FILENAME, OpenSession, ReaderPool};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::cli::{AgentChoice, FinalizeSessionArgs};
+use crate::cli::FinalizeSessionArgs;
 use crate::config::Config;
 use crate::http_client::ServerEndpoint;
 
@@ -40,7 +40,7 @@ struct FinalizeSessionReport {
 /// Returns an error if the local store cannot be read or the configured server
 /// rejects a synthetic `session-end` hook.
 pub async fn run(config: &Config, args: FinalizeSessionArgs) -> Result<()> {
-    let agent = agent_choice_to_kind(args.agent);
+    let agent = args.agent.kind();
     let project = super::resolve_project_name(config, args.project.as_deref())?;
     let db_path = config.data_dir.join("db").join(DB_FILENAME);
     if !db_path.exists() {
@@ -190,21 +190,6 @@ fn effective_cwd(config: &Config) -> Result<String> {
         .context("getting CWD for synthetic session-end")?
         .to_string_lossy()
         .into_owned())
-}
-
-fn agent_choice_to_kind(choice: AgentChoice) -> AgentKind {
-    match choice {
-        AgentChoice::ClaudeCode => AgentKind::ClaudeCode,
-        AgentChoice::Codex => AgentKind::Codex,
-        AgentChoice::OpenCode => AgentKind::OpenCode,
-        AgentChoice::Cursor => AgentKind::Cursor,
-        AgentChoice::GeminiCli => AgentKind::GeminiCli,
-        AgentChoice::Openclaw => AgentKind::OpenClaw,
-        AgentChoice::AntigravityCli => AgentKind::AntigravityCli,
-        AgentChoice::Omp => AgentKind::Omp,
-        AgentChoice::Pi => AgentKind::Pi,
-        AgentChoice::Grok => AgentKind::Grok,
-    }
 }
 
 #[cfg(test)]

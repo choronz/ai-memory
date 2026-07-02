@@ -6,6 +6,27 @@ use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+/// Rotate `hook-drain.log` once it grows past this. The log only receives
+/// drainer warnings, but a chronically unreachable server emits one on every
+/// session boundary forever — without a cap the append-only file grows
+/// unbounded. One rotation generation (`.old`) keeps the recent history.
+const MAX_DRAIN_LOG_BYTES: u64 = 1024 * 1024;
+
+/// Rename an oversized log to `<name>.old` (replacing any previous `.old`)
+/// so the next append starts a fresh file. Best-effort: a failed rotation
+/// must never block spawning the drainer.
+fn rotate_oversized_log(log: &Path, max_bytes: u64) {
+    let Ok(meta) = std::fs::metadata(log) else {
+        return;
+    };
+    if meta.len() <= max_bytes {
+        return;
+    }
+    let mut old = log.as_os_str().to_os_string();
+    old.push(".old");
+    let _ = std::fs::rename(log, PathBuf::from(old));
+}
+
 /// Unit-testable description of the hidden drainer command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrainCommandSpec {
@@ -79,6 +100,7 @@ fn spawn_spec(spec: &DrainCommandSpec) -> io::Result<()> {
     if let Some(parent) = spec.stderr_log.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    rotate_oversized_log(&spec.stderr_log, MAX_DRAIN_LOG_BYTES);
     let config = spawn_config(spec, true);
     let stderr = OpenOptions::new()
         .create(true)
@@ -227,6 +249,33 @@ mod tests {
             spec.stderr_log,
             tmp.path().join("logs").join("hook-drain.log")
         );
+    }
+
+    #[test]
+    fn rotate_oversized_log_rotates_once_over_cap_and_keeps_small_logs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("hook-drain.log");
+        let old = tmp.path().join("hook-drain.log.old");
+
+        // Under the cap: untouched.
+        std::fs::write(&log, b"small").unwrap();
+        rotate_oversized_log(&log, 16);
+        assert!(log.exists());
+        assert!(!old.exists());
+
+        // Over the cap: current becomes .old, next append starts fresh.
+        std::fs::write(&log, vec![b'x'; 32]).unwrap();
+        rotate_oversized_log(&log, 16);
+        assert!(!log.exists());
+        assert_eq!(std::fs::metadata(&old).unwrap().len(), 32);
+
+        // A second rotation replaces the previous .old rather than failing.
+        std::fs::write(&log, vec![b'y'; 32]).unwrap();
+        rotate_oversized_log(&log, 16);
+        assert_eq!(std::fs::read(&old).unwrap(), vec![b'y'; 32]);
+
+        // Missing file: no-op, no panic.
+        rotate_oversized_log(&log, 16);
     }
 
     #[test]

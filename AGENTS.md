@@ -178,20 +178,15 @@ durable retrieval follows the Karpathy-style LLM Wiki pattern.
   document it in docs/design notes rather than shipping unreachable stubs.
 - Document constraints and incidents, not line-by-line mechanics.
 - Add focused regression tests for bug fixes and behavior changes.
-- MCP tool surface changes must update `MEMORY_INSTRUCTIONS`,
-  `ai_memory_core::SNIPPET_BODY`, README/docs tool references, and regression
-  tests that assert every tool appears in both prompt surfaces.
-- Any change affecting user-visible behavior, installation, supported agents,
-  providers, deployment, env/config, or public tool/admin surfaces must update
-  `CHANGELOG.md` and relevant docs in the same change.
 
 ## Project Maintenance Rules
 
 - Keep `CLAUDE.md` as a pointer to `AGENTS.md`; this avoids split-brain
   instructions between Claude Code and AGENTS-aware harnesses.
-- When a change affects user-visible behavior, installation, supported
-  platforms, supported agents, providers, or deployment, update
-  `CHANGELOG.md` and the README/docs support references in the same commit.
+- Any change affecting user-visible behavior, installation, supported
+  platforms, supported agents, providers, deployment, env/config, or public
+  tool/admin surfaces must update `CHANGELOG.md` and the relevant README/docs
+  references in the same commit.
 - Do not bump crate/package versions, minor versions, or cut release tags
   automatically. Ask the user before any version bump or release tag; prefer no
   version change unless the user explicitly approves it.

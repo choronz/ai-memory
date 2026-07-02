@@ -493,55 +493,55 @@ impl<'a> HookCommandContext<'a> {
 }
 
 impl HookCommandPlatform {
-    fn current() -> Self {
-        match std::env::var("AI_MEMORY_HOOK_PLATFORM") {
-            Ok(v) if v.eq_ignore_ascii_case("windows") => Self::Windows,
-            Ok(v) if v.eq_ignore_ascii_case("posix") || v.eq_ignore_ascii_case("unix") => {
-                Self::Posix
+    /// Parse an explicit `AI_MEMORY_HOOK_PLATFORM` override. `None` when the
+    /// var is unset or names no known platform — callers then apply their own
+    /// per-render-path default. One parser so a new platform value can't be
+    /// recognised by one render path and silently ignored by another.
+    fn from_env_override() -> Option<Self> {
+        let v = std::env::var("AI_MEMORY_HOOK_PLATFORM").ok()?;
+        match v {
+            v if v.eq_ignore_ascii_case("windows") => Some(Self::Windows),
+            v if v.eq_ignore_ascii_case("posix") || v.eq_ignore_ascii_case("unix") => {
+                Some(Self::Posix)
             }
-            Ok(v) if v.eq_ignore_ascii_case("windows-bash") => Self::WindowsBash,
-            Ok(v) if v.eq_ignore_ascii_case("windows-native") => Self::WindowsNative,
-            Ok(v) if v.eq_ignore_ascii_case("posix-native") => Self::PosixNative,
-            _ if cfg!(windows) => Self::Windows,
-            _ => Self::Posix,
+            v if v.eq_ignore_ascii_case("windows-bash") => Some(Self::WindowsBash),
+            v if v.eq_ignore_ascii_case("windows-native") => Some(Self::WindowsNative),
+            v if v.eq_ignore_ascii_case("posix-native") => Some(Self::PosixNative),
+            _ => None,
         }
     }
 
+    fn current() -> Self {
+        Self::from_env_override().unwrap_or(if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::Posix
+        })
+    }
+
     /// Platform for agents known to use bash as their hook runner on
-    /// Windows (currently Claude Code). Returns `WindowsBash` on
+    /// Windows (currently Claude Code). Returns `WindowsNative` on
     /// Windows unless overridden by `AI_MEMORY_HOOK_PLATFORM`.
     fn for_bash_runner() -> Self {
-        match std::env::var("AI_MEMORY_HOOK_PLATFORM") {
-            Ok(v) if v.eq_ignore_ascii_case("windows") => Self::Windows,
-            Ok(v) if v.eq_ignore_ascii_case("posix") || v.eq_ignore_ascii_case("unix") => {
-                Self::Posix
-            }
-            Ok(v) if v.eq_ignore_ascii_case("windows-bash") => Self::WindowsBash,
-            Ok(v) if v.eq_ignore_ascii_case("windows-native") => Self::WindowsNative,
-            Ok(v) if v.eq_ignore_ascii_case("posix-native") => Self::PosixNative,
-            _ if cfg!(windows) => Self::WindowsNative,
-            // Native macOS / Linux defaults to the binary hook command (spool +
-            // OIDC), same as Windows. The Docker wrapper forces `posix` so its
-            // host-rendered config keeps using the `.sh` scripts.
-            _ => Self::PosixNative,
-        }
+        // Native macOS / Linux defaults to the binary hook command (spool +
+        // OIDC), same as Windows. The Docker wrapper forces `posix` so its
+        // host-rendered config keeps using the `.sh` scripts.
+        Self::from_env_override().unwrap_or(if cfg!(windows) {
+            Self::WindowsNative
+        } else {
+            Self::PosixNative
+        })
     }
 
     /// Script fallback for setup-agent / docker-host snippets. Respects an
     /// explicit override, but defaults to the shell command because setup-agent
     /// copies scripts, not a host-local native binary.
     fn for_bash_script_runner() -> Self {
-        match std::env::var("AI_MEMORY_HOOK_PLATFORM") {
-            Ok(v) if v.eq_ignore_ascii_case("windows") => Self::Windows,
-            Ok(v) if v.eq_ignore_ascii_case("posix") || v.eq_ignore_ascii_case("unix") => {
-                Self::Posix
-            }
-            Ok(v) if v.eq_ignore_ascii_case("windows-bash") => Self::WindowsBash,
-            Ok(v) if v.eq_ignore_ascii_case("windows-native") => Self::WindowsNative,
-            Ok(v) if v.eq_ignore_ascii_case("posix-native") => Self::PosixNative,
-            _ if cfg!(windows) => Self::WindowsBash,
-            _ => Self::Posix,
-        }
+        Self::from_env_override().unwrap_or(if cfg!(windows) {
+            Self::WindowsBash
+        } else {
+            Self::Posix
+        })
     }
 }
 

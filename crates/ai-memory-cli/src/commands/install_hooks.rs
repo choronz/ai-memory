@@ -2283,16 +2283,8 @@ fn is_hook_script_file(path: &Path) -> bool {
 }
 
 fn resolve_hooks_dir(explicit: Option<&Path>, agent: AgentChoice) -> Result<PathBuf> {
-    let sub = match agent {
-        AgentChoice::ClaudeCode => "claude-code",
-        AgentChoice::Codex => "codex",
-        AgentChoice::Cursor => "cursor",
-        AgentChoice::GeminiCli => "gemini-cli",
-        AgentChoice::AntigravityCli => "antigravity-cli",
-        AgentChoice::Grok => "grok",
-        AgentChoice::OpenCode | AgentChoice::Pi | AgentChoice::Omp | AgentChoice::Openclaw => {
-            anyhow::bail!("{agent:?} uses a generated integration, not a hook script directory")
-        }
+    let Some(sub) = agent.script_hook_subdir() else {
+        anyhow::bail!("{agent:?} uses a generated integration, not a hook script directory")
     };
     if let Some(p) = explicit {
         let path = p.join(sub);
