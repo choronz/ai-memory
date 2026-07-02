@@ -201,19 +201,19 @@ pub struct DrainLock {
     _file: File,
 }
 
+/// Windows can report a contended fs2 byte-range lock as this native OS code
+/// instead of mapping it to `WouldBlock`.
+#[cfg(windows)]
+const ERROR_LOCK_VIOLATION: i32 = 33;
+
 fn is_drain_lock_busy_error(err: &std::io::Error) -> bool {
     if err.kind() == std::io::ErrorKind::WouldBlock {
         return true;
     }
 
     #[cfg(windows)]
-    {
-        // Windows can report a contended fs2 byte-range lock as the native
-        // ERROR_LOCK_VIOLATION code instead of mapping it to WouldBlock.
-        const ERROR_LOCK_VIOLATION: i32 = 33;
-        if err.raw_os_error() == Some(ERROR_LOCK_VIOLATION) {
-            return true;
-        }
+    if err.raw_os_error() == Some(ERROR_LOCK_VIOLATION) {
+        return true;
     }
 
     false
@@ -917,7 +917,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_lock_violation_error_is_lock_busy() {
-        const ERROR_LOCK_VIOLATION: i32 = 33;
         let err = std::io::Error::from_raw_os_error(ERROR_LOCK_VIOLATION);
         assert!(is_drain_lock_busy_error(&err));
     }
