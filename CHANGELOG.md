@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-07-07
+
 ### Added
 - Global preferences scope ([#154]): standing user/team context that
   should apply to every project — technology choices, code style,
@@ -1585,7 +1587,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.8.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.9.0...HEAD
+[1.9.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.9.0
 [1.8.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.8.0
 [1.7.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.7.1
 [1.7.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.7.0
