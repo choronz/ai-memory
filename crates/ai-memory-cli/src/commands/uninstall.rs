@@ -31,6 +31,9 @@ enum RewriteOp {
     HooksJson,
     /// Antigravity CLI named hook group under top-level `ai-memory`.
     AntigravityHooksJson,
+    /// Zero hooks.json — `hooks` array entries whose `id` carries the
+    /// `ai-memory-` prefix.
+    ZeroHooksJson,
     /// MCP JSON config for one client shape.
     McpJson(McpClient),
     /// Codex TOML MCP config.
@@ -157,6 +160,19 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
             );
         }
 
+        let zero = install_hooks::zero_hooks_path()?;
+        if zero.exists() {
+            let content = std::fs::read_to_string(&zero)
+                .with_context(|| format!("reading {}", zero.display()))?;
+            let removal = strip_zero_hooks(&content)?;
+            push_rewrite(
+                &mut plan,
+                zero,
+                removal.removed_events,
+                RewriteOp::ZeroHooksJson,
+            );
+        }
+
         let plugin = install_hooks::opencode_plugin_path()?;
         push_generated_delete(&mut plan, plugin, DeleteKind::OpenCodePlugin);
 
@@ -197,6 +213,7 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
             Openclaw,
             Omp,
             AntigravityCli,
+            Zero,
             VsCodeCopilot,
         ] {
             let Ok(path) = install_mcp::mcp_config_path(client) else {
@@ -333,6 +350,7 @@ fn apply_change(change: &PlannedChange, name: Option<&str>, url: &str) -> anyhow
                         RewriteOp::AntigravityHooksJson => {
                             strip_antigravity_hooks(&out)?.new_content
                         }
+                        RewriteOp::ZeroHooksJson => strip_zero_hooks(&out)?.new_content,
                         RewriteOp::McpJson(client) => strip_mcp_json(&out, client, name, url)?.0,
                         RewriteOp::McpToml => strip_mcp_toml(&out, name, url)?.0,
                     };
@@ -582,6 +600,35 @@ fn strip_ai_memory_hooks(content: &str) -> Result<HookRemoval> {
     })
 }
 
+/// Remove ai-memory's entries from Zero's hooks.json `hooks` array. Zero
+/// hook entries are objects with an `id`; install writes ours with the
+/// `ai-memory-` prefix (issue #156), so the prefix IS the ownership
+/// signature — third-party hooks in the same file keep their ids and
+/// survive untouched. The top-level `enabled` flag is left alone.
+fn strip_zero_hooks(content: &str) -> Result<HookRemoval> {
+    let mut removed_events = Vec::new();
+    let new_content = mutate_json(content, |root| {
+        let Some(hooks) = root.get_mut("hooks").and_then(|v| v.as_array_mut()) else {
+            return Ok(());
+        };
+        hooks.retain(|hook| {
+            let ours = hook
+                .get("id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|id| id.starts_with("ai-memory-"));
+            if ours && let Some(id) = hook.get("id").and_then(|v| v.as_str()) {
+                removed_events.push(id.to_string());
+            }
+            !ours
+        });
+        Ok(())
+    })?;
+    Ok(HookRemoval {
+        new_content,
+        removed_events,
+    })
+}
+
 /// Remove ai-memory's named Antigravity CLI hook group entries. The group
 /// name alone is not enough to prove ownership; every removed entry must still
 /// carry ai-memory's hook command signature.
@@ -688,7 +735,7 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         | McpClient::Omp
         | McpClient::AntigravityCli => Some(&["mcpServers"]),
         McpClient::OpenCode => Some(&["mcp"]),
-        McpClient::Openclaw => Some(&["mcp", "servers"]),
+        McpClient::Openclaw | McpClient::Zero => Some(&["mcp", "servers"]),
         McpClient::VsCodeCopilot => Some(&["servers"]),
         McpClient::Codex | McpClient::Pi => None,
     }
@@ -1032,6 +1079,34 @@ mod tests {
         let content = r#"{"unrelated":true}"#;
         let out = strip_ai_memory_hooks(content).unwrap();
         assert!(out.removed_events.is_empty());
+    }
+
+    // Issue #156: uninstall removes only ai-memory's entries from Zero's
+    // hooks.json, keyed by the id prefix, and leaves everything else alone.
+    #[test]
+    fn strip_zero_hooks_removes_only_prefixed_ids() {
+        let content = r#"{"enabled": true, "hooks": [
+            {"id": "my-custom-hook", "event": "beforeTool",
+             "command": "/usr/bin/true", "args": [], "enabled": true},
+            {"id": "ai-memory-session-start", "event": "sessionStart",
+             "command": "/usr/local/bin/ai-memory", "args": ["hook"], "enabled": true},
+            {"id": "ai-memory-post-tool-use", "event": "afterTool",
+             "command": "/usr/local/bin/ai-memory", "args": ["hook"], "enabled": true}
+        ]}"#;
+        let removal = strip_zero_hooks(content).unwrap();
+        assert_eq!(
+            removal.removed_events,
+            vec!["ai-memory-session-start", "ai-memory-post-tool-use"]
+        );
+        let root: serde_json::Value = serde_json::from_str(&removal.new_content).unwrap();
+        let hooks = root["hooks"].as_array().unwrap();
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0]["id"], serde_json::json!("my-custom-hook"));
+        assert_eq!(
+            root["enabled"],
+            serde_json::json!(true),
+            "the top-level enabled flag is not ours to touch"
+        );
     }
 
     #[test]

@@ -818,6 +818,13 @@ pub enum AgentChoice {
     /// capture works but handoff injection does not — recover the prior
     /// session's handoff via the MCP `memory_handoff_accept` tool.
     Grok,
+    /// Zero coding agent (Gitlawb/zero) — JSON-config lifecycle hooks in
+    /// `$XDG_CONFIG_HOME/zero/hooks.json` (exec-form `command` + `args`,
+    /// so ai-memory's native `hook` command runs with no shell). NOTE:
+    /// Zero discards `sessionStart` hook stdout, so capture works but
+    /// handoff injection does not — recover the prior session's handoff
+    /// via the MCP `memory_handoff_accept` tool.
+    Zero,
 }
 
 impl AgentChoice {
@@ -840,17 +847,19 @@ impl AgentChoice {
             Self::Openclaw => AgentKind::OpenClaw,
             Self::AntigravityCli => AgentKind::AntigravityCli,
             Self::Grok => AgentKind::Grok,
+            Self::Zero => AgentKind::Zero,
         }
     }
 
     /// `hooks/<subdir>` bundle name for agents that install script hooks.
     /// `None` for agents wired through a generated integration (plugin /
-    /// extension) instead of a script directory. The subdir equals the
-    /// kind's wire string for every script agent.
+    /// extension / exec-form native commands) instead of a script
+    /// directory. The subdir equals the kind's wire string for every
+    /// script agent.
     #[must_use]
     pub const fn script_hook_subdir(self) -> Option<&'static str> {
         match self {
-            Self::OpenCode | Self::Pi | Self::Omp | Self::Openclaw => None,
+            Self::OpenCode | Self::Pi | Self::Omp | Self::Openclaw | Self::Zero => None,
             _ => Some(self.kind().as_str()),
         }
     }
@@ -910,6 +919,9 @@ pub enum McpClient {
     /// Google Antigravity CLI (`agy`) — `~/.gemini/antigravity-cli/mcp_config.json`.
     #[value(alias = "antigravity", alias = "agy")]
     AntigravityCli,
+    /// Zero coding agent (Gitlawb/zero) — `~/.config/zero/config.json`,
+    /// `mcp.servers` map with native HTTP transport + bearer headers.
+    Zero,
     /// VS Code GitHub Copilot (agent mode) — per-workspace
     /// `.vscode/mcp.json`. Copilot's agent mode reads MCP servers
     /// from VS Code's own MCP framework (top-level `servers` key),

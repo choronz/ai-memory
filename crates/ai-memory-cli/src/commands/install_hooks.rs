@@ -83,6 +83,18 @@ pub(crate) fn grok_hooks_path() -> anyhow::Result<std::path::PathBuf> {
         .join("ai-memory.json"))
 }
 
+/// `~/.config/zero/hooks.json` — Zero's user-level lifecycle hook config
+/// (issue #156). Zero resolves it under `$XDG_CONFIG_HOME` falling back to
+/// `~/.config`; like the OpenCode plugin path below we target the default
+/// location and `--config-file` covers non-default XDG setups.
+pub(crate) fn zero_hooks_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(home_dir()
+        .context("could not locate $HOME for ~/.config/zero/hooks.json")?
+        .join(".config")
+        .join("zero")
+        .join("hooks.json"))
+}
+
 /// `~/.config/opencode/plugins/ai-memory.ts` — OpenCode's plugin file.
 pub(crate) fn opencode_plugin_path() -> anyhow::Result<std::path::PathBuf> {
     Ok(home_dir()
@@ -183,6 +195,7 @@ pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
                 let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
                 apply_to_grok_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)
             }
+            AgentChoice::Zero => apply_to_zero_hooks(&server_url, auth, &config.data_dir, &args),
             AgentChoice::Openclaw => openclaw_plugin::apply(&server_url, auth, &args),
         };
     }
@@ -243,6 +256,7 @@ pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
             let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
             render_grok(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
         }
+        AgentChoice::Zero => render_zero(&server_url, auth, &config.data_dir, strategy),
         AgentChoice::Openclaw => {
             openclaw_plugin::render(&server_url, auth, strategy);
             Ok(())
@@ -340,6 +354,7 @@ fn infer_installed_mcp_config(agent: AgentChoice) -> Option<InferredMcpConfig> {
             infer_json_mcp_config(&content, &["mcp", "servers", "ai-memory"], "url")
         }
         McpClient::Omp => infer_json_mcp_config(&content, &["mcpServers", "ai-memory"], "url"),
+        McpClient::Zero => infer_json_mcp_config(&content, &["mcp", "servers", "ai-memory"], "url"),
         McpClient::Pi => None,
         McpClient::AntigravityCli => {
             infer_json_mcp_config(&content, &["mcpServers", "ai-memory"], "serverUrl")
@@ -364,6 +379,7 @@ fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
         AgentChoice::Omp => Some(McpClient::Omp),
         AgentChoice::Openclaw => Some(McpClient::Openclaw),
         AgentChoice::AntigravityCli => Some(McpClient::AntigravityCli),
+        AgentChoice::Zero => Some(McpClient::Zero),
         // Grok manages its own MCP config under ~/.grok/; we don't
         // auto-infer a hook server URL from it.
         AgentChoice::Pi | AgentChoice::Grok => None,
@@ -2450,6 +2466,113 @@ fn render_grok(
     Ok(())
 }
 
+/// Merge ai-memory's lifecycle hooks into Zero's user-level
+/// `~/.config/zero/hooks.json` (issue #156). Zero executes hook entries
+/// directly (`command` + `args`, JSON payload on stdin) — no scripts to
+/// stage, no shell. Only entries whose `id` carries the `ai-memory-`
+/// prefix are replaced, so third-party hooks in the same file survive
+/// re-installs and version upgrades. The file-level `enabled` flag is
+/// preserved when the file already exists (a user who disabled hooks
+/// globally keeps that choice — we warn instead of overriding).
+fn apply_to_zero_hooks(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let path = match &args.config_file {
+        Some(p) => p.clone(),
+        None => zero_hooks_path()?,
+    };
+    let strategy = args.project_strategy.baked();
+    let payload = super::render_shared::build_zero_hooks_config(
+        server_url,
+        auth_token,
+        Some(data_dir),
+        strategy,
+    );
+    let our_hooks = payload
+        .get("hooks")
+        .and_then(|v| v.as_array())
+        .context("internal: build_zero_hooks_config didn't return a hooks array")?
+        .clone();
+    let mut hooks_disabled = false;
+    let outcome = apply_atomic(&path, |existing| {
+        mutate_json(existing, |root| {
+            hooks_disabled = root.get("enabled").and_then(|v| v.as_bool()) == Some(false);
+            if !root.contains_key("enabled") {
+                root.insert("enabled".into(), serde_json::Value::Bool(true));
+            }
+            let hooks = root
+                .entry("hooks")
+                .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+                .as_array_mut()
+                .context("`hooks` is present in hooks.json but not an array")?;
+            hooks.retain(|hook| {
+                !hook
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|id| id.starts_with("ai-memory-"))
+            });
+            hooks.extend(our_hooks.iter().cloned());
+            Ok(())
+        })
+    })?;
+    println!(
+        "✓ {} {} ({})",
+        outcome.verb(),
+        path.display(),
+        match outcome {
+            ApplyOutcome::Created => "new file",
+            ApplyOutcome::Updated => "backup written next to it",
+            ApplyOutcome::NoOp => "already up to date",
+        }
+    );
+    if hooks_disabled {
+        eprintln!(
+            "# warning: this hooks.json sets \"enabled\": false at the top level, \
+             so Zero will not run ANY hooks (including ai-memory's) until you \
+             re-enable them."
+        );
+    }
+    println!("# NOTE: Zero discards sessionStart hook stdout — capture works, but");
+    println!("#       handoff injection does not. Recover a prior session's handoff");
+    println!("#       via the MCP `memory_handoff_accept` tool.");
+    Ok(())
+}
+
+/// Print Zero's hooks.json to stdout (dry-run counterpart of
+/// [`apply_to_zero_hooks`]).
+fn render_zero(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    project_strategy: Option<&str>,
+) -> Result<()> {
+    let payload = super::render_shared::build_zero_hooks_config(
+        server_url,
+        auth_token,
+        Some(data_dir),
+        project_strategy,
+    );
+    let serialized =
+        serde_json::to_string_pretty(&payload).context("serializing zero hook config")?;
+    println!("# Zero hook config — merge into ~/.config/zero/hooks.json");
+    println!("# ($XDG_CONFIG_HOME/zero/hooks.json on non-default XDG setups), or");
+    println!("# re-run with --apply to merge it in place, preserving other hooks.");
+    println!("# AI-memory server URL: {server_url}");
+    if auth_token.is_some() {
+        println!("# Auth: token embedded in each hook's args below.");
+        println!("#       Treat hooks.json as sensitive (chmod 600).");
+    }
+    println!("# NOTE: Zero discards sessionStart hook stdout — capture works, but");
+    println!("#       handoff injection does not. Recover a prior session's handoff");
+    println!("#       via the MCP `memory_handoff_accept` tool.");
+    println!();
+    println!("{serialized}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2825,6 +2948,109 @@ mod tests {
 
         let resolved = resolve_hooks_dir(Some(tmp.path()), AgentChoice::Grok).unwrap();
         assert_eq!(resolved, tmp.path().join("grok"));
+    }
+
+    // Issue #156: Zero hook install writes exec-form entries into Zero's
+    // hooks.json shape and merges around third-party hooks by id prefix.
+    #[test]
+    fn zero_hooks_config_covers_all_events_in_exec_form() {
+        let payload = super::super::render_shared::build_zero_hooks_config(
+            "http://127.0.0.1:49374",
+            Some("tok-test"),
+            Some(Path::new("/data")),
+            Some("repo-root"),
+        );
+        assert_eq!(payload["enabled"], serde_json::json!(true));
+        let hooks = payload["hooks"].as_array().unwrap();
+        assert_eq!(hooks.len(), 6, "one entry per Zero lifecycle event");
+        let events: Vec<&str> = hooks.iter().map(|h| h["event"].as_str().unwrap()).collect();
+        for zero_event in [
+            "sessionStart",
+            "sessionEnd",
+            "beforeTool",
+            "afterTool",
+            "specialistStart",
+            "specialistStop",
+        ] {
+            assert!(events.contains(&zero_event), "missing {zero_event}");
+        }
+        for hook in hooks {
+            let id = hook["id"].as_str().unwrap();
+            assert!(id.starts_with("ai-memory-"), "ownership prefix: {id}");
+            assert!(hook["enabled"].as_bool().unwrap());
+            let args: Vec<&str> = hook["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a.as_str().unwrap())
+                .collect();
+            // Exec form: the native hook subcommand with agent + auth +
+            // strategy — never a shell string.
+            assert!(args.contains(&"hook"), "{args:?}");
+            assert!(
+                args.contains(&"--agent") && args.contains(&"zero"),
+                "{args:?}"
+            );
+            assert!(args.contains(&"--auth-token") && args.contains(&"tok-test"));
+            assert!(args.contains(&"--project-strategy") && args.contains(&"repo-root"));
+            assert!(args.contains(&"--data-dir") && args.contains(&"/data"));
+        }
+    }
+
+    #[test]
+    fn zero_apply_merges_around_third_party_hooks_and_preserves_disabled_flag() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("hooks.json");
+        fs::write(
+            &path,
+            r#"{"enabled": false, "hooks": [
+                {"id": "my-custom-hook", "event": "beforeTool",
+                 "command": "/usr/bin/true", "args": [], "enabled": true},
+                {"id": "ai-memory-session-start", "event": "sessionStart",
+                 "command": "/old/ai-memory", "args": [], "enabled": true}
+            ]}"#,
+        )
+        .unwrap();
+        let args = InstallHooksArgs {
+            agent: AgentChoice::Zero,
+            config_file: Some(path.clone()),
+            ..default_hook_args()
+        };
+
+        apply_to_zero_hooks("http://127.0.0.1:49374", None, Path::new("/data"), &args).unwrap();
+
+        let root: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            root["enabled"],
+            serde_json::json!(false),
+            "a user-disabled hooks file must stay disabled (we warn instead)"
+        );
+        let hooks = root["hooks"].as_array().unwrap();
+        assert!(
+            hooks
+                .iter()
+                .any(|h| h["id"] == serde_json::json!("my-custom-hook")),
+            "third-party hooks must survive the merge"
+        );
+        let ours: Vec<&serde_json::Value> = hooks
+            .iter()
+            .filter(|h| {
+                h["id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("ai-memory-"))
+            })
+            .collect();
+        assert_eq!(
+            ours.len(),
+            6,
+            "stale ai-memory entries replaced, not duplicated"
+        );
+        assert!(
+            ours.iter()
+                .all(|h| h["command"] != serde_json::json!("/old/ai-memory")),
+            "the stale command path must be replaced"
+        );
     }
 
     #[test]

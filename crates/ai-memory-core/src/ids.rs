@@ -198,6 +198,8 @@ pub enum AgentKind {
     Pi,
     /// xAI Grok Build CLI (`grok`).
     Grok,
+    /// Zero coding agent (Gitlawb/zero).
+    Zero,
     /// Anything else (manual capture, future agents).
     Other,
 }
@@ -218,6 +220,7 @@ impl AgentKind {
             Self::Omp => "omp",
             Self::Pi => "pi",
             Self::Grok => "grok",
+            Self::Zero => "zero",
             Self::Other => "other",
         }
     }
@@ -239,6 +242,7 @@ impl AgentKind {
             "pi" => Self::Pi,
             "omp" | "oh-my-pi" => Self::Omp,
             "grok" => Self::Grok,
+            "zero" => Self::Zero,
             _ => Self::Other,
         }
     }
@@ -248,7 +252,9 @@ impl AgentKind {
     /// `true` (Claude Code reads `hookSpecificOutput.additionalContext`).
     ///
     /// Grok ignores hook stdout on `SessionStart` (per Grok's hooks docs:
-    /// "For events like SessionStart or PostToolUse, stdout is ignored"), so
+    /// "For events like SessionStart or PostToolUse, stdout is ignored"), and
+    /// Zero's agent loop discards the sessionStart dispatch result entirely
+    /// (`internal/agent/loop.go` ignores `Dispatch`'s return there), so
     /// the native hook must NOT fetch the handoff for it: the fetch is
     /// **destructive** (the server marks the handoff accepted) and the result
     /// would be discarded — silently losing the handoff. For such agents the
@@ -258,7 +264,7 @@ impl AgentKind {
     /// should fail safe.
     #[must_use]
     pub fn session_start_injects_handoff(self) -> bool {
-        !matches!(self, Self::Grok | Self::Other)
+        !matches!(self, Self::Grok | Self::Zero | Self::Other)
     }
 }
 
@@ -302,6 +308,7 @@ mod tests {
         // Grok cannot inject the session-start handoff (ignores hook stdout);
         // every other agent can.
         assert!(!AgentKind::Grok.session_start_injects_handoff());
+        assert!(!AgentKind::Zero.session_start_injects_handoff());
         assert!(AgentKind::ClaudeCode.session_start_injects_handoff());
         assert!(AgentKind::Codex.session_start_injects_handoff());
         assert!(!AgentKind::Other.session_start_injects_handoff());

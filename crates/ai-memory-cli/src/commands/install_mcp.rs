@@ -66,6 +66,7 @@ pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
         McpClient::Pi => render_pi(&args)?,
         McpClient::Omp => render_omp(&args)?,
         McpClient::AntigravityCli => render_antigravity_cli(&args)?,
+        McpClient::Zero => render_zero(&args)?,
         McpClient::VsCodeCopilot => render_vscode_copilot(&args)?,
     };
     println!("{snippet}");
@@ -152,6 +153,10 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
             .join(".gemini")
             .join("antigravity-cli")
             .join("mcp_config.json"),
+        // Zero resolves its user config under $XDG_CONFIG_HOME falling back
+        // to ~/.config; we target the default and --config-file covers
+        // non-default XDG setups (same policy as OpenCode above).
+        McpClient::Zero => home()?.join(".config").join("zero").join("config.json"),
         // VS Code MCP is workspace-scoped by default: `.vscode/mcp.json`
         // at the current workspace root. The user-profile alternative
         // lives under VS Code's profile-specific data dir; use VS
@@ -211,7 +216,9 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         | McpClient::Omp
         | McpClient::AntigravityCli => Some(JsonMcpLocation::RootMcpServers),
         McpClient::OpenCode => Some(JsonMcpLocation::RootMcp),
-        McpClient::Openclaw => Some(JsonMcpLocation::NestedMcpServers),
+        // Zero's config.json nests servers under `mcp.servers`, the same
+        // shape OpenClaw uses.
+        McpClient::Openclaw | McpClient::Zero => Some(JsonMcpLocation::NestedMcpServers),
         McpClient::VsCodeCopilot => Some(JsonMcpLocation::RootServers),
         McpClient::Codex | McpClient::Pi => None,
     }
@@ -221,6 +228,7 @@ fn build_json_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     match args.client {
         McpClient::OpenCode => build_mcp_entry_opencode(args),
         McpClient::Openclaw => build_mcp_entry_openclaw(args),
+        McpClient::Zero => build_mcp_entry_zero(args),
         McpClient::Codex => bail!("internal: Codex MCP config is TOML, not JSON"),
         _ => build_mcp_entry(args),
     }
@@ -381,6 +389,20 @@ fn build_mcp_entry_openclaw(args: &InstallMcpArgs) -> Result<serde_json::Value> 
     let mut entry = serde_json::Map::new();
     entry.insert("url".into(), json!(args.server_url));
     entry.insert("transport".into(), json!("streamable-http"));
+    if let Some(b) = bearer {
+        entry.insert("headers".into(), json!({"Authorization": b}));
+    }
+    Ok(serde_json::Value::Object(entry))
+}
+
+/// Zero (Gitlawb/zero) MCP entry: native HTTP transport with optional
+/// bearer headers — `internal/config/types.go`'s `MCPServerConfig` accepts
+/// `type: "http"` + `url` + a `headers` map (issue #156).
+fn build_mcp_entry_zero(args: &InstallMcpArgs) -> Result<serde_json::Value> {
+    let bearer = bearer_header_value(args.auth_token.as_deref());
+    let mut entry = serde_json::Map::new();
+    entry.insert("type".into(), json!("http"));
+    entry.insert("url".into(), json!(args.server_url));
     if let Some(b) = bearer {
         entry.insert("headers".into(), json!({"Authorization": b}));
     }
@@ -614,6 +636,16 @@ fn render_openclaw(args: &InstallMcpArgs) -> Result<String> {
     ))
 }
 
+fn render_zero(args: &InstallMcpArgs) -> Result<String> {
+    Ok(format!(
+        "# Zero (Gitlawb/zero) — merge into ~/.config/zero/config.json\n\
+         # ($XDG_CONFIG_HOME/zero/config.json on non-default XDG setups),\n\
+         # or run `zero mcp add` / re-run this command with --apply.\n\
+         {snippet}\n",
+        snippet = render_json_mcp_fragment(args)?,
+    ))
+}
+
 fn render_pi(args: &InstallMcpArgs) -> Result<String> {
     Ok(pi_mcp_render_guidance(args))
 }
@@ -736,6 +768,7 @@ mod tests {
             McpClient::Pi => render_pi(&args).unwrap(),
             McpClient::Omp => render_omp(&args).unwrap(),
             McpClient::AntigravityCli => render_antigravity_cli(&args).unwrap(),
+            McpClient::Zero => render_zero(&args).unwrap(),
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
         }
     }
@@ -754,6 +787,7 @@ mod tests {
             McpClient::Openclaw,
             McpClient::Omp,
             McpClient::AntigravityCli,
+            McpClient::Zero,
             McpClient::VsCodeCopilot,
         ] {
             let out = render_with_token(client);
@@ -786,6 +820,7 @@ mod tests {
             McpClient::Openclaw,
             McpClient::Omp,
             McpClient::AntigravityCli,
+            McpClient::Zero,
             McpClient::VsCodeCopilot,
         ] {
             let out = render_for_test(client);
@@ -809,6 +844,7 @@ mod tests {
             McpClient::Pi => render_pi(&args).unwrap(),
             McpClient::Omp => render_omp(&args).unwrap(),
             McpClient::AntigravityCli => render_antigravity_cli(&args).unwrap(),
+            McpClient::Zero => render_zero(&args).unwrap(),
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
         }
     }

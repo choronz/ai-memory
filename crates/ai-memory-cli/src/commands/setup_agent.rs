@@ -66,6 +66,12 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
         emit_extension_setup_hint(&args)?;
         return Ok(());
     }
+    // Zero runs ai-memory's native `hook` command directly (exec form,
+    // no scripts to stage) — setup-agent just prints the hooks.json.
+    if matches!(args.agent, AgentChoice::Zero) {
+        emit_zero(&args)?;
+        return Ok(());
+    }
     let Some(agent_sub) = args.agent.script_hook_subdir() else {
         bail!("internal: generated integration should have returned before staging hooks")
     };
@@ -134,12 +140,45 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
             &args,
             &[&ANTIGRAVITY_TOOL_EVENTS, &ANTIGRAVITY_LIFECYCLE_EVENTS],
         ),
-        AgentChoice::OpenCode | AgentChoice::Pi | AgentChoice::Omp | AgentChoice::Openclaw => {
+        AgentChoice::OpenCode
+        | AgentChoice::Pi
+        | AgentChoice::Omp
+        | AgentChoice::Openclaw
+        | AgentChoice::Zero => {
             bail!(
                 "internal: generated integration should have returned before emitting staged hooks"
             )
         }
     }
+    Ok(())
+}
+
+/// Print Zero's hooks.json (issue #156). No scripts are staged: Zero
+/// executes the ai-memory binary directly with the JSON payload on stdin,
+/// so the only artifact is the config itself. The binary must be reachable
+/// on the host that runs Zero — for docker-wrapper setups install the
+/// native binary or point `command` at the wrapper.
+fn emit_zero(args: &SetupAgentArgs) -> Result<()> {
+    let payload = crate::commands::render_shared::build_zero_hooks_config(
+        &args.server_url,
+        args.auth_token.as_deref(),
+        None,
+        None,
+    );
+    let serialized =
+        serde_json::to_string_pretty(&payload).context("serializing Zero hook config")?;
+    println!("# Zero (Gitlawb/zero) — merge into ~/.config/zero/hooks.json");
+    println!("# The `command` must be an ai-memory binary reachable on the host");
+    println!("# that runs Zero; prefer `ai-memory install-hooks --agent zero --apply`");
+    println!("# from that host so the path is resolved for you.");
+    if args.auth_token.is_some() {
+        println!("#       Treat hooks.json as sensitive (chmod 600).");
+    }
+    println!("# NOTE: Zero discards sessionStart stdout, so this config captures");
+    println!("#       but does not inject handoffs; recover them via the MCP");
+    println!("#       `memory_handoff_accept` tool.");
+    println!();
+    println!("{serialized}");
     Ok(())
 }
 

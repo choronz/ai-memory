@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Zero (Gitlawb/zero) is now a supported agent/client ([#156]).
+  `install-mcp --client zero` merges a native HTTP + bearer entry into
+  Zero's `~/.config/zero/config.json` (`mcp.servers` map), and
+  `install-hooks --agent zero --apply` merges exec-form lifecycle hooks
+  (the native `ai-memory hook` command with an args array — JSON payload
+  on stdin, no shell) into `~/.config/zero/hooks.json`, preserving
+  third-party hooks in the same file by id prefix. All six Zero events
+  are covered: `sessionStart`/`sessionEnd`, `beforeTool`/`afterTool`,
+  and `specialistStart`/`specialistStop` (mapped to ai-memory's subagent
+  events). Zero discards `sessionStart` hook stdout, so capture and
+  handoff creation work but handoff injection does not — recover
+  handoffs via the MCP `memory_handoff_accept` tool, same policy as
+  Grok. `uninstall` strips the hook entries and the MCP registration;
+  `setup-agent --agent zero` prints the config for docker-host flows.
+  Support tracks Zero's current formats — it is a fast-moving young
+  project and upstream churn will be fixed as reported.
+
 ## [1.9.1] - 2026-07-08
 
 ### Fixed

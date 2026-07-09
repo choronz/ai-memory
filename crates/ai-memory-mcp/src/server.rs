@@ -2316,6 +2316,7 @@ impl AiMemoryServer {
                 "cursor": "AGENTS.md",
                 "gemini_cli": "AGENTS.md",
                 "antigravity_cli": "AGENTS.md",
+                "zero": "AGENTS.md",
                 "default": "AGENTS.md"
             },
             "managed_skills": managed_skills,

@@ -169,6 +169,75 @@ pub(crate) fn build_grok_payload(
     )
 }
 
+/// Zero's hook events → ai-memory event names (issue #156). Zero has no
+/// user-prompt or pre-compact equivalents; its `specialistStart`/`Stop`
+/// map onto the subagent events the router already tracks for Claude Code.
+pub(crate) const ZERO_EVENTS: [(&str, &str); 6] = [
+    ("sessionStart", "session-start"),
+    ("sessionEnd", "session-end"),
+    ("beforeTool", "pre-tool-use"),
+    ("afterTool", "post-tool-use"),
+    ("specialistStart", "subagent-start"),
+    ("specialistStop", "subagent-stop"),
+];
+
+/// Zero hooks.json config (issue #156): `{"enabled": true, "hooks": [..]}`
+/// with one entry per lifecycle event. Zero executes `command` + `args`
+/// directly (exec form, JSON payload on the hook's stdin) — no shell is
+/// spawned, and our native `ai-memory hook` command reads exactly that
+/// stdin shape, so Zero gets the local spool + OIDC fallback with zero
+/// glue scripts. Entry ids carry the `ai-memory-` prefix so apply/uninstall
+/// can merge around third-party hooks in the same file.
+pub(crate) fn build_zero_hooks_config(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> serde_json::Value {
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "ai-memory".to_string());
+    let hooks: Vec<serde_json::Value> = ZERO_EVENTS
+        .iter()
+        .map(|(zero_event, our_event)| {
+            let mut args: Vec<String> = Vec::new();
+            if let Some(dir) = data_dir {
+                args.push("--data-dir".into());
+                args.push(dir.to_string_lossy().into_owned());
+            }
+            args.extend(
+                [
+                    "hook",
+                    "--event",
+                    our_event,
+                    "--agent",
+                    "zero",
+                    "--server-url",
+                    server_url,
+                ]
+                .map(String::from),
+            );
+            if let Some(token) = auth_token {
+                args.push("--auth-token".into());
+                args.push(token.to_string());
+            }
+            if let Some(strategy) = project_strategy {
+                args.push("--project-strategy".into());
+                args.push(strategy.to_string());
+            }
+            serde_json::json!({
+                "id": format!("ai-memory-{our_event}"),
+                "name": format!("ai-memory {our_event}"),
+                "event": zero_event,
+                "command": exe,
+                "args": args,
+                "enabled": true,
+            })
+        })
+        .collect();
+    serde_json::json!({ "enabled": true, "hooks": hooks })
+}
+
 /// Grok Build CLI hook payload for apply/render paths. Native commands are the
 /// default; explicit script fallback still points at the Grok script bundle.
 pub(crate) fn build_grok_payload_with_data_dir(

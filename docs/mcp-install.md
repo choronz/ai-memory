@@ -19,14 +19,14 @@
 This page documents how to register ai-memory as an MCP server with
 agent CLIs beyond the README quick start.
 
-Claude Code, OpenAI Codex, Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, OpenClaw, OpenCode, and
+Claude Code, OpenAI Codex, Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, OpenClaw, OpenCode, and
 OMP have automatic capture integrations (shell/PowerShell hooks for
 Claude Code / Codex / Cursor / Gemini CLI / Antigravity CLI / Grok Build CLI, TypeScript plugin/extension
 files for OpenClaw / OpenCode / OMP) and are covered in the
 [main README](../README.md#quick-start). On native Windows, Claude Code uses
 Git Bash `.sh` hooks rather than the PowerShell default used by other
-script-hook agents. Grok captures lifecycle events, but it ignores
-SessionStart stdout, so ai-memory does not auto-inject handoffs for Grok.
+script-hook agents. Grok and Zero capture lifecycle events, but both ignore
+SessionStart stdout, so ai-memory does not auto-inject handoffs for them.
 
 Claude Desktop and VS Code Copilot are **MCP-only** here: they expose
 long-term memory to their LLMs via ai-memory's MCP tools
@@ -393,6 +393,43 @@ The rendered hooks config looks like:
 
 ---
 
+## Zero (Gitlawb/zero)
+
+Zero manages MCP servers in `~/.config/zero/config.json`
+(`$XDG_CONFIG_HOME/zero/config.json` on non-default XDG setups) under an
+`mcp.servers` map, with native HTTP transport + bearer headers:
+
+```bash
+ai-memory install-mcp --client zero --apply \
+    --server-url "http://homelab:49374/mcp" --auth-token "$TOKEN"
+```
+
+which merges:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "ai-memory": {
+        "type": "http",
+        "url": "http://homelab:49374/mcp",
+        "headers": { "Authorization": "Bearer <token>" }
+      }
+    }
+  }
+}
+```
+
+Lifecycle capture is separate and script-free: `ai-memory install-hooks
+--agent zero --apply` merges exec-form entries (the native `ai-memory hook`
+command + args, JSON payload on stdin — no shell) into
+`~/.config/zero/hooks.json`, covering `sessionStart`/`sessionEnd`/
+`beforeTool`/`afterTool` plus `specialistStart`/`specialistStop` (mapped to
+ai-memory's subagent events). Zero discards `sessionStart` hook stdout, so
+capture and session-end handoff *creation* work, but handoff *injection*
+does not — ask Zero to call `memory_handoff_accept` at the start of a
+resumed session.
+
 ## OpenClaw
 
 **Status:** ✅ MCP supported. ✅ Lifecycle hooks supported via a native
@@ -553,7 +590,7 @@ that *starts* the next one - to play nicely with ai-memory:
 
 | Side | What's needed | Covered by |
 |---|---|---|
-| **Ending side** | The agent must create a handoff, either through a true session-end hook, the supported Codex manual finalizer, or by calling `memory_handoff_begin`. | Built-in automatically for Claude Code, Cursor, Gemini CLI, Grok Build CLI, OpenClaw, OpenCode, and OMP. Codex has no reliable true session-end event, so run `ai-memory finalize-session` when you need the final summary/handoff/auto-improve eligibility. Antigravity CLI has no true session-end event in the current integration, so ask it to call `memory_handoff_begin` before quitting when you need a handoff. |
+| **Ending side** | The agent must create a handoff, either through a true session-end hook, the supported Codex manual finalizer, or by calling `memory_handoff_begin`. | Built-in automatically for Claude Code, Cursor, Gemini CLI, Grok Build CLI, Zero, OpenClaw, OpenCode, and OMP. Codex has no reliable true session-end event, so run `ai-memory finalize-session` when you need the final summary/handoff/auto-improve eligibility. Antigravity CLI has no true session-end event in the current integration, so ask it to call `memory_handoff_begin` before quitting when you need a handoff. |
 | **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model proactively calls `memory_handoff_accept` on first turn. | (a) is built-in for Claude Code / Codex / Cursor / Gemini CLI / Antigravity CLI / OpenClaw / OpenCode / OMP. Grok is explicitly excluded because it ignores SessionStart stdout; use (b). (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
 
 OpenCode uses its official `session.deleted` plugin event for true session-end
