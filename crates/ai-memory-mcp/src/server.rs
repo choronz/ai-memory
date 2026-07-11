@@ -2612,47 +2612,55 @@ fn build_explore_request(
 /// `prompts/explore_system.md`.
 const EXPLORE_SYSTEM_PROMPT: &str = include_str!("../prompts/explore_system.md");
 
-/// Synthetic anonymous request `Parts` for callers arriving over a transport
-/// that injects none (stdio): no actor headers, so downstream resolves an
+/// Synthetic anonymous request `Parts` for callers arriving without request
+/// parts (for example stdio): no actor headers, so downstream resolves an
 /// anonymous `ActorKey` — the correct identity for a local, unauthenticated
-/// `serve`. The streamable-HTTP transport always injects the real `Parts`
-/// (carrying the auth middleware's identity), so this only applies to stdio.
+/// `serve`. Streamable HTTP injects real `Parts` carrying middleware identity;
+/// when those are present, the extractor below preserves them instead.
 fn default_parts() -> axum::http::request::Parts {
-    axum::http::Request::builder()
-        .uri("/mcp")
-        .method("POST")
-        .body(())
-        .unwrap()
-        .into_parts()
-        .0
+    let mut request = axum::http::Request::new(());
+    *request.method_mut() = axum::http::Method::POST;
+    *request.uri_mut() = axum::http::Uri::from_static("/mcp");
+    request.into_parts().0
 }
 
 /// Tool-handler extractor for the request `Parts`. Unlike rmcp's
 /// `Extension<Parts>` — which fails every `tools/call` with "missing extension
 /// http::request::Parts" when the extension is absent — this yields the real
 /// `Parts` over the streamable-HTTP transport and a synthetic anonymous one
-/// over stdio (where the transport injects no extensions), so a local stdio
-/// `serve` works while HTTP auth is unchanged.
+/// when request parts are absent (the stdio case), so a local stdio `serve`
+/// works while HTTP auth is unchanged when real request parts are present.
 struct OptionalParts(axum::http::request::Parts);
+
+impl OptionalParts {
+    fn from_extensions(extensions: &rmcp::model::Extensions) -> Self {
+        let parts = extensions
+            .get::<axum::http::request::Parts>()
+            .cloned()
+            .unwrap_or_else(default_parts);
+        Self(parts)
+    }
+}
 
 impl<C> rmcp::handler::server::common::FromContextPart<C> for OptionalParts
 where
     C: rmcp::handler::server::common::AsRequestContext,
 {
     fn from_context_part(context: &mut C) -> Result<Self, rmcp::ErrorData> {
-        let parts = context
-            .as_request_context()
-            .extensions
-            .get::<axum::http::request::Parts>()
-            .cloned()
-            .unwrap_or_else(default_parts);
-        Ok(OptionalParts(parts))
+        Ok(Self::from_extensions(
+            &context.as_request_context().extensions,
+        ))
     }
 }
 
 #[cfg(test)]
 fn test_parts_default() -> axum::http::request::Parts {
     default_parts()
+}
+
+#[cfg(test)]
+fn test_optional_parts() -> OptionalParts {
+    OptionalParts(test_parts_default())
 }
 
 #[cfg(test)]
@@ -2670,6 +2678,67 @@ mod tests {
         assert!(
             key.user.is_none() && key.session_id.is_none(),
             "stdio default must be anonymous"
+        );
+    }
+
+    #[test]
+    fn optional_parts_missing_extension_uses_anonymous_stdio_default() {
+        let extensions = rmcp::model::Extensions::new();
+
+        let OptionalParts(parts) = OptionalParts::from_extensions(&extensions);
+
+        assert_eq!(parts.method, axum::http::Method::POST);
+        assert_eq!(parts.uri, axum::http::Uri::from_static("/mcp"));
+        assert_eq!(
+            AiMemoryServer::actor_key_from_parts(Some(&parts)),
+            ai_memory_core::ActorKey::default(),
+            "missing request parts must degrade to anonymous stdio context instead of failing extraction"
+        );
+        assert!(parts.extensions.get::<AuthLevel>().is_none());
+        assert!(parts.extensions.get::<ai_memory_core::UserId>().is_none());
+        assert!(parts.extensions.get::<ActorContext>().is_none());
+    }
+
+    #[test]
+    fn optional_parts_preserves_real_http_parts_and_auth_context() {
+        let user_id = ai_memory_core::UserId::new();
+        let mut real_parts = test_parts_default();
+        real_parts
+            .headers
+            .insert("mcp-session-id", "session-from-header".parse().unwrap());
+        real_parts.extensions.insert(AuthLevel::User);
+        real_parts.extensions.insert(user_id);
+        real_parts.extensions.insert(ActorContext {
+            user: Some("alice".into()),
+            name: Some("Alice Smith".into()),
+            email: Some("alice@example.com".into()),
+            ..ActorContext::default()
+        });
+
+        let mut extensions = rmcp::model::Extensions::new();
+        extensions.insert(real_parts);
+
+        let OptionalParts(parts) = OptionalParts::from_extensions(&extensions);
+
+        assert_eq!(parts.extensions.get::<AuthLevel>(), Some(&AuthLevel::User));
+        assert_eq!(
+            parts.extensions.get::<ai_memory_core::UserId>(),
+            Some(&user_id)
+        );
+        assert_eq!(
+            parts
+                .extensions
+                .get::<ActorContext>()
+                .and_then(|ctx| ctx.user.as_deref()),
+            Some("alice")
+        );
+        assert_eq!(
+            AiMemoryServer::actor_key_from_parts(Some(&parts)),
+            ai_memory_core::ActorKey {
+                user: Some("alice".into()),
+                session_id: Some("session-from-header".into()),
+            },
+            "real HTTP request parts must preserve auth identity and routing session"
         );
     }
 
@@ -3892,7 +3961,7 @@ mod tests {
                     workspace: None,
                     global: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                test_optional_parts(),
             )
             .await
             .unwrap();
@@ -3984,7 +4053,7 @@ mod tests {
                         workspace: None,
                         global: None,
                     }),
-                    rmcp::handler::server::tool::Extension(test_parts_default()),
+                    test_optional_parts(),
                 )
                 .await
                 .unwrap(),
@@ -4047,7 +4116,7 @@ mod tests {
                         workspace: None,
                         global: None,
                     }),
-                    rmcp::handler::server::tool::Extension(test_parts_default()),
+                    test_optional_parts(),
                 )
                 .await
                 .unwrap(),
@@ -4086,7 +4155,7 @@ mod tests {
                     workspace: None,
                     global: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                test_optional_parts(),
             )
             .await
             .expect_err("missing explicit scope must fail closed");
@@ -4155,7 +4224,7 @@ mod tests {
                         workspace: None,
                         global: None,
                     }),
-                    rmcp::handler::server::tool::Extension(test_parts_default()),
+                    test_optional_parts(),
                 )
                 .await
                 .unwrap(),
@@ -4404,7 +4473,7 @@ mod tests {
                     project: Some("scratch".into()),
                     workspace: Some("default".into()),
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                test_optional_parts(),
             )
             .await
             .expect_err("missing page must error");
@@ -4427,7 +4496,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                test_optional_parts(),
             )
             .await
             .expect_err("missing page must error");

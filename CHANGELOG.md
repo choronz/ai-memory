@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the unused LLM retry-exhaustion error variant was removed ([#171]).
 
 ### Fixed
+- MCP tool calls over the stdio transport now fall back to an anonymous
+  synthetic request context when HTTP request parts are absent, while preserving
+  real streamable-HTTP auth/session parts when present ([#168]).
 - Copy-purge `/admin/move-project` now skips only the webhook named exactly
   `contributors` while copying pages, avoiding redundant per-page contributor
   enrichment on already-enriched frontmatter while preserving other
