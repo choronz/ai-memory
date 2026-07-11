@@ -67,6 +67,7 @@ use tokio_util::io::ReaderStream;
 use tracing::{info, warn};
 
 const EMBEDDING_WRITE_BATCH: usize = 100;
+const CONTRIBUTORS_WEBHOOK_NAME: &str = "contributors";
 
 /// Shared state for the admin router.
 #[derive(Clone)]
@@ -3761,14 +3762,14 @@ async fn copy_purge_merge(
                 // Preserve the stored title verbatim (PageSummary.title is
                 // the DB-derived title), rather than re-deriving it.
                 title: Some(p.title.clone()),
-                // Skip the `contributors` enrich webhook on move copies: the
-                // frontmatter (including the contributors list) is copied
+                // Skip the named contributors enrich webhook on move copies:
+                // the frontmatter (including the contributors list) is copied
                 // verbatim, so re-enriching each copy adds nothing but blocking
                 // per-page latency to a bulk move. write_page still resolves
                 // the destination NAMES and runs the other hooks (git-mirror),
                 // so the copy lands under the destination path.
                 admission_ctx: Some(AdmissionContext {
-                    skip_webhooks: vec!["contributors".to_string()],
+                    skip_webhooks: vec![CONTRIBUTORS_WEBHOOK_NAME.to_string()],
                     ..AdmissionContext::default()
                 }),
                 author_id: None,

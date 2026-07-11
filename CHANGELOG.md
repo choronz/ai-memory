@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Copy-purge `/admin/move-project` now skips only the webhook named exactly
+  `contributors` while copying pages, avoiding redundant per-page contributor
+  enrichment on already-enriched frontmatter while preserving other
+  `write_page` webhooks and the terminal purge notification ([#167]).
 - `memory_read_page` by-path not-found errors now name the resolved
   workspace/project scope, making stale or mis-scoped page paths easier to
   diagnose from MCP clients ([#166]).
