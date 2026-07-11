@@ -17,7 +17,6 @@ use ai_memory_store::{AutoImproveProposalOperation, NewAutoImproveProposal, Stag
 use ai_memory_store::{DecayParams, PageHit, ReaderPool, ScopeName, ScopeResolver, WriterHandle};
 use ai_memory_wiki::{Wiki, WikiError, WritePageRequest};
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, Content, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
@@ -968,6 +967,31 @@ impl AiMemoryServer {
             .map_err(Self::scope_error)
     }
 
+    /// Human-readable `workspace/project` label for a resolved scope. Makes
+    /// not-found errors diagnosable — especially under cross-project
+    /// scope-bleed, where a scoped-implicit read resolves to a different
+    /// scope than a concurrent write landed in. Degrades to a placeholder
+    /// when a name lookup fails so it never turns a not-found into a harder
+    /// error.
+    async fn scope_label(
+        &self,
+        ws: ai_memory_core::WorkspaceId,
+        proj: ai_memory_core::ProjectId,
+    ) -> String {
+        let ws_name = self.reader.workspace_name_by_id(ws).await.ok().flatten();
+        let proj_name = self
+            .reader
+            .project_name_by_id(ws, proj)
+            .await
+            .ok()
+            .flatten();
+        format!(
+            "{}/{}",
+            ws_name.as_deref().unwrap_or("<unknown-workspace>"),
+            proj_name.as_deref().unwrap_or("<unknown-project>")
+        )
+    }
+
     async fn embed_query(&self, query: &str) -> Option<Vec<f32>> {
         let Some(embedder) = &self.embedder else {
             return None;
@@ -1067,8 +1091,10 @@ impl AiMemoryServer {
         self
     }
 
-    /// Search the compiled wiki via FTS5/vector/graph retrieval. Falls back
-    /// to bounded raw observation search when no compiled page matches.
+    /// Search the compiled wiki via FTS5/vector/graph retrieval. Default,
+    /// explicit project, and explicit `scopes` searches fall back to bounded
+    /// raw observation search when no compiled page matches; `global=true`
+    /// searches compiled wiki pages across projects only.
     #[tool(description = "Search the project's long-term memory wiki — \
         prior sessions, decisions, gotchas, architecture notes captured \
         by ai-memory across earlier runs. Call this BEFORE proposing \
@@ -1077,8 +1103,10 @@ impl AiMemoryServer {
         FTS5 + graph RRF + (when configured) vector RRF re-ranking. \
         Returns up to `limit` pages with HTML-marked snippets and a rank \
         score (lower rank = better match). Only latest page versions. \
-        If compiled wiki search misses, `raw_hits` contains bounded raw \
-        observation fallback matches. Default-scoped calls also return \
+        If compiled wiki search misses in default/project/`scopes` mode, \
+        `raw_hits` contains bounded raw observation fallback matches; \
+        `global=true` searches compiled wiki pages only and returns no raw \
+        fallback. Default-scoped calls also return \
         `global_scope_hits`: standing user/team preferences from the \
         reserved `_global` scope that apply across projects. Set \
         `global=true` to search EVERY \
@@ -1088,7 +1116,7 @@ impl AiMemoryServer {
     async fn memory_query(
         &self,
         Parameters(args): Parameters<QueryArgs>,
-        Extension(parts): Extension<axum::http::request::Parts>,
+        OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let limit = args.limit.unwrap_or(self.default_limit).clamp(1, 100);
@@ -1284,7 +1312,7 @@ impl AiMemoryServer {
     async fn memory_recent(
         &self,
         Parameters(args): Parameters<RecentArgs>,
-        Extension(parts): Extension<axum::http::request::Parts>,
+        OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let limit = args.limit.unwrap_or(self.default_limit).clamp(1, 100);
@@ -1315,7 +1343,7 @@ impl AiMemoryServer {
     async fn memory_forget_sweep(
         &self,
         Parameters(args): Parameters<SweepArgs>,
-        Extension(parts): Extension<axum::http::request::Parts>,
+        OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let (ws, proj) = self
@@ -1346,7 +1374,7 @@ impl AiMemoryServer {
     async fn memory_lint(
         &self,
         Parameters(args): Parameters<LintArgs>,
-        Extension(parts): Extension<axum::http::request::Parts>,
+        OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let Some(wiki) = self.wiki.as_ref() else {
@@ -1419,7 +1447,7 @@ impl AiMemoryServer {
     async fn memory_auto_improve(
         &self,
         Parameters(args): Parameters<AutoImproveArgs>,
-        Extension(parts): Extension<axum::http::request::Parts>,
+        OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         if args.dry_run.is_some() || args.stage.is_some() || args.mode.is_some() {
             return Err(McpError::invalid_params(
@@ -1675,7 +1703,7 @@ impl AiMemoryServer {
     async fn memory_write_page(
         &self,
         Parameters(args): Parameters<WritePageArgs>,
-        Extension(parts): Extension<axum::http::request::Parts>,
+        OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let Some(wiki) = self.wiki.as_ref() else {
@@ -1818,7 +1846,7 @@ impl AiMemoryServer {
     async fn memory_read_page(
         &self,
         Parameters(args): Parameters<ReadPageArgs>,
-        Extension(parts): Extension<axum::http::request::Parts>,
+        OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let Some(wiki) = self.wiki.as_ref() else {
@@ -1837,6 +1865,15 @@ impl AiMemoryServer {
                 &aps_actor,
             )
             .await?;
+        // Diagnose cross-project scope-bleed: a read with no explicit scope
+        // resolves to the active project, which may differ from the scope a
+        // concurrent write landed in — the write persists but the by-path
+        // read looks in the wrong bucket and 404s.
+        let auto_scoped = args
+            .workspace
+            .as_deref()
+            .is_none_or(|s| s.trim().is_empty())
+            && args.project.as_deref().is_none_or(|s| s.trim().is_empty());
 
         let page_path = if let Some(p) = args.path {
             PagePath::new(p)
@@ -1911,7 +1948,28 @@ impl AiMemoryServer {
                             "served_from": "db-fallback",
                         }))
                     }
-                    None => Err(McpError::internal_error(disk_err.to_string(), None)),
+                    None => {
+                        // Not on disk and not in the DB under the resolved
+                        // scope. Name the scope (and flag auto-resolution) so
+                        // scope-bleed is diagnosable from the error itself,
+                        // instead of leaking the raw disk error/path.
+                        let scope = self.scope_label(ws, proj).await;
+                        let hint = if auto_scoped {
+                            " — this scope was auto-resolved from the active \
+                             project; pass explicit workspace+project if this \
+                             is a parallel multi-project session where the \
+                             write may have landed in a different scope"
+                        } else {
+                            ""
+                        };
+                        Err(McpError::internal_error(
+                            format!(
+                                "page {} not found in resolved scope {scope}{hint}",
+                                page_path.as_str()
+                            ),
+                            None,
+                        ))
+                    }
                 }
             }
             Err(disk_err) => Err(McpError::internal_error(disk_err.to_string(), None)),
@@ -1931,7 +1989,7 @@ impl AiMemoryServer {
     async fn memory_delete_page(
         &self,
         Parameters(args): Parameters<DeletePageArgs>,
-        Extension(parts): Extension<axum::http::request::Parts>,
+        OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let Some(wiki) = self.wiki.as_ref() else {
@@ -2001,7 +2059,7 @@ impl AiMemoryServer {
     async fn memory_handoff_begin(
         &self,
         Parameters(args): Parameters<HandoffBeginArgs>,
-        Extension(parts): Extension<axum::http::request::Parts>,
+        OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         // Handoffs bypass `Wiki::write_page` (they live in their own
@@ -2089,7 +2147,7 @@ impl AiMemoryServer {
     async fn memory_handoff_accept(
         &self,
         Parameters(args): Parameters<HandoffAcceptArgs>,
-        Extension(parts): Extension<axum::http::request::Parts>,
+        OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let (ws, proj) = self
@@ -2128,7 +2186,7 @@ impl AiMemoryServer {
     async fn memory_handoff_cancel(
         &self,
         Parameters(args): Parameters<HandoffCancelArgs>,
-        Extension(parts): Extension<axum::http::request::Parts>,
+        OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let handoff_id = HandoffId::from_str(&args.handoff_id)
@@ -2179,7 +2237,7 @@ impl AiMemoryServer {
     async fn memory_status(
         &self,
         Parameters(args): Parameters<StatusArgs>,
-        Extension(parts): Extension<axum::http::request::Parts>,
+        OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let (ws, proj) = self
@@ -2211,7 +2269,7 @@ impl AiMemoryServer {
     async fn memory_briefing(
         &self,
         Parameters(args): Parameters<BriefingArgs>,
-        Extension(parts): Extension<axum::http::request::Parts>,
+        OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let limit = args.recent_pages_limit.unwrap_or(10);
@@ -2247,7 +2305,7 @@ impl AiMemoryServer {
     async fn memory_explore(
         &self,
         Parameters(args): Parameters<ExploreArgs>,
-        Extension(parts): Extension<axum::http::request::Parts>,
+        OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let limit = args.recent_pages_limit.unwrap_or(10);
@@ -2309,8 +2367,9 @@ impl AiMemoryServer {
         asks to install or refresh ai-memory routing in this project. \
         After calling, use your Write/Edit tool to preserve non-ai-memory \
         user content: replace only an existing `<!-- ai-memory:start -->` \
-        / `<!-- ai-memory:end -->` block or append `markered_block` with \
-        one blank line, then write every `managed_skills` item beneath \
+        / `<!-- ai-memory:end -->` block whose delimiters appear alone on \
+        their own lines, or append `markered_block` with one blank line, \
+        then write every `managed_skills` item beneath \
         the chosen skill root using its `relative_path`. This tool is \
         read-only and is the source of truth for the snippet and skills. \
         Skill files are ai-memory-managed only when they contain the \
@@ -2361,7 +2420,7 @@ impl AiMemoryServer {
             },
             "notes": [
                 "Pick the filename matching your own agent identity.",
-                "If the target file already contains <!-- ai-memory:start --> / <!-- ai-memory:end -->, replace ONLY that block in place; preserve every other line.",
+                "If the target file already contains <!-- ai-memory:start --> / <!-- ai-memory:end --> delimiters alone on their own lines, replace ONLY that line-delimited block in place; ignore inline mentions and preserve every other line.",
                 "If the file doesn't exist, create it with just the markered_block (plus a trailing newline).",
                 "If the file exists but has no ai-memory markers, append the markered_block with one blank line of separation from existing content.",
                 "Install each managed_skills item under the selected skill root from target_hints using its relative_path, for example .claude/skills/<relative_path> or .agents/skills/<relative_path>.",
@@ -2553,21 +2612,135 @@ fn build_explore_request(
 /// `prompts/explore_system.md`.
 const EXPLORE_SYSTEM_PROMPT: &str = include_str!("../prompts/explore_system.md");
 
+/// Synthetic anonymous request `Parts` for callers arriving without request
+/// parts (for example stdio): no actor headers, so downstream resolves an
+/// anonymous `ActorKey` — the correct identity for a local, unauthenticated
+/// `serve`. Streamable HTTP injects real `Parts` carrying middleware identity;
+/// when those are present, the extractor below preserves them instead.
+fn default_parts() -> axum::http::request::Parts {
+    let mut request = axum::http::Request::new(());
+    *request.method_mut() = axum::http::Method::POST;
+    *request.uri_mut() = axum::http::Uri::from_static("/mcp");
+    request.into_parts().0
+}
+
+/// Tool-handler extractor for the request `Parts`. Unlike rmcp's
+/// `Extension<Parts>` — which fails every `tools/call` with "missing extension
+/// http::request::Parts" when the extension is absent — this yields the real
+/// `Parts` over the streamable-HTTP transport and a synthetic anonymous one
+/// when request parts are absent (the stdio case), so a local stdio `serve`
+/// works while HTTP auth is unchanged when real request parts are present.
+struct OptionalParts(axum::http::request::Parts);
+
+impl OptionalParts {
+    fn from_extensions(extensions: &rmcp::model::Extensions) -> Self {
+        let parts = extensions
+            .get::<axum::http::request::Parts>()
+            .cloned()
+            .unwrap_or_else(default_parts);
+        Self(parts)
+    }
+}
+
+impl<C> rmcp::handler::server::common::FromContextPart<C> for OptionalParts
+where
+    C: rmcp::handler::server::common::AsRequestContext,
+{
+    fn from_context_part(context: &mut C) -> Result<Self, rmcp::ErrorData> {
+        Ok(Self::from_extensions(
+            &context.as_request_context().extensions,
+        ))
+    }
+}
+
 #[cfg(test)]
 fn test_parts_default() -> axum::http::request::Parts {
-    axum::http::Request::builder()
-        .uri("/mcp")
-        .method("POST")
-        .body(())
-        .unwrap()
-        .into_parts()
-        .0
+    default_parts()
+}
+
+#[cfg(test)]
+fn test_optional_parts() -> OptionalParts {
+    OptionalParts(test_parts_default())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn stdio_default_parts_resolves_to_anonymous_actor() {
+        // The stdio transport injects no `Parts`, so the `OptionalParts`
+        // extractor falls back to `default_parts()`. That synthetic default
+        // must carry no actor identity — a local unauthenticated caller —
+        // rather than error, which is what let tools/call fail on stdio.
+        let key = AiMemoryServer::actor_key_from_parts(Some(&default_parts()));
+        assert!(
+            key.user.is_none() && key.session_id.is_none(),
+            "stdio default must be anonymous"
+        );
+    }
+
+    #[test]
+    fn optional_parts_missing_extension_uses_anonymous_stdio_default() {
+        let extensions = rmcp::model::Extensions::new();
+
+        let OptionalParts(parts) = OptionalParts::from_extensions(&extensions);
+
+        assert_eq!(parts.method, axum::http::Method::POST);
+        assert_eq!(parts.uri, axum::http::Uri::from_static("/mcp"));
+        assert_eq!(
+            AiMemoryServer::actor_key_from_parts(Some(&parts)),
+            ai_memory_core::ActorKey::default(),
+            "missing request parts must degrade to anonymous stdio context instead of failing extraction"
+        );
+        assert!(parts.extensions.get::<AuthLevel>().is_none());
+        assert!(parts.extensions.get::<ai_memory_core::UserId>().is_none());
+        assert!(parts.extensions.get::<ActorContext>().is_none());
+    }
+
+    #[test]
+    fn optional_parts_preserves_real_http_parts_and_auth_context() {
+        let user_id = ai_memory_core::UserId::new();
+        let mut real_parts = test_parts_default();
+        real_parts
+            .headers
+            .insert("mcp-session-id", "session-from-header".parse().unwrap());
+        real_parts.extensions.insert(AuthLevel::User);
+        real_parts.extensions.insert(user_id);
+        real_parts.extensions.insert(ActorContext {
+            user: Some("alice".into()),
+            name: Some("Alice Smith".into()),
+            email: Some("alice@example.com".into()),
+            ..ActorContext::default()
+        });
+
+        let mut extensions = rmcp::model::Extensions::new();
+        extensions.insert(real_parts);
+
+        let OptionalParts(parts) = OptionalParts::from_extensions(&extensions);
+
+        assert_eq!(parts.extensions.get::<AuthLevel>(), Some(&AuthLevel::User));
+        assert_eq!(
+            parts.extensions.get::<ai_memory_core::UserId>(),
+            Some(&user_id)
+        );
+        assert_eq!(
+            parts
+                .extensions
+                .get::<ActorContext>()
+                .and_then(|ctx| ctx.user.as_deref()),
+            Some("alice")
+        );
+        assert_eq!(
+            AiMemoryServer::actor_key_from_parts(Some(&parts)),
+            ai_memory_core::ActorKey {
+                user: Some("alice".into()),
+                session_id: Some("session-from-header".into()),
+            },
+            "real HTTP request parts must preserve auth identity and routing session"
+        );
+    }
 
     use ai_memory_core::{
         ActorContext, AuthLevel, NewObservation, NewPage, NewSession, NewUser, ObservationKind,
@@ -2852,8 +3025,9 @@ mod tests {
             "snippet must tell agents to refresh managed skill files"
         );
         assert!(
-            snippet.contains(ai_memory_core::MARKER_START)
-                && snippet.contains(ai_memory_core::MARKER_END),
+            snippet.contains("start/end HTML-comment markers")
+                && ai_memory_core::full_block().contains(ai_memory_core::MARKER_START)
+                && ai_memory_core::full_block().contains(ai_memory_core::MARKER_END),
             "snippet must preserve marker replacement guidance"
         );
     }
@@ -3422,7 +3596,7 @@ mod tests {
                     workspace: None,
                     scope: None,
                 }),
-                rmcp::handler::server::tool::Extension(parts),
+                OptionalParts(parts),
             )
             .await
             .unwrap();
@@ -3468,7 +3642,7 @@ mod tests {
                     project: Some("sibling".to_string()),
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -3501,7 +3675,7 @@ mod tests {
                     workspace: None,
                     global: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -3549,7 +3723,7 @@ mod tests {
         let result = server
             .memory_query(
                 Parameters(query(None, None)),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -3568,7 +3742,7 @@ mod tests {
         let result = server
             .memory_query(
                 Parameters(query(Some("default"), Some("scratch"))),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -3595,7 +3769,7 @@ mod tests {
                     workspace: None,
                     global: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -3634,7 +3808,7 @@ mod tests {
         server
             .memory_write_page(
                 Parameters(write_args(Some("global"), None)),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -3658,7 +3832,7 @@ mod tests {
         let err = server
             .memory_write_page(
                 Parameters(write_args(Some("global"), Some("other"))),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .expect_err("scope + project must fail closed");
@@ -3667,7 +3841,7 @@ mod tests {
         let err = server
             .memory_write_page(
                 Parameters(write_args(Some("universe"), None)),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .expect_err("unknown scope values must fail closed");
@@ -3715,7 +3889,7 @@ mod tests {
                     workspace: None,
                     global: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -3787,7 +3961,7 @@ mod tests {
                     workspace: None,
                     global: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                test_optional_parts(),
             )
             .await
             .unwrap();
@@ -3879,7 +4053,7 @@ mod tests {
                         workspace: None,
                         global: None,
                     }),
-                    rmcp::handler::server::tool::Extension(test_parts_default()),
+                    test_optional_parts(),
                 )
                 .await
                 .unwrap(),
@@ -3942,7 +4116,7 @@ mod tests {
                         workspace: None,
                         global: None,
                     }),
-                    rmcp::handler::server::tool::Extension(test_parts_default()),
+                    test_optional_parts(),
                 )
                 .await
                 .unwrap(),
@@ -3981,7 +4155,7 @@ mod tests {
                     workspace: None,
                     global: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                test_optional_parts(),
             )
             .await
             .expect_err("missing explicit scope must fail closed");
@@ -4050,7 +4224,7 @@ mod tests {
                         workspace: None,
                         global: None,
                     }),
-                    rmcp::handler::server::tool::Extension(test_parts_default()),
+                    test_optional_parts(),
                 )
                 .await
                 .unwrap(),
@@ -4110,7 +4284,7 @@ mod tests {
                     workspace: Some("practice".into()),
                     global: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4164,7 +4338,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .expect_err("neither arg must fail closed");
@@ -4213,7 +4387,7 @@ mod tests {
                     project: Some("docs".into()),
                     workspace: Some("practice".into()),
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4263,7 +4437,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4280,6 +4454,55 @@ mod tests {
         assert!(
             text.contains("db-fallback"),
             "expected fallback diagnostic; got {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_read_page_missing_error_names_the_scope() {
+        let (tmp, store, server, _ws, _proj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = server.with_wiki(wiki);
+
+        // Explicit scope: the not-found error names workspace/project and the
+        // relative path (no raw disk error / absolute path leak).
+        let err = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: None,
+                    path: Some("does-not-exist.md".into()),
+                    project: Some("scratch".into()),
+                    workspace: Some("default".into()),
+                }),
+                test_optional_parts(),
+            )
+            .await
+            .expect_err("missing page must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("default/scratch"),
+            "must name the scope; got {msg}"
+        );
+        assert!(
+            msg.contains("does-not-exist.md"),
+            "must name the path; got {msg}"
+        );
+
+        // Auto-scoped read: the error adds the parallel-session hint.
+        let err = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: None,
+                    path: Some("does-not-exist.md".into()),
+                    project: None,
+                    workspace: None,
+                }),
+                test_optional_parts(),
+            )
+            .await
+            .expect_err("missing page must error");
+        assert!(
+            err.to_string().contains("auto-resolved"),
+            "auto-scoped error must hint at scope-bleed; got {err}"
         );
     }
 
@@ -4374,7 +4597,7 @@ mod tests {
                     workspace: None,
                     global: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4443,7 +4666,7 @@ mod tests {
                     workspace: None,
                     global: Some(true),
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4477,7 +4700,7 @@ mod tests {
                     workspace: None,
                     global: Some(true),
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await;
         assert!(
@@ -4495,7 +4718,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4518,7 +4741,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4566,7 +4789,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4629,7 +4852,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4683,7 +4906,7 @@ mod tests {
                     workspace: None,
                     scope: None,
                 }),
-                rmcp::handler::server::tool::Extension(parts),
+                OptionalParts(parts),
             )
             .await
             .unwrap();
@@ -4702,7 +4925,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4749,7 +4972,7 @@ mod tests {
                     workspace: Some("default".into()),
                     scope: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .expect_err("workspace-only memory_write_page must fail");
@@ -4815,7 +5038,7 @@ mod tests {
                     workspace: None,
                     scope: None,
                 }),
-                rmcp::handler::server::tool::Extension(parts),
+                OptionalParts(parts),
             )
             .await
             .unwrap();
@@ -4863,7 +5086,7 @@ mod tests {
                     workspace: None,
                     scope: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -4876,7 +5099,7 @@ mod tests {
                     project: Some("typo".into()),
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .expect_err("unknown explicit project must not fall back to scratch");
@@ -4926,7 +5149,7 @@ mod tests {
                     workspace: None,
                     scope: None,
                 }),
-                rmcp::handler::server::tool::Extension(parts()),
+                OptionalParts(parts()),
             )
             .await
             .unwrap();
@@ -4938,7 +5161,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(parts()),
+                OptionalParts(parts()),
             )
             .await
             .unwrap();
@@ -4952,7 +5175,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await;
         assert!(read.is_err(), "deleted page must not be readable");
@@ -4967,7 +5190,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -5014,7 +5237,7 @@ mod tests {
                     workspace: None,
                     scope: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -5026,7 +5249,7 @@ mod tests {
                     project: Some("typo".into()),
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .expect_err("unknown explicit project must not delete from scratch");
@@ -5043,7 +5266,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await;
         assert!(read.is_ok(), "page must survive delete with typo'd project");
@@ -5106,7 +5329,7 @@ mod tests {
                     workspace: Some("alpha".into()),
                     scope: None,
                 }),
-                rmcp::handler::server::tool::Extension(parts()),
+                OptionalParts(parts()),
             )
             .await
             .unwrap();
@@ -5123,7 +5346,7 @@ mod tests {
                     workspace: Some("beta".into()),
                     scope: None,
                 }),
-                rmcp::handler::server::tool::Extension(parts()),
+                OptionalParts(parts()),
             )
             .await
             .unwrap();
@@ -5136,7 +5359,7 @@ mod tests {
                     project: Some("shared".into()),
                     workspace: Some("beta".into()),
                 }),
-                rmcp::handler::server::tool::Extension(parts()),
+                OptionalParts(parts()),
             )
             .await
             .unwrap();
@@ -5150,7 +5373,7 @@ mod tests {
                     project: Some("shared".into()),
                     workspace: Some("alpha".into()),
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await;
         assert!(
@@ -5167,7 +5390,7 @@ mod tests {
                     project: Some("shared".into()),
                     workspace: Some("beta".into()),
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await;
         assert!(
@@ -5221,7 +5444,7 @@ mod tests {
                     workspace: None,
                     scope: None,
                 }),
-                rmcp::handler::server::tool::Extension(parts()),
+                OptionalParts(parts()),
             )
             .await
             .unwrap();
@@ -5234,7 +5457,7 @@ mod tests {
                     project: Some("other".into()),
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -5256,7 +5479,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -5296,7 +5519,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -5308,7 +5531,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -5338,7 +5561,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -5358,7 +5581,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -5379,7 +5602,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -5406,7 +5629,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -5418,7 +5641,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -5450,7 +5673,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -5462,7 +5685,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -5509,7 +5732,7 @@ mod tests {
                     project: Some("sibling-app".into()),
                     workspace: Some("djalmajr".into()),
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -5522,7 +5745,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -5545,7 +5768,7 @@ mod tests {
                     project: Some("sibling-app".into()),
                     workspace: Some("djalmajr".into()),
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -5575,7 +5798,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -5595,7 +5818,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -5614,7 +5837,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -5634,7 +5857,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -5653,7 +5876,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .unwrap();
@@ -5719,7 +5942,7 @@ mod tests {
                     max_proposals: None,
                     include_raw_fallback: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .expect_err("removed dry_run argument must fail closed");
@@ -5749,7 +5972,7 @@ mod tests {
                     max_proposals: None,
                     include_raw_fallback: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .expect_err("must reject when no LLM provider is configured");
@@ -5773,7 +5996,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .expect_err("must reject when wiki is not attached");
@@ -5831,7 +6054,7 @@ mod tests {
                     workspace: None,
                     scope: None,
                 }),
-                rmcp::handler::server::tool::Extension(parts()),
+                OptionalParts(parts()),
             )
             .await
             .unwrap();
@@ -5840,10 +6063,7 @@ mod tests {
             let server = &server;
             async move {
                 let out = server
-                    .memory_forget_sweep(
-                        Parameters(args),
-                        rmcp::handler::server::tool::Extension(test_parts_default()),
-                    )
+                    .memory_forget_sweep(Parameters(args), OptionalParts(test_parts_default()))
                     .await
                     .unwrap();
                 let text = out
@@ -5895,7 +6115,7 @@ mod tests {
                     project: None,
                     workspace: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .expect("empty-queue must be Ok, not Err");
@@ -5930,7 +6150,7 @@ mod tests {
                     workspace: None,
                     global: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await
             .expect("oversized limit should be clamped, not refused");
@@ -5961,7 +6181,7 @@ mod tests {
                     workspace: None,
                     global: None,
                 }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
+                OptionalParts(test_parts_default()),
             )
             .await;
         // Either a tidy 0-hit Ok (FTS5 is occasionally lenient) or

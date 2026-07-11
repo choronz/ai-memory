@@ -7,21 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- OIDC CLI help and token-store test fixtures now use a neutral `ai-memory`
+  realm placeholder instead of the old project-specific `serpro` example, and
+  the unused LLM retry-exhaustion error variant was removed ([#171]).
+
 ### Fixed
+- MCP tool calls over the stdio transport now fall back to an anonymous
+  synthetic request context when HTTP request parts are absent, while preserving
+  real streamable-HTTP auth/session parts when present ([#168]).
+- Copy-purge `/admin/move-project` now skips only the webhook named exactly
+  `contributors` while copying pages, avoiding redundant per-page contributor
+  enrichment on already-enriched frontmatter while preserving other
+  `write_page` webhooks and the terminal purge notification ([#167]).
+- `memory_read_page` by-path not-found errors now name the resolved
+  workspace/project scope, making stale or mis-scoped page paths easier to
+  diagnose from MCP clients ([#166]).
+
+## [1.11.2] - 2026-07-11
+
+### Fixed
+- `ai-memory install-instructions` and `ai-memory uninstall --only instructions`
+  now match only line-anchored routing markers, handle CRLF marker lines, and
+  repair one or more exact orphan-tail copies left by older refreshes when the
+  snippet body mentioned an end marker inline ([#161]).
 - Project creation now emits a warning when the same project name already
   exists in another workspace, helping catch accidental cross-workspace
-  misroutes while preserving legal id-namespaced homonyms.
+  misroutes while preserving legal id-namespaced homonyms ([#160]).
 - `memory_query` now runs the raw-observation fallback for explicit `scopes`
   requests when compiled wiki pages miss, so scoped cross-project searches can
   still surface bounded raw session matches without falling back to the current
-  project.
-- Upgraded `crossbeam-epoch` to the RUSTSEC-2026-0204 fixed release.
+  project ([#159]).
+- Upgraded `crossbeam-epoch` to the RUSTSEC-2026-0204 fixed release ([#162]).
 - Fixed the Docker wrapper on macOS with rootless Docker so host-config
   commands (`install-mcp`, `install-hooks`, `install-instructions`, and
   related setup/removal commands) keep the `-u 0:0` mapping needed to write
-  bind-mounted agent configuration as the invoking host user.
+  bind-mounted agent configuration as the invoking host user ([#162]).
 - Stabilized the Windows uninstall purge-preview regression test against
-  verbatim temp-path spelling.
+  verbatim temp-path spelling ([#162]).
 
 ## [1.11.1] - 2026-07-09
 
@@ -1696,7 +1719,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.11.1...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.11.2...HEAD
+[1.11.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.11.2
 [1.11.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.11.1
 [1.11.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.11.0
 [1.10.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.10.1

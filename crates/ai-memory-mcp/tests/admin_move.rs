@@ -1523,6 +1523,113 @@ async fn copy_purge_purge_admission_runs_before_db_destruction() {
     );
 }
 
+/// A move copies frontmatter (including the contributors list) verbatim, so
+/// the copy leg skips the `contributors` enrich webhook — re-enriching would
+/// only add blocking per-page latency to a bulk move — while other hooks
+/// (e.g. the git-mirror) still fire for the copied page.
+#[tokio::test]
+async fn move_copy_skips_contributors_webhook_but_runs_others() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let contrib_hits = std::sync::Arc::new(AtomicUsize::new(0));
+    let mirror_hits = std::sync::Arc::new(AtomicUsize::new(0));
+    let c = contrib_hits.clone();
+    let m = mirror_hits.clone();
+    let app = Router::new()
+        .route(
+            "/contributors",
+            axum_post(move |Json(_p): Json<serde_json::Value>| {
+                let c = c.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::NO_CONTENT, String::new())
+                }
+            }),
+        )
+        .route(
+            "/mirror",
+            axum_post(move |Json(_p): Json<serde_json::Value>| {
+                let m = m.clone();
+                async move {
+                    m.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::NO_CONTENT, String::new())
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let chain = AdmissionChain::new(vec![
+        WebhookConfig {
+            name: "contributors".into(),
+            url: format!("{base}/contributors"),
+            timeout_ms: 2_000,
+            failure_policy: FailurePolicy::Reject,
+            events: vec![AdmissionOp::WritePage],
+            blocking: true,
+        },
+        WebhookConfig {
+            name: "mirror".into(),
+            url: format!("{base}/mirror"),
+            timeout_ms: 2_000,
+            failure_policy: FailurePolicy::Reject,
+            events: vec![AdmissionOp::WritePage],
+            blocking: true,
+        },
+    ])
+    .unwrap();
+    let wiki = Wiki::new(tmp.path(), store.writer.clone())
+        .unwrap()
+        .with_admission_chain(chain)
+        .with_store_reader(store.reader.clone());
+    let state = AdminState {
+        writer: store.writer.clone(),
+        reader: store.reader.clone(),
+        wiki,
+        llm: None,
+        auto_improve_require_approval: false,
+        auto_improve_review_config: Default::default(),
+        embedder: None,
+        provider_health: ai_memory_llm::ProviderHealth::default(),
+        decay_params: DecayParams::default(),
+        data_dir: tmp.path().to_path_buf(),
+        db_path: store.db_path().to_path_buf(),
+        bind: "127.0.0.1:0".to_string(),
+        home_dir: None,
+        bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        token_pepper: None,
+        active_project: ai_memory_core::ActiveProject::new(),
+        on_project_moved: None,
+    };
+    // Pre-seed BOTH sides so the move takes the copy-purge (merge) path.
+    seed_page(&store, &state.wiki, "src", "proj", "notes/a.md", "body a").await;
+    seed_page(&store, &state.wiki, "dst", "proj", "notes/keep.md", "keep").await;
+
+    let contrib_before = contrib_hits.load(Ordering::SeqCst);
+    let mirror_before = mirror_hits.load(Ordering::SeqCst);
+
+    let resp = post(
+        state,
+        "/admin/move-project",
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK, "merge move should succeed");
+
+    assert_eq!(
+        contrib_hits.load(Ordering::SeqCst),
+        contrib_before,
+        "the contributors enrich webhook must be skipped on the move copy"
+    );
+    assert!(
+        mirror_hits.load(Ordering::SeqCst) > mirror_before,
+        "non-skipped webhooks must still fire for the copied page"
+    );
+}
+
 /// W6: re-running a copy-purge merge is idempotent — re-copying an
 /// already-present page is a no-op supersession, leaving no duplicates.
 #[tokio::test]

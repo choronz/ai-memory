@@ -71,6 +71,13 @@ when the source is torn down. The `purge_project` event carries
 `partial_failure: true` if the SQL purge committed but the on-disk
 dir removal failed afterwards.
 
+During the copy leg, the engine skips only the webhook named exactly
+`contributors`. Move copies preserve page frontmatter verbatim, including any
+existing `contributors` list, so re-running that enrichment hook for every page
+adds bulk-move latency without changing the copied page. Other `write_page`
+webhooks, such as a `git-mirror`, still run normally for each copied page; the
+terminal `purge_project` notification is unchanged.
+
 ### What does NOT fire the chain (by design)
 
 - **`log.md` / `log-YYYY-MM.md` appends** — written on every hook event

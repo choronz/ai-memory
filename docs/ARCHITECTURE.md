@@ -80,9 +80,11 @@ from hook paths.
    rejected candidates/rejection-buffer entries rather than wiki writes.
 6. `memory_query` answers via FTS5 + link-neighbour RRF; when an
    embedder is configured, vector cosine over `page_embeddings` joins
-   the same RRF. If compiled wiki pages miss entirely, bounded raw
-   observation FTS returns fallback `raw_hits`. Page hits bump
-   `access_count` + `last_accessed_at` - the M8 reinforcement term.
+   the same RRF. If compiled wiki pages miss entirely in default,
+   explicit project, or explicit `scopes` mode, bounded raw observation
+   FTS returns fallback `raw_hits`; `global=true` searches compiled wiki
+   pages across projects only. Page hits bump `access_count` +
+   `last_accessed_at` - the M8 reinforcement term.
 7. The forget sweep runs on demand and on the server's `[maintenance]`
    schedule: pages with `retention < cold_threshold` are soft-deleted;
    soft-deletions older than `hard_delete_after_days` with no subsequent
