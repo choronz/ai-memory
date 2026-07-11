@@ -436,6 +436,17 @@ impl Wiki {
         }
     }
 
+    /// Best-effort fill of `ctx.workspace` from a workspace id via the store
+    /// reader. Workspace-wide ops have no project id to resolve.
+    async fn resolve_workspace_name(&self, workspace_id: WorkspaceId, ctx: &mut AdmissionContext) {
+        if let Some(reader) = &self.store_reader
+            && ctx.workspace.is_empty()
+            && let Ok(Some(name)) = reader.workspace_name_by_id(workspace_id).await
+        {
+            ctx.workspace = name;
+        }
+    }
+
     /// Delete a single page file. When an admission chain is attached, it is
     /// notified (`op=delete`) BEFORE the file is removed, so a mirror can
     /// `git rm` the same path. A `Reject`-policy webhook aborts the delete.
@@ -543,6 +554,29 @@ impl Wiki {
         }
     }
 
+    /// Run the blocking admission notification for a workspace purge without
+    /// removing files. Admin callers use this before the DB purge so a
+    /// `failure_policy = reject` webhook can still abort all destructive work.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] when a reject-policy webhook fails.
+    pub async fn admit_purge_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+        admission_ctx: Option<AdmissionContext>,
+    ) -> WikiResult<Option<AdmissionContext>> {
+        if let Some(chain) = &self.admission_chain {
+            let mut ctx = admission_ctx.unwrap_or_default();
+            ctx.op = AdmissionOp::PurgeWorkspace;
+            self.resolve_workspace_name(workspace_id, &mut ctx).await;
+            ctx.project.clear();
+            chain.notify(None, &ctx).await?;
+            Ok(Some(ctx))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Remove the project's on-disk directory without running admission.
     ///
     /// # Errors
@@ -561,9 +595,33 @@ impl Wiki {
         }
     }
 
+    /// Remove a workspace's on-disk directory (`<wiki_root>/<ws>`), including
+    /// every project under it, without running admission. Best-effort: a
+    /// missing dir is not an error.
+    ///
+    /// # Errors
+    /// Returns [`WikiError::Io`] on filesystem errors other than NotFound.
+    pub async fn remove_workspace_dir(&self, workspace_id: WorkspaceId) -> WikiResult<()> {
+        let _guard = self.mutation_lock.write().await;
+        let root = self.root.join(workspace_id.to_string());
+        match std::fs::remove_dir_all(&root) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(crate::WikiError::Io(e)),
+        }
+    }
+
     /// Dispatch non-blocking purge webhooks after the caller's purge has
     /// completed its durable DB/filesystem work.
     pub fn dispatch_purge_project(&self, admission_ctx: Option<&AdmissionContext>) {
+        if let (Some(chain), Some(ctx)) = (&self.admission_chain, admission_ctx) {
+            chain.dispatch_async(None, &serde_json::Value::Null, "", ctx);
+        }
+    }
+
+    /// Dispatch non-blocking purge-workspace webhooks after the caller's purge
+    /// has completed its durable DB/filesystem work.
+    pub fn dispatch_purge_workspace(&self, admission_ctx: Option<&AdmissionContext>) {
         if let (Some(chain), Some(ctx)) = (&self.admission_chain, admission_ctx) {
             chain.dispatch_async(None, &serde_json::Value::Null, "", ctx);
         }

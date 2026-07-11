@@ -49,7 +49,7 @@ use ai_memory_store::{
     ApproveAutoImproveProposalResult, AutoImproveProposalOperation, AutoImproveProposalStatus,
     DecayParams, EmbeddingWrite, NewAutoImproveProposal, ReaderPool, RejectAutoImproveProposal,
     ScopeResolutionError, StageAutoImproveRun, StoreError, WriterHandle, create_explicit_scope,
-    f32_vec_to_bytes, lookup_existing_scope,
+    f32_vec_to_bytes, lookup_existing_scope, lookup_existing_workspace,
 };
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Markdown, Wiki, WikiError, WritePageRequest};
 use axum::Json;
@@ -516,6 +516,8 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/admin/purge-project", post(handle_purge_project))
         .route("/admin/rename-project", post(handle_rename_project))
         .route("/admin/move-project", post(handle_move_project))
+        .route("/admin/delete-workspace", post(handle_delete_workspace))
+        .route("/admin/rename-workspace", post(handle_rename_workspace))
         .route("/admin/write-page", post(handle_write_page))
         .route("/admin/delete-page", post(handle_delete_page));
     let users = Router::new()
@@ -1023,6 +1025,16 @@ async fn lookup_ws_proj_no_create(
     lookup_existing_scope(&state.reader, workspace, project)
         .await
         .map(ai_memory_store::ResolvedScope::as_tuple)
+        .map_err(scope_err)
+}
+
+/// Look up a workspace by name **without** auto-creating it.
+async fn lookup_ws_no_create(
+    state: &AdminState,
+    workspace: &str,
+) -> Result<WorkspaceId, (StatusCode, Json<serde_json::Value>)> {
+    lookup_existing_workspace(&state.reader, workspace)
+        .await
         .map_err(scope_err)
 }
 
@@ -2953,6 +2965,211 @@ async fn handle_purge_project(
 // ---------------------------------------------------------------------
 // rename-project
 // ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/rename-workspace`.
+#[derive(Deserialize)]
+struct RenameWorkspaceRequest {
+    /// Current workspace name (must exist).
+    from: String,
+    /// New workspace name. Must be non-empty, no slashes, and not already used.
+    to: String,
+}
+
+/// Wire-format summary returned by `POST /admin/rename-workspace`.
+#[derive(Debug, Serialize)]
+pub struct RenameWorkspaceResult {
+    /// Previous workspace name.
+    pub from: String,
+    /// New workspace name.
+    pub to: String,
+    /// Post-rename mirror checkpoint, if one was taken.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+    /// Number of scope manifests refreshed after the SQLite rename.
+    pub manifests_refreshed: usize,
+}
+
+/// `POST /admin/rename-workspace` — rename a workspace (column-only; the
+/// on-disk dir is UUID-keyed, so nothing moves). 404 unknown, 422 taken/invalid.
+async fn handle_rename_workspace(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<RenameWorkspaceRequest>,
+) -> impl IntoResponse {
+    let ws_id = match lookup_ws_no_create(&state, &req.from).await {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+    if let Err(e) = state.writer.rename_workspace(ws_id, req.to.clone()).await {
+        let status = match &e {
+            StoreError::WorkspaceNameTaken(_) | StoreError::InvalidWorkspaceName(_) => {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
+            StoreError::NotFound(_) => StatusCode::NOT_FOUND,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        return (status, Json(serde_json::json!({ "error": e.to_string() })));
+    }
+    let manifests_refreshed = match state.wiki.backfill_scope_manifests().await {
+        Ok(n) => n,
+        Err(e) => return internal_err(e.to_string()),
+    };
+    let checkpoint = checkpoint_or_warn(
+        &state.wiki,
+        format!("rename-workspace {} -> {}", req.from, req.to),
+    );
+    let result = RenameWorkspaceResult {
+        from: req.from.clone(),
+        to: req.to.clone(),
+        checkpoint,
+        manifests_refreshed,
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&result).unwrap_or(serde_json::Value::Null)),
+    )
+}
+
+/// JSON request body for `POST /admin/delete-workspace`.
+#[derive(Deserialize)]
+struct DeleteWorkspaceRequest {
+    /// Workspace name to delete (must exist).
+    workspace: String,
+    /// Delete even when the workspace still holds projects. Without it, a
+    /// non-empty workspace is refused so a typo can't wipe live data.
+    #[serde(default)]
+    force: bool,
+}
+
+/// Wire-format summary returned by `POST /admin/delete-workspace`.
+#[derive(Debug, Serialize)]
+pub struct DeleteWorkspaceResult {
+    /// Workspace name that was deleted.
+    pub workspace: String,
+    /// Projects removed via the `workspace_id` cascade.
+    pub projects_deleted: u64,
+    /// `pages` rows removed via cascade (all versions).
+    pub pages_deleted: u64,
+    /// Paths removed from disk (the workspace's UUID-namespaced directory).
+    pub files_deleted: Vec<String>,
+    /// Paths that could not be removed from disk (non-fatal; DB rows are gone).
+    pub files_failed: Vec<String>,
+    /// Pre-delete checkpoint, if the tree had uncommitted changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_checkpoint: Option<String>,
+    /// Post-delete mirror checkpoint, if one was taken.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+}
+
+/// `POST /admin/delete-workspace` — remove a workspace and, via cascade, every
+/// project/page under it. Guarded: refuses a non-empty workspace unless
+/// `force` (a typo shouldn't wipe live data). Orphan-workspace cleanup.
+async fn handle_delete_workspace(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    Json(req): Json<DeleteWorkspaceRequest>,
+) -> impl IntoResponse {
+    let ws_id = match lookup_ws_no_create(&state, &req.workspace).await {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+
+    if !req.force {
+        match state
+            .reader
+            .list_projects_with_stats_for_workspace(req.workspace.clone())
+            .await
+        {
+            Ok(projects) if !projects.is_empty() => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": StoreError::WorkspaceNotEmpty(projects.len() as u64).to_string()
+                    })),
+                );
+            }
+            Ok(_) => {}
+            Err(e) => return internal_err(e.to_string()),
+        }
+    }
+
+    let actor = actor_ext
+        .map(|axum::Extension(a)| a)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    let purge_ctx = AdmissionContext {
+        workspace: req.workspace.clone(),
+        project: String::new(),
+        op: AdmissionOp::PurgeWorkspace,
+        actor,
+        ..Default::default()
+    };
+    let resolved_purge_ctx = match state
+        .wiki
+        .admit_purge_workspace(ws_id, Some(purge_ctx))
+        .await
+    {
+        Ok(ctx) => ctx,
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    let pre_checkpoint = match checkpoint_or_500(
+        &state.wiki,
+        format!("pre-delete-workspace {}", req.workspace),
+    ) {
+        Ok(oid) => oid,
+        Err(e) => return e,
+    };
+
+    let summary = match state.writer.delete_workspace(ws_id, req.force).await {
+        Ok(s) => s,
+        Err(e) => {
+            let status = match &e {
+                StoreError::WorkspaceNotEmpty(_) => StatusCode::CONFLICT,
+                StoreError::NotFound(_) => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            return (status, Json(serde_json::json!({ "error": e.to_string() })));
+        }
+    };
+
+    let ws_root_str = state
+        .wiki
+        .root()
+        .join(ws_id.to_string())
+        .display()
+        .to_string();
+    let mut files_deleted = Vec::new();
+    let mut files_failed = Vec::new();
+    match state.wiki.remove_workspace_dir(ws_id).await {
+        Ok(()) => files_deleted.push(ws_root_str.clone()),
+        Err(e) => {
+            warn!(error = %e, workspace = %req.workspace, path = %ws_root_str, "delete-workspace: on-disk dir removal failed");
+            files_failed.push(ws_root_str);
+        }
+    }
+
+    let mut dispatch_ctx = resolved_purge_ctx;
+    if !files_failed.is_empty()
+        && let Some(ref mut c) = dispatch_ctx
+    {
+        c.partial_failure = true;
+    }
+    state.wiki.dispatch_purge_workspace(dispatch_ctx.as_ref());
+
+    let result = DeleteWorkspaceResult {
+        workspace: req.workspace.clone(),
+        projects_deleted: summary.projects_deleted,
+        pages_deleted: summary.pages_deleted,
+        files_deleted,
+        files_failed,
+        pre_checkpoint,
+        checkpoint: checkpoint_or_warn(&state.wiki, format!("delete-workspace {}", req.workspace)),
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&result).unwrap_or(serde_json::Value::Null)),
+    )
+}
 
 /// JSON request body for `POST /admin/rename-project`.
 #[derive(Deserialize)]
@@ -6273,6 +6490,16 @@ mod tests {
             ),
             (
                 "POST",
+                "/admin/delete-workspace",
+                serde_json::json!({"workspace": "default", "force": true}),
+            ),
+            (
+                "POST",
+                "/admin/rename-workspace",
+                serde_json::json!({"from": "default", "to": "renamed"}),
+            ),
+            (
+                "POST",
                 "/admin/write-page",
                 serde_json::json!({
                     "workspace": "default",
@@ -6372,6 +6599,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn multiuser_workspace_admin_routes_reach_handler_for_root() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        for (uri, payload) in [
+            (
+                "/admin/delete-workspace",
+                serde_json::json!({"workspace": "missing", "force": true}),
+            ),
+            (
+                "/admin/rename-workspace",
+                serde_json::json!({"from": "missing", "to": "renamed"}),
+            ),
+        ] {
+            let resp = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("authorization", "Bearer root-token")
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{uri} rejected root auth"
+            );
+            assert_ne!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "{uri} rejected root auth"
+            );
+        }
     }
 
     #[tokio::test]

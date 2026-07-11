@@ -34,7 +34,7 @@ pub use auto_improve::{
 };
 pub use decay::{DecayParams, retention_score};
 pub use error::{StoreError, StoreResult};
-pub use ops::{EmbeddingWrite, MoveSummary, PurgeSummary, ReorgSummary};
+pub use ops::{DeleteWorkspaceSummary, EmbeddingWrite, MoveSummary, PurgeSummary, ReorgSummary};
 pub use reader::{
     ActivityWindow, AutoImproveCandidateSession, BriefingPage, BriefingSnapshot,
     ContaminationFinding, ContaminationReport, ContaminationSummary, DecayCandidate,
@@ -46,8 +46,8 @@ pub use reader::{
 };
 pub use scope::{
     ResolvedScope, ScopeName, ScopeResolutionError, ScopeResolver, WORKSPACE_PROJECT_PAIR_REQUIRED,
-    create_explicit_scope, create_global_scope, lookup_existing_scope, lookup_global_scope,
-    resolve_many_existing_scopes,
+    create_explicit_scope, create_global_scope, lookup_existing_scope, lookup_existing_workspace,
+    lookup_global_scope, resolve_many_existing_scopes,
 };
 pub use users::{TOKEN_HASH_LEN, TOKEN_RAW_LEN, TokenPepper, generate_token, hash_token};
 pub use writer::WriterHandle;

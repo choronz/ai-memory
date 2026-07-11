@@ -54,6 +54,21 @@ pub enum StoreError {
     #[error("not found: {0}")]
     NotFound(String),
 
+    /// A workspace delete was refused because it still holds projects and the
+    /// caller did not pass `force`. Carries the project count so the admin
+    /// endpoint / CLI can report it before the operator retries with force.
+    #[error("workspace still has {0} project(s); pass force to delete anyway")]
+    WorkspaceNotEmpty(u64),
+
+    /// A workspace rename was rejected because the destination name is already
+    /// in use by another workspace (`workspaces.name` is UNIQUE).
+    #[error("workspace name '{0}' is already taken")]
+    WorkspaceNameTaken(String),
+
+    /// The supplied workspace name failed validation (empty, slash, etc.).
+    #[error("invalid workspace name: {0}")]
+    InvalidWorkspaceName(String),
+
     /// A UNIQUE constraint was violated by an insert (e.g. duplicate
     /// `users.username` / `users.email`). The string carries a
     /// human-readable explanation the CLI / admin endpoint surfaces
