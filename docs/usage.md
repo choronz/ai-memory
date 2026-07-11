@@ -78,10 +78,11 @@ The agent calls `memory_install_self_routing` and receives the slim
 `markered_block`, marker strings, rules-file hints, managed skill payloads,
 skill target hints, and overwrite guidance. It then uses its normal file-edit
 tool to preserve unrelated user content, replace or append the
-`<!-- ai-memory:start -->` / `<!-- ai-memory:end -->` block, and write each
-managed skill below the selected skill root. Skill files are ai-memory-managed
-only when they contain the managed marker, so unmanaged same-name skills should
-not be overwritten unless the human explicitly forces replacement.
+`<!-- ai-memory:start -->` / `<!-- ai-memory:end -->` block only when the
+marker delimiters appear alone on their own lines, and write each managed skill
+below the selected skill root. Skill files are ai-memory-managed only when they
+contain the managed marker, so unmanaged same-name skills should not be
+overwritten unless the human explicitly forces replacement.
 
 From a terminal:
 

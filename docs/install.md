@@ -1029,13 +1029,13 @@ default:
 
 1. A slim instruction block in `CLAUDE.md`, `AGENTS.md`, or the file passed with
    `--target`. The block is bounded by `<!-- ai-memory:start -->` and
-   `<!-- ai-memory:end -->`.
+   `<!-- ai-memory:end -->` delimiters that appear alone on their own lines.
 2. Managed ai-memory Agent Skills containing the detailed tool-routing guidance.
 
 Re-running the command is safe. If a project still has the old long ai-memory
-block between those markers, the refresh replaces that block in place with the
-slim snippet, leaves unrelated instructions before and after it alone, and
-writes a timestamped `.bak-*` backup before changing an existing file.
+block between line-anchored markers, the refresh replaces that block in place
+with the slim snippet, leaves unrelated instructions before and after it alone,
+and writes a timestamped `.bak-*` backup before changing an existing file.
 Managed skill files contain an ai-memory ownership marker; same-name user skills
 without that marker are preserved unless you explicitly force replacement.
 `install-instructions --print` previews only the instruction snippet; run

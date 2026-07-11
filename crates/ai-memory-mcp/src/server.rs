@@ -967,6 +967,31 @@ impl AiMemoryServer {
             .map_err(Self::scope_error)
     }
 
+    /// Human-readable `workspace/project` label for a resolved scope. Makes
+    /// not-found errors diagnosable — especially under cross-project
+    /// scope-bleed, where a scoped-implicit read resolves to a different
+    /// scope than a concurrent write landed in. Degrades to a placeholder
+    /// when a name lookup fails so it never turns a not-found into a harder
+    /// error.
+    async fn scope_label(
+        &self,
+        ws: ai_memory_core::WorkspaceId,
+        proj: ai_memory_core::ProjectId,
+    ) -> String {
+        let ws_name = self.reader.workspace_name_by_id(ws).await.ok().flatten();
+        let proj_name = self
+            .reader
+            .project_name_by_id(ws, proj)
+            .await
+            .ok()
+            .flatten();
+        format!(
+            "{}/{}",
+            ws_name.as_deref().unwrap_or("<unknown-workspace>"),
+            proj_name.as_deref().unwrap_or("<unknown-project>")
+        )
+    }
+
     async fn embed_query(&self, query: &str) -> Option<Vec<f32>> {
         let Some(embedder) = &self.embedder else {
             return None;
@@ -1066,8 +1091,10 @@ impl AiMemoryServer {
         self
     }
 
-    /// Search the compiled wiki via FTS5/vector/graph retrieval. Falls back
-    /// to bounded raw observation search when no compiled page matches.
+    /// Search the compiled wiki via FTS5/vector/graph retrieval. Default,
+    /// explicit project, and explicit `scopes` searches fall back to bounded
+    /// raw observation search when no compiled page matches; `global=true`
+    /// searches compiled wiki pages across projects only.
     #[tool(description = "Search the project's long-term memory wiki — \
         prior sessions, decisions, gotchas, architecture notes captured \
         by ai-memory across earlier runs. Call this BEFORE proposing \
@@ -1076,8 +1103,10 @@ impl AiMemoryServer {
         FTS5 + graph RRF + (when configured) vector RRF re-ranking. \
         Returns up to `limit` pages with HTML-marked snippets and a rank \
         score (lower rank = better match). Only latest page versions. \
-        If compiled wiki search misses, `raw_hits` contains bounded raw \
-        observation fallback matches. Default-scoped calls also return \
+        If compiled wiki search misses in default/project/`scopes` mode, \
+        `raw_hits` contains bounded raw observation fallback matches; \
+        `global=true` searches compiled wiki pages only and returns no raw \
+        fallback. Default-scoped calls also return \
         `global_scope_hits`: standing user/team preferences from the \
         reserved `_global` scope that apply across projects. Set \
         `global=true` to search EVERY \
@@ -1836,6 +1865,15 @@ impl AiMemoryServer {
                 &aps_actor,
             )
             .await?;
+        // Diagnose cross-project scope-bleed: a read with no explicit scope
+        // resolves to the active project, which may differ from the scope a
+        // concurrent write landed in — the write persists but the by-path
+        // read looks in the wrong bucket and 404s.
+        let auto_scoped = args
+            .workspace
+            .as_deref()
+            .is_none_or(|s| s.trim().is_empty())
+            && args.project.as_deref().is_none_or(|s| s.trim().is_empty());
 
         let page_path = if let Some(p) = args.path {
             PagePath::new(p)
@@ -1910,7 +1948,28 @@ impl AiMemoryServer {
                             "served_from": "db-fallback",
                         }))
                     }
-                    None => Err(McpError::internal_error(disk_err.to_string(), None)),
+                    None => {
+                        // Not on disk and not in the DB under the resolved
+                        // scope. Name the scope (and flag auto-resolution) so
+                        // scope-bleed is diagnosable from the error itself,
+                        // instead of leaking the raw disk error/path.
+                        let scope = self.scope_label(ws, proj).await;
+                        let hint = if auto_scoped {
+                            " — this scope was auto-resolved from the active \
+                             project; pass explicit workspace+project if this \
+                             is a parallel multi-project session where the \
+                             write may have landed in a different scope"
+                        } else {
+                            ""
+                        };
+                        Err(McpError::internal_error(
+                            format!(
+                                "page {} not found in resolved scope {scope}{hint}",
+                                page_path.as_str()
+                            ),
+                            None,
+                        ))
+                    }
                 }
             }
             Err(disk_err) => Err(McpError::internal_error(disk_err.to_string(), None)),
@@ -2308,8 +2367,9 @@ impl AiMemoryServer {
         asks to install or refresh ai-memory routing in this project. \
         After calling, use your Write/Edit tool to preserve non-ai-memory \
         user content: replace only an existing `<!-- ai-memory:start -->` \
-        / `<!-- ai-memory:end -->` block or append `markered_block` with \
-        one blank line, then write every `managed_skills` item beneath \
+        / `<!-- ai-memory:end -->` block whose delimiters appear alone on \
+        their own lines, or append `markered_block` with one blank line, \
+        then write every `managed_skills` item beneath \
         the chosen skill root using its `relative_path`. This tool is \
         read-only and is the source of truth for the snippet and skills. \
         Skill files are ai-memory-managed only when they contain the \
@@ -2360,7 +2420,7 @@ impl AiMemoryServer {
             },
             "notes": [
                 "Pick the filename matching your own agent identity.",
-                "If the target file already contains <!-- ai-memory:start --> / <!-- ai-memory:end -->, replace ONLY that block in place; preserve every other line.",
+                "If the target file already contains <!-- ai-memory:start --> / <!-- ai-memory:end --> delimiters alone on their own lines, replace ONLY that line-delimited block in place; ignore inline mentions and preserve every other line.",
                 "If the file doesn't exist, create it with just the markered_block (plus a trailing newline).",
                 "If the file exists but has no ai-memory markers, append the markered_block with one blank line of separation from existing content.",
                 "Install each managed_skills item under the selected skill root from target_hints using its relative_path, for example .claude/skills/<relative_path> or .agents/skills/<relative_path>.",
@@ -2896,8 +2956,9 @@ mod tests {
             "snippet must tell agents to refresh managed skill files"
         );
         assert!(
-            snippet.contains(ai_memory_core::MARKER_START)
-                && snippet.contains(ai_memory_core::MARKER_END),
+            snippet.contains("start/end HTML-comment markers")
+                && ai_memory_core::full_block().contains(ai_memory_core::MARKER_START)
+                && ai_memory_core::full_block().contains(ai_memory_core::MARKER_END),
             "snippet must preserve marker replacement guidance"
         );
     }
@@ -4324,6 +4385,55 @@ mod tests {
         assert!(
             text.contains("db-fallback"),
             "expected fallback diagnostic; got {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_read_page_missing_error_names_the_scope() {
+        let (tmp, store, server, _ws, _proj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = server.with_wiki(wiki);
+
+        // Explicit scope: the not-found error names workspace/project and the
+        // relative path (no raw disk error / absolute path leak).
+        let err = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: None,
+                    path: Some("does-not-exist.md".into()),
+                    project: Some("scratch".into()),
+                    workspace: Some("default".into()),
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
+            .await
+            .expect_err("missing page must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("default/scratch"),
+            "must name the scope; got {msg}"
+        );
+        assert!(
+            msg.contains("does-not-exist.md"),
+            "must name the path; got {msg}"
+        );
+
+        // Auto-scoped read: the error adds the parallel-session hint.
+        let err = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: None,
+                    path: Some("does-not-exist.md".into()),
+                    project: None,
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
+            .await
+            .expect_err("missing page must error");
+        assert!(
+            err.to_string().contains("auto-resolved"),
+            "auto-scoped error must hint at scope-bleed; got {err}"
         );
     }
 

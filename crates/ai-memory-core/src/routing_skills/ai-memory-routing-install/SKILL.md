@@ -19,7 +19,7 @@ The always-loaded instruction block is owned by ai-memory only between these mar
 - Start marker: `<!-- ai-memory:start -->`
 - End marker: `<!-- ai-memory:end -->`
 
-Refresh must replace the first complete marker-bounded block in place, preserving unrelated content before and after it. If no complete block exists, append the canonical block with one blank line of separation. Never edit unrelated instructions while refreshing ai-memory routing.
+Refresh must replace the first complete marker-bounded block whose start and end delimiters appear alone on their own lines, preserving unrelated content before and after it. Ignore inline mentions of marker strings inside prose or code; they are not delimiters. If no complete line-delimited block exists, append the canonical block with one blank line of separation. Never edit unrelated instructions while refreshing ai-memory routing.
 
 ## Managed skill marker
 
