@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `purge-project` and `rename-project` now write attributed rows to the
+  append-only `audit_log`, inside the same transaction as the operation
+  itself — so "which user wiped project X?" finally has an answer, and a
+  rolled-back rename (name collision) leaves no phantom trail. The
+  operator identity comes from the authenticated admin request and is
+  `NULL` for single-user/unauthenticated servers; internal sub-purges
+  (move-project's copy-purge step, the hook router's self-heal) are
+  deliberately not attributed as standalone purges ([#175]).
+
 ## [1.11.4] - 2026-07-11
 
 ### Fixed

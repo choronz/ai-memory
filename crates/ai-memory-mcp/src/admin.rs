@@ -2875,8 +2875,10 @@ pub struct PurgeProjectReport {
 async fn handle_purge_project(
     State(state): State<Arc<AdminState>>,
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
     Json(req): Json<PurgeProjectRequest>,
 ) -> impl IntoResponse {
+    let author_id = author_ext.map(|axum::Extension(u)| u);
     if !req.confirm {
         return (
             StatusCode::BAD_REQUEST,
@@ -2926,7 +2928,11 @@ async fn handle_purge_project(
         Err(e) => return e,
     };
 
-    let summary = match state.writer.purge_project(ws_id, proj_id, &label).await {
+    let summary = match state
+        .writer
+        .purge_project(ws_id, proj_id, &label, author_id)
+        .await
+    {
         Ok(s) => s,
         Err(e) => return internal_err(e.to_string()),
     };
@@ -3239,8 +3245,10 @@ pub struct RenameProjectSummary {
 
 async fn handle_rename_project(
     State(state): State<Arc<AdminState>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
     Json(req): Json<RenameProjectRequest>,
 ) -> impl IntoResponse {
+    let author_id = author_ext.map(|axum::Extension(u)| u);
     // Look up workspace + source project; 404 if either is absent.
     let (ws_id, proj_id) = match lookup_ws_proj_no_create(&state, &req.workspace, &req.from).await {
         Ok(ids) => ids,
@@ -3255,7 +3263,7 @@ async fn handle_rename_project(
     // instead of the previous false-200.
     if let Err(e) = state
         .writer
-        .rename_project(ws_id, proj_id, req.to.clone())
+        .rename_project(ws_id, proj_id, req.to.clone(), author_id)
         .await
     {
         let status = match &e {
@@ -4115,7 +4123,14 @@ async fn copy_purge_merge(
         Err(e) => return internal_err(e.to_string()),
     };
 
-    let summary = match state.writer.purge_project(src_ws, src_proj, &label).await {
+    // The source purge is an internal step of move-project (a distinct op that
+    // records its own move report); it is not attributed as a standalone
+    // `purge_project` here, so the audit author is left NULL.
+    let summary = match state
+        .writer
+        .purge_project(src_ws, src_proj, &label, None)
+        .await
+    {
         Ok(s) => s,
         Err(e) => return internal_err(e.to_string()),
     };

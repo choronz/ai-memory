@@ -154,6 +154,9 @@ pub(crate) enum WriteCmd {
         project_id: ProjectId,
         /// Human-readable `workspace/project` label forwarded into the summary.
         label: String,
+        /// Authenticated operator recorded in the `audit_log` row (NULL when
+        /// single-user / unauthenticated).
+        author_id: Option<ai_memory_core::UserId>,
         reply: oneshot::Sender<StoreResult<PurgeSummary>>,
     },
     /// Delete a workspace row (its `workspace_id` FKs cascade projects/pages/
@@ -186,6 +189,9 @@ pub(crate) enum WriteCmd {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         new_name: String,
+        /// Authenticated operator recorded in the `audit_log` row (NULL when
+        /// single-user / unauthenticated).
+        author_id: Option<ai_memory_core::UserId>,
         reply: oneshot::Sender<StoreResult<()>>,
     },
     /// Record a successfully-applied wiki-structure migration.
@@ -627,12 +633,14 @@ impl WriterHandle {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         label: impl Into<String>,
+        author_id: Option<ai_memory_core::UserId>,
     ) -> StoreResult<PurgeSummary> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::PurgeProject {
             workspace_id,
             project_id,
             label: label.into(),
+            author_id,
             reply: tx,
         })
         .await?;
@@ -723,12 +731,14 @@ impl WriterHandle {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         new_name: impl Into<String>,
+        author_id: Option<ai_memory_core::UserId>,
     ) -> StoreResult<()> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::RenameProject {
             workspace_id,
             project_id,
             new_name: new_name.into(),
+            author_id,
             reply: tx,
         })
         .await?;
@@ -1214,9 +1224,11 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 workspace_id,
                 project_id,
                 label,
+                author_id,
                 reply,
             } => {
-                let result = ops::purge_project(&mut conn, &workspace_id, &project_id, &label);
+                let result =
+                    ops::purge_project(&mut conn, &workspace_id, &project_id, &label, author_id);
                 send_or_warn(reply, result, "purge_project");
             }
             WriteCmd::DeleteWorkspace {
@@ -1253,9 +1265,16 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 workspace_id,
                 project_id,
                 new_name,
+                author_id,
                 reply,
             } => {
-                let result = ops::rename_project(&mut conn, &workspace_id, &project_id, &new_name);
+                let result = ops::rename_project(
+                    &mut conn,
+                    &workspace_id,
+                    &project_id,
+                    &new_name,
+                    author_id,
+                );
                 send_or_warn(reply, result, "rename_project");
             }
             WriteCmd::InsertWikiMigration {

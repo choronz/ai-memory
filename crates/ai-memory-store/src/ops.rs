@@ -1200,6 +1200,7 @@ pub fn rename_project(
     workspace_id: &WorkspaceId,
     project_id: &ProjectId,
     new_name: &str,
+    author_id: Option<ai_memory_core::UserId>,
 ) -> StoreResult<()> {
     let trimmed = new_name.trim();
     if trimmed.is_empty() {
@@ -1213,7 +1214,11 @@ pub fn rename_project(
         ));
     }
 
-    let rows = conn.execute(
+    // Wrap the UPDATE + audit row in one transaction so the trail can never
+    // diverge from the rename it records (on any error the tx drops without
+    // commit, rolling both back).
+    let tx = conn.transaction()?;
+    let rows = tx.execute(
         "UPDATE projects SET name = ?1 WHERE id = ?2 AND workspace_id = ?3",
         params![trimmed, project_id.as_bytes(), workspace_id.as_bytes()],
     );
@@ -1230,7 +1235,19 @@ pub fn rename_project(
             "project id {project_id} no longer exists in workspace {workspace_id} \
              (race with concurrent purge or delete)",
         ))),
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            audit(
+                &tx,
+                "rename_project",
+                Some(workspace_id.as_bytes()),
+                Some(project_id.as_bytes()),
+                None,
+                author_id.as_ref().map(ai_memory_core::UserId::as_bytes),
+                Timestamp::now().as_microsecond(),
+            )?;
+            tx.commit()?;
+            Ok(())
+        }
         Err(rusqlite::Error::SqliteFailure(err, _))
             if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
                 || err.code == rusqlite::ErrorCode::ConstraintViolation =>
@@ -1283,6 +1300,7 @@ pub fn purge_project(
     workspace_id: &WorkspaceId,
     project_id: &ProjectId,
     workspace_project_label: &str,
+    author_id: Option<ai_memory_core::UserId>,
 ) -> StoreResult<PurgeSummary> {
     let tx = conn.transaction()?;
 
@@ -1331,6 +1349,19 @@ pub fn purge_project(
     tx.execute(
         "DELETE FROM projects WHERE id = ?1 AND workspace_id = ?2",
         rusqlite::params![&pid[..], workspace_id.as_bytes()],
+    )?;
+
+    // Attributed audit trail for the destructive purge. `page_id` is None
+    // (the whole project is gone); the operator identity comes from the
+    // authenticated request (NULL when single-user / unauthenticated).
+    audit(
+        &tx,
+        "purge_project",
+        Some(workspace_id.as_bytes()),
+        Some(project_id.as_bytes()),
+        None,
+        author_id.as_ref().map(ai_memory_core::UserId::as_bytes),
+        Timestamp::now().as_microsecond(),
     )?;
 
     tx.commit()?;
@@ -3606,13 +3637,13 @@ mod tests {
         let (_tmp, mut conn, ws, proj) = fresh_db();
         // Simulate the post-purge state: project row gone.
         // `purge_project` drives the cascading deletes we want here.
-        let _ = purge_project(&mut conn, &ws, &proj, "default/scratch")
+        let _ = purge_project(&mut conn, &ws, &proj, "default/scratch", None)
             .expect("purge of fresh project should succeed");
         // Now try to rename the project that no longer exists. The
         // pre-fix code returned `Ok(())` because `UPDATE` affected
         // zero rows. The fix returns `NotFound` so admin handlers
         // can respond 404 honestly.
-        let err = rename_project(&mut conn, &ws, &proj, "renamed")
+        let err = rename_project(&mut conn, &ws, &proj, "renamed", None)
             .expect_err("rename of purged project must error");
         match err {
             StoreError::NotFound(_) => {}
@@ -3626,8 +3657,83 @@ mod tests {
     #[test]
     fn rename_project_of_live_project_succeeds() {
         let (_tmp, mut conn, ws, proj) = fresh_db();
-        rename_project(&mut conn, &ws, &proj, "renamed-live")
+        rename_project(&mut conn, &ws, &proj, "renamed-live", None)
             .expect("rename of live project must succeed");
+    }
+
+    fn seed_user(conn: &Connection, username: &str) -> ai_memory_core::UserId {
+        crate::users::insert_user(
+            conn,
+            &ai_memory_core::NewUser {
+                username: username.to_string(),
+                name: None,
+                email: None,
+            },
+            &[7u8; crate::users::TOKEN_HASH_LEN],
+        )
+        .expect("seed user")
+    }
+
+    fn audit_row_for(conn: &Connection, op: &str) -> (i64, Option<Vec<u8>>) {
+        conn.query_row(
+            "SELECT COUNT(*), MAX(author_id) FROM audit_log WHERE op = ?1",
+            [op],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    /// Attribution guard: a `purge_project` leaves exactly one `audit_log`
+    /// row tagged with the op + the authenticated operator — the
+    /// point-in-time answer to "who wiped this project?" (V16's motivating
+    /// case). Without the audit call the count would be 0.
+    #[test]
+    fn audit_log_records_purge_project_with_author() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let author = seed_user(&conn, "alice");
+
+        purge_project(&mut conn, &ws, &proj, "default/scratch", Some(author))
+            .expect("purge should succeed");
+
+        let (count, op_author) = audit_row_for(&conn, "purge_project");
+        assert_eq!(count, 1, "exactly one purge_project audit row");
+        assert_eq!(
+            op_author.as_deref(),
+            Some(&author.as_bytes()[..]),
+            "audit row must carry the purging operator"
+        );
+    }
+
+    /// A `rename_project` writes an attributed audit row, committed
+    /// atomically with the rename.
+    #[test]
+    fn audit_log_records_rename_project_with_author() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let author = seed_user(&conn, "bob");
+
+        rename_project(&mut conn, &ws, &proj, "renamed", Some(author))
+            .expect("rename should succeed");
+
+        let (count, op_author) = audit_row_for(&conn, "rename_project");
+        assert_eq!(count, 1, "exactly one rename_project audit row");
+        assert_eq!(op_author.as_deref(), Some(&author.as_bytes()[..]));
+    }
+
+    /// A failed rename (name collision) writes NO audit row — the tx that
+    /// wraps the UPDATE + audit rolls back as a unit.
+    #[test]
+    fn audit_log_omits_rename_project_on_collision() {
+        let (_tmp, mut conn, ws, _proj) = fresh_db();
+        let author = seed_user(&conn, "carol");
+        // Second project whose name we'll collide with.
+        let other = get_or_create_project(&mut conn, &ws, "taken", None).unwrap();
+
+        let err = rename_project(&mut conn, &ws, &other, "scratch", Some(author))
+            .expect_err("rename onto an existing name must fail");
+        assert!(matches!(err, StoreError::ProjectNameTaken(_)));
+
+        let (count, _) = audit_row_for(&conn, "rename_project");
+        assert_eq!(count, 0, "a rolled-back rename must leave no audit row");
     }
 
     /// Run the reader's exact FTS5 `MATCH` against the real, populated
