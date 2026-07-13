@@ -2441,6 +2441,20 @@ mod tests {
             2,
             "two inserts → two rows"
         );
+        // Idempotent misses stay out of the trail: a double-accept and a
+        // cancel of an already-accepted handoff change no row, audit nothing.
+        accept_handoff(&mut conn, &id, AgentKind::Codex, None).unwrap();
+        assert!(!cancel_handoff(&mut conn, &id).unwrap());
+        assert_eq!(
+            audit_row_for(&conn, "accept_handoff").0,
+            1,
+            "a no-op double-accept must not write a second audit row"
+        );
+        assert_eq!(
+            audit_row_for(&conn, "cancel_handoff").0,
+            1,
+            "cancelling a non-open handoff must not write an audit row"
+        );
         let ws_bytes: Option<Vec<u8>> = conn
             .query_row(
                 "SELECT workspace_id FROM audit_log WHERE op = 'accept_handoff'",

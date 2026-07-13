@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `memory_delete_page` / admin `delete-page` now write one attributed
+  `audit_log` row pointing at the deleted page id, in the same transaction
+  as the delete — completing the "who deleted the gotcha page about X?"
+  trail that purge/rename attribution started. Idempotent no-op deletes
+  write nothing. The handoff lifecycle (insert / accept / cancel) is also
+  audited, scoped to the handoff's workspace/project with a NULL author by
+  design — handoffs are agent/session-keyed, not owned by a DB user
+  ([#179]).
+
 ## [1.12.0] - 2026-07-12
 
 ### Added
