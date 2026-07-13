@@ -413,11 +413,6 @@ struct StatusArgs {
 }
 
 #[derive(Debug, Serialize)]
-struct QueryResponse<T: Serialize> {
-    hits: Vec<T>,
-}
-
-#[derive(Debug, Serialize)]
 struct MemoryQueryResponse {
     hits: Vec<ai_memory_store::PageHit>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -433,6 +428,18 @@ struct MemoryQueryResponse {
     /// `global=true`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     global_scope_hits: Vec<ai_memory_store::PageHit>,
+}
+
+/// Response for `memory_recent`. `hits` carries the current project's recent
+/// pages; `global_hits` is populated instead when the read broadened to global
+/// (repo opted into `[recall] default_global`), each hit annotated with its
+/// workspace + project. `global_hits` is omitted when empty, so a plain
+/// project-scoped response is unchanged.
+#[derive(Debug, Serialize)]
+struct MemoryRecentResponse {
+    hits: Vec<ai_memory_store::PageHit>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    global_hits: Vec<ai_memory_store::PageHitWithMeta>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1333,6 +1340,29 @@ impl AiMemoryServer {
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let limit = args.limit.unwrap_or(self.default_limit).clamp(1, 100);
+        // A repo that opted into `[recall] default_global` broadens an
+        // unscoped `memory_recent` to "most recent across every project", each
+        // hit annotated with its workspace + project. An explicit
+        // `workspace`/`project` always wins (same precedence as memory_query).
+        let explicit_scoping = args
+            .workspace
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+            || args
+                .project
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty());
+        if !explicit_scoping && self.active_project.default_global_for(&aps_actor) {
+            let global_hits = self
+                .reader
+                .recent_pages_global(limit)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            return ok_json(&MemoryRecentResponse {
+                hits: Vec::new(),
+                global_hits,
+            });
+        }
         let (ws, proj) = self
             .effective_ids_for_read_args_with_actor(
                 args.workspace.as_deref(),
@@ -1346,8 +1376,10 @@ impl AiMemoryServer {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         self.spawn_access_bump(hits.iter().map(|h| h.id).collect());
-        let response = QueryResponse { hits };
-        ok_json(&response)
+        ok_json(&MemoryRecentResponse {
+            hits,
+            global_hits: Vec::new(),
+        })
     }
 
     /// Run the M8 forget sweep over episodic pages.
@@ -4987,6 +5019,92 @@ mod tests {
             .map(|t| t.text.clone())
             .unwrap();
         assert!(text.contains("foo.md"), "expected hit; got {text}");
+    }
+
+    #[tokio::test]
+    async fn memory_recent_default_global_marker_broadens_to_all_projects() {
+        let (_tmp, store, server, ws, _pj) = setup_server().await;
+        let infra = store
+            .writer
+            .get_or_create_project(ws, "infra", None)
+            .await
+            .unwrap();
+        let ops_ws = store.writer.get_or_create_workspace("ops").await.unwrap();
+        let runbooks = store
+            .writer
+            .get_or_create_project(ops_ws, "runbooks", None)
+            .await
+            .unwrap();
+        for (w, p, path) in [(ws, infra, "cluster.md"), (ops_ws, runbooks, "deploy.md")] {
+            store
+                .writer
+                .upsert_page(NewPage {
+                    workspace_id: w,
+                    project_id: p,
+                    path: PagePath::new(path).unwrap(),
+                    title: path.into(),
+                    body: "recent body".into(),
+                    tier: Tier::Semantic,
+                    frontmatter_json: serde_json::json!({}),
+                    pinned: false,
+                    links: Vec::new(),
+                    author_id: None,
+                })
+                .await
+                .unwrap();
+        }
+        // Opt into default_global on the (empty) test actor's single slot.
+        server
+            .active_project
+            .set_for(&ai_memory_core::ActorKey::default(), ws, infra, true);
+
+        let result = server
+            .memory_recent(
+                Parameters(RecentArgs {
+                    limit: Some(10),
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(
+            text.contains("global_hits"),
+            "default_global must broaden recent across projects: {text}"
+        );
+        assert!(text.contains("cluster.md"), "{text}");
+        assert!(text.contains("deploy.md"), "{text}");
+
+        // An explicit workspace+project still scopes (no cross-project broaden).
+        let scoped = server
+            .memory_recent(
+                Parameters(RecentArgs {
+                    limit: Some(10),
+                    project: Some("runbooks".into()),
+                    workspace: Some("ops".into()),
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let scoped_text = scoped
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(scoped_text.contains("deploy.md"), "{scoped_text}");
+        assert!(
+            !scoped_text.contains("cluster.md"),
+            "explicit scope must not broaden: {scoped_text}"
+        );
     }
 
     #[tokio::test]

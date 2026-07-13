@@ -1001,6 +1001,53 @@ impl ReaderPool {
         .await
     }
 
+    /// The `limit` most-recently-updated `is_latest` pages across EVERY
+    /// project, each annotated with its workspace + project name. The
+    /// cross-project analog of [`Self::recent_pages_for_project`]; used when a
+    /// read's scope broadens to global.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn recent_pages_global(&self, limit: usize) -> StoreResult<Vec<PageHitWithMeta>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT workspaces.name, projects.name, pages.path, pages.title, \
+                        substr(pages.body, 1, 240) AS snip, \
+                        CAST(pages.updated_at AS REAL) AS rank \
+                 FROM pages \
+                 JOIN projects ON projects.id = pages.project_id \
+                 JOIN workspaces ON workspaces.id = pages.workspace_id \
+                 WHERE pages.is_latest = 1 \
+                 ORDER BY pages.updated_at DESC \
+                 LIMIT ?1",
+            )?;
+            #[allow(clippy::cast_possible_wrap)]
+            let rows = stmt.query_map(params![limit as i64], |row| {
+                let workspace_name: String = row.get(0)?;
+                let project_name: String = row.get(1)?;
+                let path: String = row.get(2)?;
+                let title: String = row.get(3)?;
+                let snippet: String = row.get(4)?;
+                let rank: f64 = row.get(5)?;
+                Ok((workspace_name, project_name, path, title, snippet, rank))
+            })?;
+            let mut hits = Vec::new();
+            for row in rows {
+                let (workspace_name, project_name, path, title, snippet, rank) = row?;
+                hits.push(PageHitWithMeta {
+                    workspace_name,
+                    project_name,
+                    path: PagePath::new(path)?,
+                    title,
+                    snippet,
+                    rank,
+                });
+            }
+            Ok(hits)
+        })
+        .await
+    }
+
     /// Return all observations for the given session, ordered by
     /// `created_at` ascending.
     ///
