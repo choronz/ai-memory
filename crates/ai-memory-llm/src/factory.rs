@@ -135,10 +135,12 @@ pub struct EmbedderConfig {
     /// Vector dimensionality. Refused on mismatch with the stored
     /// pages' dim.
     pub dim: u32,
-    /// API key.
+    /// API key (single).
     pub api_key: SecretString,
     /// Optional base URL override.
     pub base_url: Option<String>,
+    /// Optional additional API keys for rotation (Google/Gemini).
+    pub api_keys: Vec<SecretString>,
 }
 
 /// Construct an `Arc<dyn Embedder>` from the config.
@@ -162,7 +164,17 @@ pub fn build_embedder(config: EmbedderConfig) -> LlmResult<Arc<dyn Embedder>> {
             Arc::new(e)
         }
         EmbedderChoice::Google => {
-            let mut e = GoogleEmbedder::new(config.api_key, config.model, config.dim)?;
+            let keys = if config.api_keys.is_empty() {
+                vec![config.api_key]
+            } else {
+                let mut merged = config.api_keys;
+                // Ensure at least one key
+                if merged.is_empty() {
+                    merged.push(config.api_key);
+                }
+                merged
+            };
+            let mut e = GoogleEmbedder::new_with_keys(keys, config.model, config.dim)?;
             if let Some(url) = config.base_url {
                 e = e.with_base_url(url);
             }
@@ -205,8 +217,13 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             Ok(Arc::new(OpenAiProvider::new(key, config.model)?))
         }
         ProviderChoice::Gemini => {
-            let key = config.auth.require_api_key()?;
-            Ok(Arc::new(GeminiProvider::new(key, config.model)?))
+            let keys = config.auth.api_keys();
+            let keys = if keys.is_empty() {
+                vec![config.auth.require_api_key()?]
+            } else {
+                keys
+            };
+            Ok(Arc::new(GeminiProvider::new_with_keys(keys, config.model)?))
         }
         ProviderChoice::OpenAiCompat => {
             let base = config

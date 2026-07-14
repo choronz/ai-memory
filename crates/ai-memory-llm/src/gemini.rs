@@ -27,24 +27,33 @@ pub const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 /// Gemini-backed provider.
 pub struct GeminiProvider {
     client: reqwest::Client,
-    api_key: SecretString,
+    api_keys: Vec<SecretString>,
     base_url: String,
     model: String,
 }
 
 impl GeminiProvider {
-    /// Construct a provider given an API key and model id (e.g.
+    /// Construct a provider given a single API key and model id (e.g.
     /// `gemini-2.5-flash`).
     ///
     /// # Errors
     /// Returns a `reqwest::Error` if the HTTP client cannot be built.
     pub fn new(api_key: SecretString, model: impl Into<String>) -> LlmResult<Self> {
+        Self::new_with_keys(vec![api_key], model)
+    }
+
+    /// Construct a provider given multiple API keys and model id.
+    /// Keys are rotated on 429/5xx errors in round-robin fashion.
+    ///
+    /// # Errors
+    /// Returns a `reqwest::Error` if the HTTP client cannot be built.
+    pub fn new_with_keys(api_keys: Vec<SecretString>, model: impl Into<String>) -> LlmResult<Self> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
             .build()?;
         Ok(Self {
             client,
-            api_key,
+            api_keys,
             base_url: DEFAULT_BASE_URL.to_string(),
             model: model.into(),
         })
@@ -225,23 +234,61 @@ impl GeminiProvider {
             self.model
         );
         debug!(url, "POST gemini");
-        let resp = self
-            .client
-            .post(&url)
-            .header("x-goog-api-key", self.api_key.expose_secret())
-            .header("content-type", "application/json")
-            .json(body)
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = provider_error_body(resp).await;
-            return Err(LlmError::Provider {
-                status: status.as_u16(),
-                body,
-            });
+
+        let mut attempt = 0u32;
+        let mut key_idx = 0usize;
+        let max_attempts = std::cmp::max(5, self.api_keys.len()) as u32;
+
+        loop {
+            let api_key = if attempt == 0 {
+                self.api_keys.get(key_idx).cloned()
+            } else {
+                key_idx = (key_idx + 1) % self.api_keys.len();
+                self.api_keys.get(key_idx).cloned()
+            };
+
+            let Some(api_key) = api_key else {
+                return Err(LlmError::Provider {
+                    status: 500,
+                    body: "no api keys configured".into(),
+                });
+            };
+
+            let resp = self
+                .client
+                .post(&url)
+                .header("x-goog-api-key", api_key.expose_secret())
+                .header("content-type", "application/json")
+                .json(body)
+                .send()
+                .await?;
+            let status = resp.status();
+
+            let is_retryable =
+                status.as_u16() == 429 || (status.as_u16() >= 500 && status.as_u16() < 600);
+            if is_retryable && attempt < max_attempts.saturating_sub(1) {
+                attempt += 1;
+                let delay = Duration::from_secs(2u64.saturating_pow(attempt.min(4)));
+                debug!(
+                    attempt,
+                    key_index = key_idx,
+                    ?delay,
+                    status = status.as_u16(),
+                    "gemini key failed, rotating to next key"
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
+            if !status.is_success() {
+                let body = provider_error_body(resp).await;
+                return Err(LlmError::Provider {
+                    status: status.as_u16(),
+                    body,
+                });
+            }
+            return response_json_limited::<R>(resp).await;
         }
-        response_json_limited::<R>(resp).await
     }
 }
 

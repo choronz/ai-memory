@@ -67,6 +67,8 @@ pub struct CopilotAuth {
 pub enum Credential {
     /// Static API key / bearer secret.
     ApiKey(SecretString),
+    /// Multiple API keys for rotation (Gemini).
+    ApiKeys(Vec<SecretString>),
     /// Path to the OpenAI OAuth token file.
     OpenAiOAuthTokenFile(PathBuf),
     /// GitHub Copilot auth inputs.
@@ -168,6 +170,24 @@ impl ProviderAuth {
         }
     }
 
+    /// Resolve a required API-key auth method from multiple environment values.
+    #[must_use]
+    pub fn required_api_keys_from_env(
+        env_var: &'static str,
+        keys: Option<Vec<SecretString>>,
+    ) -> Self {
+        let has_keys = keys.as_ref().map(|k| !k.is_empty()).unwrap_or(false);
+        Self {
+            requirement: AuthRequirement::RequiredApiKey { env_var },
+            credential: keys.map(Credential::ApiKeys),
+            source: if has_keys {
+                CredentialSource::Environment { name: env_var }
+            } else {
+                CredentialSource::NotProvided
+            },
+        }
+    }
+
     /// Override the resolved credential with a CLI-provided API key.
     #[must_use]
     pub fn with_cli_api_key_override(mut self, key: Option<SecretString>) -> Self {
@@ -198,6 +218,9 @@ impl ProviderAuth {
     pub fn require_api_key(&self) -> LlmResult<SecretString> {
         match (&self.requirement, &self.credential) {
             (_, Some(Credential::ApiKey(key))) => Ok(key.clone()),
+            (_, Some(Credential::ApiKeys(keys))) => {
+                Ok(keys.first().cloned().unwrap_or_default())
+            }
             (_, Some(Credential::OpenAiOAuthTokenFile(_))) => Err(LlmError::NotConfigured(
                 "API key credential expected, got openai-oauth token file".into(),
             )),
@@ -228,11 +251,25 @@ impl ProviderAuth {
         }
     }
 
+    /// Extract all API keys (for providers that support key rotation).
+    ///
+    /// Returns a Vec with a single key if `ApiKey` variant, or the full
+    /// list if `ApiKeys` variant. Empty vec means no credential resolved.
+    #[must_use]
+    pub fn api_keys(&self) -> Vec<SecretString> {
+        match &self.credential {
+            Some(Credential::ApiKey(key)) => vec![key.clone()],
+            Some(Credential::ApiKeys(keys)) => keys.clone(),
+            _ => Vec::new(),
+        }
+    }
+
     /// Extract an optional API key.
     #[must_use]
     pub fn optional_api_key(&self) -> Option<SecretString> {
         match &self.credential {
             Some(Credential::ApiKey(key)) => Some(key.clone()),
+            Some(Credential::ApiKeys(keys)) => keys.first().cloned(),
             Some(
                 Credential::OpenAiOAuthTokenFile(_)
                 | Credential::Copilot(_)

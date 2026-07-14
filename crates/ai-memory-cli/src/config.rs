@@ -17,7 +17,7 @@ use figment::{
     Figment,
     providers::{Env, Format, Serialized, Toml},
 };
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
 /// Default HTTP bind address for the local single-user server.
@@ -194,6 +194,7 @@ pub struct RuntimeEnv {
     anthropic_oauth_token: Option<SecretString>,
     openai_api_key: Option<SecretString>,
     gemini_api_key: Option<SecretString>,
+    gemini_api_keys: Option<Vec<SecretString>>,
     llm_api_key: Option<SecretString>,
     llm_base_url: Option<String>,
     copilot_github_token: Option<SecretString>,
@@ -206,6 +207,28 @@ pub struct RuntimeEnv {
 
 impl RuntimeEnv {
     fn from_process() -> Self {
+        // GEMINI_API_KEYS can be comma-separated
+        let gemini_api_keys: Option<Vec<SecretString>> = env_secret("GEMINI_API_KEYS")
+            .or_else(|| env_secret("GOOGLE_API_KEYS"))
+            .map(|s| {
+                s.expose_secret()
+                    .split(',')
+                    .map(|k| k.trim())
+                    .filter(|k| !k.is_empty())
+                    .map(SecretString::from)
+                    .collect()
+            });
+        let gemini_single = env_secret("GEMINI_API_KEY").or_else(|| env_secret("GOOGLE_API_KEY"));
+        let gemini_key = if gemini_api_keys
+            .as_ref()
+            .map(|k| !k.is_empty())
+            .unwrap_or(false)
+        {
+            gemini_api_keys.as_ref().and_then(|k| k.first().cloned())
+        } else {
+            gemini_single
+        };
+
         Self {
             data_dir: env_path("AI_MEMORY_DATA_DIR"),
             home_dir: env_string("AI_MEMORY_HOME").or_else(|| env_string("HOME")),
@@ -218,9 +241,8 @@ impl RuntimeEnv {
             anthropic_oauth_token: env_secret("ANTHROPIC_OAUTH_TOKEN")
                 .or_else(|| env_secret("CLAUDE_CODE_OAUTH_TOKEN")),
             openai_api_key: env_secret("OPENAI_API_KEY"),
-            // GOOGLE_API_KEY is the older alias many Google docs still
-            // mention; accept either so users don't get tripped up.
-            gemini_api_key: env_secret("GEMINI_API_KEY").or_else(|| env_secret("GOOGLE_API_KEY")),
+            gemini_api_key: gemini_key,
+            gemini_api_keys,
             llm_api_key: env_secret("LLM_API_KEY"),
             llm_base_url: env_string("LLM_BASE_URL"),
             copilot_github_token: env_secret("COPILOT_GITHUB_TOKEN")
@@ -754,12 +776,14 @@ impl Config {
                 LlmError::NotConfigured("GEMINI_API_KEY or GOOGLE_API_KEY".into())
             })?,
         };
+        let api_keys = self.runtime_env.gemini_api_keys.clone().unwrap_or_default();
         Ok(Some(EmbedderConfig {
             provider,
             model,
             dim,
             api_key,
             base_url: self.embedding_base_url.clone(),
+            api_keys,
         }))
     }
 
@@ -826,6 +850,20 @@ impl Config {
     ) -> ProviderAuth {
         match provider.auth_requirement() {
             AuthRequirement::RequiredApiKey { env_var } => {
+                // For Gemini, use multi-key auth if available from env
+                if provider == ProviderChoice::Gemini
+                    && let Some(ref keys) = self.runtime_env.gemini_api_keys
+                    && !keys.is_empty()
+                {
+                    return ProviderAuth::required_api_keys_from_env(
+                        env_var,
+                        if let Some(override_key) = api_key_override {
+                            Some(vec![override_key])
+                        } else {
+                            Some(keys.clone())
+                        },
+                    );
+                }
                 ProviderAuth::required_api_key_from_env(env_var, self.provider_api_key(provider))
                     .with_cli_api_key_override(api_key_override)
             }

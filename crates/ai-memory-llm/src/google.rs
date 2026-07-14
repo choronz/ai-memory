@@ -22,7 +22,7 @@ pub const DEFAULT_MODEL: &str = "gemini-embedding-001";
 /// Gemini / Google Generative Language embeddings.
 pub struct GoogleEmbedder {
     client: reqwest::Client,
-    api_key: SecretString,
+    api_keys: Vec<SecretString>,
     base_url: String,
     /// Wire model id, e.g. `models/gemini-embedding-001`.
     model: String,
@@ -37,6 +37,18 @@ impl GoogleEmbedder {
     /// # Errors
     /// Propagates HTTP client construction errors.
     pub fn new(api_key: SecretString, model: impl Into<String>, dim: u32) -> LlmResult<Self> {
+        Self::new_with_keys(vec![api_key], model, dim)
+    }
+
+    /// Construct a Google embedder with multiple API keys for rotation.
+    ///
+    /// # Errors
+    /// Propagates HTTP client construction errors.
+    pub fn new_with_keys(
+        api_keys: Vec<SecretString>,
+        model: impl Into<String>,
+        dim: u32,
+    ) -> LlmResult<Self> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
             .build()?;
@@ -44,7 +56,7 @@ impl GoogleEmbedder {
         let embedding_v2 = model.contains("embedding-2");
         Ok(Self {
             client,
-            api_key,
+            api_keys,
             base_url: DEFAULT_BASE_URL.into(),
             model,
             dim,
@@ -85,22 +97,44 @@ impl GoogleEmbedder {
 
         debug!(url, model = %self.model, ?task_type, "POST google/embedContent");
         let mut attempt = 0u32;
+        let mut key_idx = 0usize;
+        let max_attempts = std::cmp::max(5, self.api_keys.len()) as u32;
+
         loop {
+            let api_key = if attempt == 0 {
+                self.api_keys.get(key_idx).cloned()
+            } else {
+                key_idx = (key_idx + 1) % self.api_keys.len();
+                self.api_keys.get(key_idx).cloned()
+            };
+
+            let Some(api_key) = api_key else {
+                return Err(LlmError::Provider {
+                    status: 500,
+                    body: "no api keys configured".into(),
+                });
+            };
+
             let resp = self
                 .client
                 .post(&url)
-                .header("x-goog-api-key", self.api_key.expose_secret())
+                .header("x-goog-api-key", api_key.expose_secret())
                 .json(&body)
                 .send()
                 .await?;
             let status = resp.status();
-            if status.as_u16() == 429 && attempt < 5 {
+
+            let is_retryable =
+                status.as_u16() == 429 || (status.as_u16() >= 500 && status.as_u16() < 600);
+            if is_retryable && attempt < max_attempts.saturating_sub(1) {
                 attempt += 1;
-                let delay = Duration::from_secs(2u64.saturating_pow(attempt));
+                let delay = Duration::from_secs(2u64.saturating_pow(attempt.min(4)));
                 debug!(
                     attempt,
+                    key_index = key_idx,
                     ?delay,
-                    "google embedContent rate-limited; retrying"
+                    status = status.as_u16(),
+                    "google embedContent key failed, rotating to next key"
                 );
                 tokio::time::sleep(delay).await;
                 continue;
