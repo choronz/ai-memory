@@ -1358,7 +1358,25 @@ fn configure_consolidator(
     let provider_name = cfg.provider.name().to_string();
     let model = cfg.model.clone();
     let retry_hint = llm_retry_hint(&provider_name, &model, cfg.base_url.as_deref());
-    let llm = build_provider(cfg).context("building LLM provider from config")?;
+    let llm = match build_provider(cfg) {
+        Ok(llm) => llm,
+        Err(e) => {
+            // A provider is configured (explicitly or via the `gemini`
+            // default) but cannot start. `memory_consolidate` / `bootstrap` /
+            // PreCompact LLM checkpointing simply stay off until a key is
+            // supplied.
+            tracing::warn!(
+                error = %e,
+                "LLM provider configured but could not be built (missing API key?); \
+                 memory_consolidate / bootstrap / PreCompact LLM checkpointing disabled"
+            );
+            return Ok(ConsolidatorSetup {
+                server,
+                consolidator: None,
+                admin_llm: None,
+            });
+        }
+    };
     let llm = provider_health.wrap_llm_provider(llm, provider_name, model, Some(retry_hint));
     info!(
         provider = llm.name(),
