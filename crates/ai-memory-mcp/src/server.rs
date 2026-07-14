@@ -252,8 +252,9 @@ should be proposed from a completed session, or at explicit wrap-up \
   ai-memory routing into this project' or 'add ai-memory to \
   CLAUDE.md / AGENTS.md'. Returns the managed routing package: the \
   slim markered snippet (`markered_block`), filename hints, \
-  `managed_skills` payloads, `target_hints` for `.claude/skills` or \
-  `.agents/skills`, and overwrite guidance. Use your own Write/Edit \
+  `managed_skills` payloads, `target_hints` for `.claude/skills`, \
+  `.agents/skills`, `.devin/skills`, and Devin's Windows global \
+  `%APPDATA%\\devin\\skills` root, and overwrite guidance. Use your own Write/Edit \
   tool to replace only the ai-memory marker block in the rules file, \
   then write each managed skill under the selected skill root. Only \
   replace same-name skill files that contain the ai-memory managed \
@@ -2043,7 +2044,8 @@ impl AiMemoryServer {
         let pre_checkpoint =
             checkpoint_or_mcp(wiki, format!("pre-memory_delete_page: {}", path.as_str()))?;
 
-        wiki.delete_page(ws, proj, &path, admission_ctx)
+        let author_id = crate::actor::author_id_from_parts(&parts);
+        wiki.delete_page(ws, proj, &path, admission_ctx, author_id)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let checkpoint = checkpoint_or_warn(wiki, format!("memory_delete_page: {}", path.as_str()));
@@ -2380,7 +2382,7 @@ impl AiMemoryServer {
         `markered_block` for the slim CLAUDE.md / AGENTS.md snippet, \
         `agent_filenames` for rules-file targets, `managed_skills` for \
         Agent Skill files, and `target_hints` for project/global \
-        `.claude/skills` and `.agents/skills` roots. Use when the user \
+        `.claude/skills`, `.agents/skills`, `.devin/skills`, and Devin Windows global roots. Use when the user \
         asks to install or refresh ai-memory routing in this project. \
         After calling, use your Write/Edit tool to preserve non-ai-memory \
         user content: replace only an existing `<!-- ai-memory:start -->` \
@@ -2417,17 +2419,23 @@ impl AiMemoryServer {
                 "gemini_cli": "AGENTS.md",
                 "antigravity_cli": "AGENTS.md",
                 "zero": "AGENTS.md",
+                "devin": "AGENTS.md",
                 "default": "AGENTS.md"
             },
             "managed_skills": managed_skills,
             "target_hints": {
                 "project": {
                     "claude_code": ".claude/skills",
-                    "agents": ".agents/skills"
+                    "agents": ".agents/skills",
+                    "devin": ".devin/skills"
                 },
                 "global": {
                     "claude_code": "~/.claude/skills",
-                    "agents": "~/.agents/skills"
+                    "agents": "~/.agents/skills",
+                    "devin": {
+                        "windows": "%APPDATA%\\devin\\skills",
+                        "non_windows": "~/.devin/skills"
+                    }
                 }
             },
             "overwrite_guidance": {
@@ -2440,7 +2448,7 @@ impl AiMemoryServer {
                 "If the target file already contains <!-- ai-memory:start --> / <!-- ai-memory:end --> delimiters alone on their own lines, replace ONLY that line-delimited block in place; ignore inline mentions and preserve every other line.",
                 "If the file doesn't exist, create it with just the markered_block (plus a trailing newline).",
                 "If the file exists but has no ai-memory markers, append the markered_block with one blank line of separation from existing content.",
-                "Install each managed_skills item under the selected skill root from target_hints using its relative_path, for example .claude/skills/<relative_path> or .agents/skills/<relative_path>.",
+                "Install each managed_skills item under the selected skill root from target_hints using its relative_path, for example .claude/skills/<relative_path>, .agents/skills/<relative_path>, .devin/skills/<relative_path>, or %APPDATA%\\devin\\skills\\<relative_path> on Windows global Devin installs.",
                 "Existing skill files containing the managed marker <!-- ai-memory-managed: routing-skill --> may be replaced; unmanaged same-name skills must not be overwritten unless the human explicitly forces replacement."
             ]
         });
@@ -3233,6 +3241,19 @@ mod tests {
             response["agent_filenames"]["default"].as_str().unwrap(),
             "AGENTS.md"
         );
+        assert_eq!(
+            response["agent_filenames"]["devin"].as_str().unwrap(),
+            "AGENTS.md"
+        );
+        // Proposed symmetrically alongside the devin assertion above:
+        // upstream added "zero" to this same payload (issue #156) without a
+        // matching assertion. Not validated against a live Zero agent in
+        // this environment — for the Zero team to confirm "AGENTS.md" is
+        // still the intended target file before relying on this.
+        assert_eq!(
+            response["agent_filenames"]["zero"].as_str().unwrap(),
+            "AGENTS.md"
+        );
 
         let managed_skills = response["managed_skills"]
             .as_array()
@@ -3275,6 +3296,12 @@ mod tests {
             ".agents/skills"
         );
         assert_eq!(
+            response["target_hints"]["project"]["devin"]
+                .as_str()
+                .unwrap(),
+            ".devin/skills"
+        );
+        assert_eq!(
             response["target_hints"]["global"]["claude_code"]
                 .as_str()
                 .unwrap(),
@@ -3286,6 +3313,18 @@ mod tests {
                 .unwrap(),
             "~/.agents/skills"
         );
+        assert_eq!(
+            response["target_hints"]["global"]["devin"]["windows"]
+                .as_str()
+                .unwrap(),
+            "%APPDATA%\\devin\\skills"
+        );
+        assert_eq!(
+            response["target_hints"]["global"]["devin"]["non_windows"]
+                .as_str()
+                .unwrap(),
+            "~/.devin/skills"
+        );
 
         let notes = response["notes"]
             .as_array()
@@ -3296,6 +3335,7 @@ mod tests {
             .join("\n");
         assert!(notes.contains(ai_memory_core::routing_skills::MANAGED_MARKER));
         assert!(notes.contains("unmanaged same-name skills"));
+        assert!(notes.contains("%APPDATA%\\devin\\skills"));
         assert!(notes.contains("explicitly forces replacement"));
     }
 
@@ -3317,8 +3357,10 @@ mod tests {
             "tool description must tell agents to install snippet and skill payloads; got: {desc}"
         );
         assert!(
-            desc.contains(".claude/skills") && desc.contains(".agents/skills"),
-            "tool description must name Claude and .agents skill targets; got: {desc}"
+            desc.contains(".claude/skills")
+                && desc.contains(".agents/skills")
+                && desc.contains(".devin/skills"),
+            "tool description must name Claude, .agents, and Devin skill targets; got: {desc}"
         );
         assert!(
             desc.contains("preserve non-ai-memory user content"),
