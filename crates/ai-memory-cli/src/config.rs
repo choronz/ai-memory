@@ -667,7 +667,7 @@ impl Config {
                 ProviderChoice::Anthropic => "claude-sonnet-4-6".to_string(),
                 ProviderChoice::AnthropicOAuth => "claude-sonnet-4-6".to_string(),
                 ProviderChoice::OpenAi => "gpt-4o-mini".to_string(),
-                ProviderChoice::Gemini => "gemini-2.5-flash".to_string(),
+                ProviderChoice::Gemini => "gemini-3.1-flash-lite".to_string(),
                 ProviderChoice::OpenAiOAuth => "gpt-5.5".to_string(),
                 ProviderChoice::Copilot => "gpt-5.5".to_string(),
                 ProviderChoice::OpenAiCompat => {
