@@ -252,8 +252,9 @@ should be proposed from a completed session, or at explicit wrap-up \
   ai-memory routing into this project' or 'add ai-memory to \
   CLAUDE.md / AGENTS.md'. Returns the managed routing package: the \
   slim markered snippet (`markered_block`), filename hints, \
-  `managed_skills` payloads, `target_hints` for `.claude/skills` or \
-  `.agents/skills`, and overwrite guidance. Use your own Write/Edit \
+  `managed_skills` payloads, `target_hints` for `.claude/skills`, \
+  `.agents/skills`, `.devin/skills`, and Devin's Windows global \
+  `%APPDATA%\\devin\\skills` root, and overwrite guidance. Use your own Write/Edit \
   tool to replace only the ai-memory marker block in the rules file, \
   then write each managed skill under the selected skill root. Only \
   replace same-name skill files that contain the ai-memory managed \
@@ -413,11 +414,6 @@ struct StatusArgs {
 }
 
 #[derive(Debug, Serialize)]
-struct QueryResponse<T: Serialize> {
-    hits: Vec<T>,
-}
-
-#[derive(Debug, Serialize)]
 struct MemoryQueryResponse {
     hits: Vec<ai_memory_store::PageHit>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -433,6 +429,18 @@ struct MemoryQueryResponse {
     /// `global=true`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     global_scope_hits: Vec<ai_memory_store::PageHit>,
+}
+
+/// Response for `memory_recent`. `hits` carries the current project's recent
+/// pages; `global_hits` is populated instead when the read broadened to global
+/// (repo opted into `[recall] default_global`), each hit annotated with its
+/// workspace + project. `global_hits` is omitted when empty, so a plain
+/// project-scoped response is unchanged.
+#[derive(Debug, Serialize)]
+struct MemoryRecentResponse {
+    hits: Vec<ai_memory_store::PageHit>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    global_hits: Vec<ai_memory_store::PageHitWithMeta>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1126,14 +1134,7 @@ impl AiMemoryServer {
         // `global` / `scopes` / `workspace` / `project` arg always wins, so
         // this only fires when the caller passed none of them.
         let explicit_scoping = !args.scopes.is_empty()
-            || args
-                .workspace
-                .as_deref()
-                .is_some_and(|s| !s.trim().is_empty())
-            || args
-                .project
-                .as_deref()
-                .is_some_and(|s| !s.trim().is_empty());
+            || named_scope_args_present(args.workspace.as_deref(), args.project.as_deref());
         let recall_global = !explicit_scoping
             && !args.global.unwrap_or(false)
             && self.active_project.default_global_for(&aps_actor);
@@ -1333,6 +1334,23 @@ impl AiMemoryServer {
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let limit = args.limit.unwrap_or(self.default_limit).clamp(1, 100);
+        // A repo that opted into `[recall] default_global` broadens an
+        // unscoped `memory_recent` to "most recent across every project", each
+        // hit annotated with its workspace + project. An explicit
+        // `workspace`/`project` always wins (same precedence as memory_query).
+        let explicit_scoping =
+            named_scope_args_present(args.workspace.as_deref(), args.project.as_deref());
+        if !explicit_scoping && self.active_project.default_global_for(&aps_actor) {
+            let global_hits = self
+                .reader
+                .recent_pages_global(limit)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            return ok_json(&MemoryRecentResponse {
+                hits: Vec::new(),
+                global_hits,
+            });
+        }
         let (ws, proj) = self
             .effective_ids_for_read_args_with_actor(
                 args.workspace.as_deref(),
@@ -1346,8 +1364,10 @@ impl AiMemoryServer {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         self.spawn_access_bump(hits.iter().map(|h| h.id).collect());
-        let response = QueryResponse { hits };
-        ok_json(&response)
+        ok_json(&MemoryRecentResponse {
+            hits,
+            global_hits: Vec::new(),
+        })
     }
 
     /// Run the M8 forget sweep over episodic pages.
@@ -2050,7 +2070,8 @@ impl AiMemoryServer {
         let pre_checkpoint =
             checkpoint_or_mcp(wiki, format!("pre-memory_delete_page: {}", path.as_str()))?;
 
-        wiki.delete_page(ws, proj, &path, admission_ctx)
+        let author_id = crate::actor::author_id_from_parts(&parts);
+        wiki.delete_page(ws, proj, &path, admission_ctx, author_id)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let checkpoint = checkpoint_or_warn(wiki, format!("memory_delete_page: {}", path.as_str()));
@@ -2387,7 +2408,7 @@ impl AiMemoryServer {
         `markered_block` for the slim CLAUDE.md / AGENTS.md snippet, \
         `agent_filenames` for rules-file targets, `managed_skills` for \
         Agent Skill files, and `target_hints` for project/global \
-        `.claude/skills` and `.agents/skills` roots. Use when the user \
+        `.claude/skills`, `.agents/skills`, `.devin/skills`, and Devin Windows global roots. Use when the user \
         asks to install or refresh ai-memory routing in this project. \
         After calling, use your Write/Edit tool to preserve non-ai-memory \
         user content: replace only an existing `<!-- ai-memory:start -->` \
@@ -2424,17 +2445,23 @@ impl AiMemoryServer {
                 "gemini_cli": "AGENTS.md",
                 "antigravity_cli": "AGENTS.md",
                 "zero": "AGENTS.md",
+                "devin": "AGENTS.md",
                 "default": "AGENTS.md"
             },
             "managed_skills": managed_skills,
             "target_hints": {
                 "project": {
                     "claude_code": ".claude/skills",
-                    "agents": ".agents/skills"
+                    "agents": ".agents/skills",
+                    "devin": ".devin/skills"
                 },
                 "global": {
                     "claude_code": "~/.claude/skills",
-                    "agents": "~/.agents/skills"
+                    "agents": "~/.agents/skills",
+                    "devin": {
+                        "windows": "%APPDATA%\\devin\\skills",
+                        "non_windows": "~/.devin/skills"
+                    }
                 }
             },
             "overwrite_guidance": {
@@ -2447,7 +2474,7 @@ impl AiMemoryServer {
                 "If the target file already contains <!-- ai-memory:start --> / <!-- ai-memory:end --> delimiters alone on their own lines, replace ONLY that line-delimited block in place; ignore inline mentions and preserve every other line.",
                 "If the file doesn't exist, create it with just the markered_block (plus a trailing newline).",
                 "If the file exists but has no ai-memory markers, append the markered_block with one blank line of separation from existing content.",
-                "Install each managed_skills item under the selected skill root from target_hints using its relative_path, for example .claude/skills/<relative_path> or .agents/skills/<relative_path>.",
+                "Install each managed_skills item under the selected skill root from target_hints using its relative_path, for example .claude/skills/<relative_path>, .agents/skills/<relative_path>, .devin/skills/<relative_path>, or %APPDATA%\\devin\\skills\\<relative_path> on Windows global Devin installs.",
                 "Existing skill files containing the managed marker <!-- ai-memory-managed: routing-skill --> may be replaced; unmanaged same-name skills must not be overwritten unless the human explicitly forces replacement."
             ]
         });
@@ -2498,6 +2525,14 @@ impl AiMemoryServer {
             }
         });
     }
+}
+
+/// True when the caller explicitly scoped the read by name — a non-empty
+/// `workspace` or `project` argument. Explicit scoping always wins over the
+/// `[recall] default_global` marker broadening; `memory_query` also counts
+/// its `scopes` list on top of this.
+fn named_scope_args_present(workspace: Option<&str>, project: Option<&str>) -> bool {
+    workspace.is_some_and(|s| !s.trim().is_empty()) || project.is_some_and(|s| !s.trim().is_empty())
 }
 
 fn ok_json<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
@@ -3240,6 +3275,19 @@ mod tests {
             response["agent_filenames"]["default"].as_str().unwrap(),
             "AGENTS.md"
         );
+        assert_eq!(
+            response["agent_filenames"]["devin"].as_str().unwrap(),
+            "AGENTS.md"
+        );
+        // Proposed symmetrically alongside the devin assertion above:
+        // upstream added "zero" to this same payload (issue #156) without a
+        // matching assertion. Not validated against a live Zero agent in
+        // this environment — for the Zero team to confirm "AGENTS.md" is
+        // still the intended target file before relying on this.
+        assert_eq!(
+            response["agent_filenames"]["zero"].as_str().unwrap(),
+            "AGENTS.md"
+        );
 
         let managed_skills = response["managed_skills"]
             .as_array()
@@ -3282,6 +3330,12 @@ mod tests {
             ".agents/skills"
         );
         assert_eq!(
+            response["target_hints"]["project"]["devin"]
+                .as_str()
+                .unwrap(),
+            ".devin/skills"
+        );
+        assert_eq!(
             response["target_hints"]["global"]["claude_code"]
                 .as_str()
                 .unwrap(),
@@ -3293,6 +3347,18 @@ mod tests {
                 .unwrap(),
             "~/.agents/skills"
         );
+        assert_eq!(
+            response["target_hints"]["global"]["devin"]["windows"]
+                .as_str()
+                .unwrap(),
+            "%APPDATA%\\devin\\skills"
+        );
+        assert_eq!(
+            response["target_hints"]["global"]["devin"]["non_windows"]
+                .as_str()
+                .unwrap(),
+            "~/.devin/skills"
+        );
 
         let notes = response["notes"]
             .as_array()
@@ -3303,6 +3369,7 @@ mod tests {
             .join("\n");
         assert!(notes.contains(ai_memory_core::routing_skills::MANAGED_MARKER));
         assert!(notes.contains("unmanaged same-name skills"));
+        assert!(notes.contains("%APPDATA%\\devin\\skills"));
         assert!(notes.contains("explicitly forces replacement"));
     }
 
@@ -3324,8 +3391,10 @@ mod tests {
             "tool description must tell agents to install snippet and skill payloads; got: {desc}"
         );
         assert!(
-            desc.contains(".claude/skills") && desc.contains(".agents/skills"),
-            "tool description must name Claude and .agents skill targets; got: {desc}"
+            desc.contains(".claude/skills")
+                && desc.contains(".agents/skills")
+                && desc.contains(".devin/skills"),
+            "tool description must name Claude, .agents, and Devin skill targets; got: {desc}"
         );
         assert!(
             desc.contains("preserve non-ai-memory user content"),
@@ -4994,6 +5063,92 @@ mod tests {
             .map(|t| t.text.clone())
             .unwrap();
         assert!(text.contains("foo.md"), "expected hit; got {text}");
+    }
+
+    #[tokio::test]
+    async fn memory_recent_default_global_marker_broadens_to_all_projects() {
+        let (_tmp, store, server, ws, _pj) = setup_server().await;
+        let infra = store
+            .writer
+            .get_or_create_project(ws, "infra", None)
+            .await
+            .unwrap();
+        let ops_ws = store.writer.get_or_create_workspace("ops").await.unwrap();
+        let runbooks = store
+            .writer
+            .get_or_create_project(ops_ws, "runbooks", None)
+            .await
+            .unwrap();
+        for (w, p, path) in [(ws, infra, "cluster.md"), (ops_ws, runbooks, "deploy.md")] {
+            store
+                .writer
+                .upsert_page(NewPage {
+                    workspace_id: w,
+                    project_id: p,
+                    path: PagePath::new(path).unwrap(),
+                    title: path.into(),
+                    body: "recent body".into(),
+                    tier: Tier::Semantic,
+                    frontmatter_json: serde_json::json!({}),
+                    pinned: false,
+                    links: Vec::new(),
+                    author_id: None,
+                })
+                .await
+                .unwrap();
+        }
+        // Opt into default_global on the (empty) test actor's single slot.
+        server
+            .active_project
+            .set_for(&ai_memory_core::ActorKey::default(), ws, infra, true);
+
+        let result = server
+            .memory_recent(
+                Parameters(RecentArgs {
+                    limit: Some(10),
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(
+            text.contains("global_hits"),
+            "default_global must broaden recent across projects: {text}"
+        );
+        assert!(text.contains("cluster.md"), "{text}");
+        assert!(text.contains("deploy.md"), "{text}");
+
+        // An explicit workspace+project still scopes (no cross-project broaden).
+        let scoped = server
+            .memory_recent(
+                Parameters(RecentArgs {
+                    limit: Some(10),
+                    project: Some("runbooks".into()),
+                    workspace: Some("ops".into()),
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let scoped_text = scoped
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(scoped_text.contains("deploy.md"), "{scoped_text}");
+        assert!(
+            !scoped_text.contains("cluster.md"),
+            "explicit scope must not broaden: {scoped_text}"
+        );
     }
 
     #[tokio::test]
