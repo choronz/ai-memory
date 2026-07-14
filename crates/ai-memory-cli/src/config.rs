@@ -356,7 +356,7 @@ impl Default for Config {
             base_path: String::new(),
             home_dir: None,
             log_level: "info".into(),
-            llm_provider: None,
+            llm_provider: Some("gemini".into()),
             llm_model: None,
             llm_base_url: None,
             llm_compat_strict: false,
