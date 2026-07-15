@@ -8,10 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Multi-API key support for Gemini/Gemini providers via `GEMINI_API_KEYS` or
-  `GOOGLE_API_KEYS` environment variables (comma-separated). Implements
-  round-robin key rotation on 429 (rate limit) and 5xx server errors with
-  exponential backoff, enabling higher throughput and resilience.
+- Multi-API key support for Gemini via `GEMINI_API_KEYS` / `GOOGLE_API_KEYS`
+  environment variables **or** the root-level `gemini_api_keys` key in
+  `config.toml` (comma-separated string or TOML array). Env vars take
+  precedence when both are present. Implements round-robin key rotation on
+  429 (rate limit) and 5xx server errors with exponential backoff, enabling
+  higher throughput and resilience.
 
 ## [1.13.0] - 2026-07-14
 

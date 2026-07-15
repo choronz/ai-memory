@@ -498,6 +498,10 @@ fn normalize_nullable_types(value: &mut serde_json::Value) {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
     #[test]
     fn prepare_schema_inlines_defs_and_strips_metadata() {
@@ -651,5 +655,199 @@ mod tests {
         let request = ChatRequest::user_prompt("emit json");
         let body = serde_json::to_value(provider.build_request(&request, None)).unwrap();
         assert!(body.pointer("/generationConfig/thinkingConfig").is_none());
+    }
+
+    /// Records the `x-goog-api-key` used per request and returns `fail_status`
+    /// for the first `fail_for` requests, then a 200 with `success_body`.
+    #[derive(Clone)]
+    struct RecordingResponder {
+        seen_keys: Arc<Mutex<Vec<String>>>,
+        request_count: Arc<AtomicUsize>,
+        fail_status: u16,
+        fail_for: usize,
+        success_body: String,
+    }
+
+    impl Respond for RecordingResponder {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let n = self.request_count.fetch_add(1, Ordering::SeqCst) + 1;
+            let api_key = req
+                .headers
+                .get("x-goog-api-key")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            self.seen_keys.lock().unwrap().push(api_key);
+            if n <= self.fail_for {
+                return ResponseTemplate::new(self.fail_status);
+            }
+            ResponseTemplate::new(200).set_body_string(self.success_body.clone())
+        }
+    }
+
+    fn generate_success_body() -> String {
+        serde_json::json!({
+            "candidates": [{ "content": { "parts": [{ "text": "hello" }] } }]
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn complete_rotates_to_next_key_on_429() {
+        let server = MockServer::start().await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let count = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1beta/models/gemini-2.5-flash:generateContent"))
+            .respond_with(RecordingResponder {
+                seen_keys: seen.clone(),
+                request_count: count.clone(),
+                fail_status: 429,
+                fail_for: 1,
+                success_body: generate_success_body(),
+            })
+            .mount(&server)
+            .await;
+
+        let provider = GeminiProvider::new_with_keys(
+            vec![SecretString::from("k0"), SecretString::from("k1")],
+            "gemini-2.5-flash",
+        )
+        .expect("gemini provider builds")
+        .with_base_url(server.uri());
+
+        let response = provider
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .expect("succeeds after rotating to the second key");
+
+        assert_eq!(response.text, "hello");
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        let seen = seen.lock().unwrap();
+        assert!(seen.contains(&"k0".to_string()));
+        assert!(seen.contains(&"k1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn complete_retries_same_key_on_429_single_key() {
+        let server = MockServer::start().await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let count = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1beta/models/gemini-2.5-flash:generateContent"))
+            .respond_with(RecordingResponder {
+                seen_keys: seen.clone(),
+                request_count: count.clone(),
+                fail_status: 429,
+                fail_for: 1,
+                success_body: generate_success_body(),
+            })
+            .mount(&server)
+            .await;
+
+        let provider =
+            GeminiProvider::new_with_keys(vec![SecretString::from("k0")], "gemini-2.5-flash")
+                .expect("gemini provider builds")
+                .with_base_url(server.uri());
+
+        let response = provider
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .expect("succeeds after one retry on the same key");
+
+        assert_eq!(response.text, "hello");
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["k0".to_string(), "k0".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_rotates_through_multiple_keys() {
+        let server = MockServer::start().await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let count = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1beta/models/gemini-2.5-flash:generateContent"))
+            .respond_with(RecordingResponder {
+                seen_keys: seen.clone(),
+                request_count: count.clone(),
+                fail_status: 429,
+                fail_for: 2,
+                success_body: generate_success_body(),
+            })
+            .mount(&server)
+            .await;
+
+        let provider = GeminiProvider::new_with_keys(
+            vec![
+                SecretString::from("k0"),
+                SecretString::from("k1"),
+                SecretString::from("k2"),
+            ],
+            "gemini-2.5-flash",
+        )
+        .expect("gemini provider builds")
+        .with_base_url(server.uri());
+
+        let response = provider
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .expect("succeeds on the third key");
+
+        assert_eq!(response.text, "hello");
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+        let seen = seen.lock().unwrap();
+        assert!(seen.contains(&"k0".to_string()));
+        assert!(seen.contains(&"k1".to_string()));
+        assert!(seen.contains(&"k2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn complete_does_not_retry_on_non_retryable_status() {
+        let server = MockServer::start().await;
+        let count = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1beta/models/gemini-2.5-flash:generateContent"))
+            .respond_with(RecordingResponder {
+                seen_keys: Arc::new(Mutex::new(Vec::new())),
+                request_count: count.clone(),
+                fail_status: 400,
+                fail_for: 999,
+                success_body: generate_success_body(),
+            })
+            .mount(&server)
+            .await;
+
+        let provider =
+            GeminiProvider::new_with_keys(vec![SecretString::from("k0")], "gemini-2.5-flash")
+                .expect("gemini provider builds")
+                .with_base_url(server.uri());
+
+        let err = provider
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .expect_err("400 is not retryable");
+        assert!(matches!(err, LlmError::Provider { status: 400, .. }));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn complete_no_keys_configured_errors() {
+        let provider = GeminiProvider::new_with_keys(vec![], "gemini-2.5-flash")
+            .expect("gemini provider builds");
+
+        let err = provider
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .expect_err("empty key list must error before any request");
+        match err {
+            LlmError::Provider { status, body } => {
+                assert_eq!(status, 500);
+                assert!(body.contains("no api keys"));
+            }
+            other => panic!("expected Provider error, got {other:?}"),
+        }
     }
 }

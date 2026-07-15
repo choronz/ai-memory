@@ -253,6 +253,8 @@ pub fn format_query_v2(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -312,5 +314,204 @@ mod tests {
             .expect("embedContent request succeeds with API-key auth");
 
         assert_eq!(embedding, vec![1.0, 0.0, 0.0]);
+    }
+
+    /// Records the `x-goog-api-key` used per request and returns `fail_status`
+    /// for the first `fail_for` requests, then a 200 with `success_body`.
+    #[derive(Clone)]
+    struct RecordingResponder {
+        seen_keys: Arc<Mutex<Vec<String>>>,
+        request_count: Arc<AtomicUsize>,
+        fail_status: u16,
+        fail_for: usize,
+        success_body: String,
+    }
+
+    impl Respond for RecordingResponder {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let n = self.request_count.fetch_add(1, Ordering::SeqCst) + 1;
+            let api_key = req
+                .headers
+                .get("x-goog-api-key")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            self.seen_keys.lock().unwrap().push(api_key);
+            if n <= self.fail_for {
+                return ResponseTemplate::new(self.fail_status);
+            }
+            ResponseTemplate::new(200).set_body_string(self.success_body.clone())
+        }
+    }
+
+    fn embed_success_body() -> String {
+        serde_json::json!({ "embedding": { "values": [1.0, 0.0, 0.0] } }).to_string()
+    }
+
+    #[tokio::test]
+    async fn embed_rotates_to_next_key_on_429() {
+        let server = MockServer::start().await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let count = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1beta/models/gemini-embedding-001:embedContent"))
+            .respond_with(RecordingResponder {
+                seen_keys: seen.clone(),
+                request_count: count.clone(),
+                fail_status: 429,
+                fail_for: 1,
+                success_body: embed_success_body(),
+            })
+            .mount(&server)
+            .await;
+
+        let embedder = GoogleEmbedder::new_with_keys(
+            vec![SecretString::from("k0"), SecretString::from("k1")],
+            "gemini-embedding-001",
+            3,
+        )
+        .expect("google embedder builds")
+        .with_base_url(server.uri());
+
+        let embedding = embedder
+            .embed_document("hello")
+            .await
+            .expect("succeeds after rotating to the second key");
+
+        assert_eq!(embedding, vec![1.0, 0.0, 0.0]);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        let seen = seen.lock().unwrap();
+        assert!(seen.contains(&"k0".to_string()));
+        assert!(seen.contains(&"k1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn embed_retries_same_key_on_429_single_key() {
+        let server = MockServer::start().await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let count = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1beta/models/gemini-embedding-001:embedContent"))
+            .respond_with(RecordingResponder {
+                seen_keys: seen.clone(),
+                request_count: count.clone(),
+                fail_status: 429,
+                fail_for: 1,
+                success_body: embed_success_body(),
+            })
+            .mount(&server)
+            .await;
+
+        let embedder = GoogleEmbedder::new_with_keys(
+            vec![SecretString::from("k0")],
+            "gemini-embedding-001",
+            3,
+        )
+        .expect("google embedder builds")
+        .with_base_url(server.uri());
+
+        let embedding = embedder
+            .embed_document("hello")
+            .await
+            .expect("succeeds after one retry on the same key");
+
+        assert_eq!(embedding, vec![1.0, 0.0, 0.0]);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["k0".to_string(), "k0".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn embed_rotates_through_multiple_keys() {
+        let server = MockServer::start().await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let count = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1beta/models/gemini-embedding-001:embedContent"))
+            .respond_with(RecordingResponder {
+                seen_keys: seen.clone(),
+                request_count: count.clone(),
+                fail_status: 429,
+                fail_for: 2,
+                success_body: embed_success_body(),
+            })
+            .mount(&server)
+            .await;
+
+        let embedder = GoogleEmbedder::new_with_keys(
+            vec![
+                SecretString::from("k0"),
+                SecretString::from("k1"),
+                SecretString::from("k2"),
+            ],
+            "gemini-embedding-001",
+            3,
+        )
+        .expect("google embedder builds")
+        .with_base_url(server.uri());
+
+        let embedding = embedder
+            .embed_document("hello")
+            .await
+            .expect("succeeds on the third key");
+
+        assert_eq!(embedding, vec![1.0, 0.0, 0.0]);
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+        let seen = seen.lock().unwrap();
+        assert!(seen.contains(&"k0".to_string()));
+        assert!(seen.contains(&"k1".to_string()));
+        assert!(seen.contains(&"k2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn embed_does_not_retry_on_non_retryable_status() {
+        let server = MockServer::start().await;
+        let count = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1beta/models/gemini-embedding-001:embedContent"))
+            .respond_with(RecordingResponder {
+                seen_keys: Arc::new(Mutex::new(Vec::new())),
+                request_count: count.clone(),
+                fail_status: 400,
+                fail_for: 999,
+                success_body: embed_success_body(),
+            })
+            .mount(&server)
+            .await;
+
+        let embedder = GoogleEmbedder::new_with_keys(
+            vec![SecretString::from("k0")],
+            "gemini-embedding-001",
+            3,
+        )
+        .expect("google embedder builds")
+        .with_base_url(server.uri());
+
+        let err = embedder
+            .embed_document("hello")
+            .await
+            .expect_err("400 is not retryable");
+        assert!(matches!(err, LlmError::Provider { status: 400, .. }));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn embed_no_keys_configured_errors() {
+        let embedder = GoogleEmbedder::new_with_keys(vec![], "gemini-embedding-001", 3)
+            .expect("google embedder builds");
+
+        let err = embedder
+            .embed_document("hello")
+            .await
+            .expect_err("empty key list must error before any request");
+        match err {
+            LlmError::Provider { status, body } => {
+                assert_eq!(status, 500);
+                assert!(body.contains("no api keys"));
+            }
+            other => panic!("expected Provider error, got {other:?}"),
+        }
     }
 }

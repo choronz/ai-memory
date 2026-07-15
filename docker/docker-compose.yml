@@ -29,8 +29,7 @@ services:
     environment:
       - RUST_LOG=ai_memory=info,ai_memory_store=info,ai_memory_wiki=info,ai_memory_mcp=info,tracing_appender=warn
       # LLM provider configured via docker/.env (gitignored). Options:
-      # anthropic | openai | openai-oauth | anthropic-oauth | copilot |
-      # gemini | openai-compat | opencode
+      # anthropic | openai | openai-oauth | anthropic-oauth | copilot | gemini | openai-compat | opencode
       # See .env.production.example for the full reference.
     healthcheck:
       test: ["CMD", "/usr/local/bin/ai-memory", "status"]

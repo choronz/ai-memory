@@ -78,6 +78,16 @@ pub struct Config {
     pub llm_provider: Option<String>,
     /// Optional LLM model override.
     pub llm_model: Option<String>,
+    /// Optional Gemini/Google API keys (comma-separated string or TOML
+    /// array) enabling round-robin rotation on 429/5xx. Loaded from the
+    /// root of `config.toml` or the `GEMINI_API_KEYS`/`GOOGLE_API_KEYS` env
+    /// vars; env takes precedence when both are present.
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "deserialize_api_keys_string_or_vec_option"
+    )]
+    pub gemini_api_keys: Option<Vec<SecretString>>,
     /// Optional LLM base URL override.
     pub llm_base_url: Option<String>,
     /// Opt-in: send `response_format=json_schema` (strict) to the
@@ -301,6 +311,38 @@ where
     })
 }
 
+/// Accept an optional `Vec<SecretString>` from either a comma-separated
+/// string (e.g. `gemini_api_keys = "k1,k2,k3"`) or a TOML/JSON array at the
+/// config root. Used for the root-level `gemini_api_keys` key.
+fn deserialize_api_keys_string_or_vec_option<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<SecretString>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Single(String),
+        Many(Vec<String>),
+    }
+    Ok(match Option::<Either>::deserialize(deserializer)? {
+        None => None,
+        Some(Either::Single(s)) => Some(split_api_keys(&s)),
+        Some(Either::Many(v)) => Some(v.into_iter().map(SecretString::from).collect()),
+    })
+}
+
+/// Split a comma-separated API-key string into [`SecretString`]s, dropping
+/// empty entries (e.g. trailing commas).
+fn split_api_keys(s: &str) -> Vec<SecretString> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(SecretString::from)
+        .collect()
+}
+
 /// `[auth]` section of `config.toml`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -380,6 +422,7 @@ impl Default for Config {
             log_level: "info".into(),
             llm_provider: Some("gemini".into()),
             llm_model: None,
+            gemini_api_keys: None,
             llm_base_url: None,
             llm_compat_strict: false,
             consolidate_on_session_end: false,
@@ -648,6 +691,18 @@ impl Config {
 
         config.data_dir = canonicalise_or_keep(&config.data_dir);
         config.runtime_env = runtime_env;
+
+        // Root-level `gemini_api_keys` in config.toml backs the multi-key
+        // rotation when no `GEMINI_API_KEYS`/`GOOGLE_API_KEYS` env var is
+        // set. Env wins; when present it already populated both the plural
+        // list and the singular key in `RuntimeEnv::from_process`.
+        let toml_keys = config.gemini_api_keys.clone().unwrap_or_default();
+        if config.runtime_env.gemini_api_keys.is_none() && !toml_keys.is_empty() {
+            config.runtime_env.gemini_api_keys = Some(toml_keys.clone());
+            // TOML plural is authoritative here, so derive the singular key
+            // from it (mirrors `RuntimeEnv::from_process`).
+            config.runtime_env.gemini_api_key = toml_keys.into_iter().next();
+        }
 
         Ok(config)
     }
@@ -1038,6 +1093,97 @@ mod tests {
                 .ok()
                 .and_then(|h| normalize_home_dir(&h))
         );
+    }
+
+    /// True when any Gemini/Google key env var is set. Used to guard tests
+    /// that assert the TOML->runtime_env merge, since env wins and the crate
+    /// forbids `unsafe_code` (so process env can't be cleared here).
+    fn gemini_env_present() -> bool {
+        [
+            "GEMINI_API_KEYS",
+            "GOOGLE_API_KEYS",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+        ]
+        .iter()
+        .any(|v| std::env::var(v).is_ok())
+    }
+
+    #[test]
+    fn load_reads_root_gemini_api_keys_string() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            "llm_model = \"gemini-3.1-flash-lite\"\ngemini_api_keys = \"k1,k2,k3\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&cfg_path), Some(tmp.path().to_path_buf())).unwrap();
+        // The raw root field is sourced only from config.toml (no AI_MEMORY_
+        // prefix), so this assertion is env-independent.
+        let raw = cfg
+            .gemini_api_keys
+            .expect("root-level gemini_api_keys parsed from TOML");
+        assert_eq!(raw.len(), 3);
+        assert_eq!(raw[0].expose_secret(), "k1");
+
+        if gemini_env_present() {
+            return;
+        }
+        let keys = cfg
+            .runtime_env
+            .gemini_api_keys
+            .expect("merged into runtime_env");
+        assert_eq!(keys.len(), 3);
+        assert_eq!(
+            cfg.runtime_env
+                .gemini_api_key
+                .as_ref()
+                .unwrap()
+                .expose_secret(),
+            "k1"
+        );
+    }
+
+    #[test]
+    fn load_reads_root_gemini_api_keys_array() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        std::fs::write(&cfg_path, "gemini_api_keys = [\"a\", \"b\"]\n").unwrap();
+        let cfg = Config::load(Some(&cfg_path), Some(tmp.path().to_path_buf())).unwrap();
+        let raw = cfg
+            .gemini_api_keys
+            .expect("root-level gemini_api_keys array parsed from TOML");
+        assert_eq!(raw.len(), 2);
+        assert_eq!(raw[1].expose_secret(), "b");
+
+        if gemini_env_present() {
+            return;
+        }
+        let keys = cfg
+            .runtime_env
+            .gemini_api_keys
+            .expect("merged into runtime_env");
+        assert_eq!(keys.len(), 2);
+    }
+
+    #[test]
+    fn load_env_gemini_api_keys_takes_precedence_over_toml() {
+        // Only meaningful when an env key is actually present (we can't set
+        // it here — crate forbids unsafe_code). When present, env must win.
+        if !gemini_env_present() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        std::fs::write(&cfg_path, "gemini_api_keys = \"toml1,toml2,toml3\"\n").unwrap();
+        let cfg = Config::load(Some(&cfg_path), Some(tmp.path().to_path_buf())).unwrap();
+        // Env keys (not the TOML value) must be what the provider sees.
+        let keys = cfg
+            .runtime_env
+            .gemini_api_keys
+            .expect("env gemini_api_keys loaded");
+        assert_ne!(keys.len(), 3);
     }
 
     #[test]

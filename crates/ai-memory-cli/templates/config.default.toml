@@ -18,6 +18,12 @@ allowed_hosts = ["localhost", "127.0.0.1", "::1"]
 # Default tracing filter (overridable by RUST_LOG).
 log_level = "info"
 
+# llm_provider = "gemini"
+llm_model = "gemini-3.1-flash-lite"
+gemini_api_keys = "api-key-1,api-key-2,api-key-3,..."
+# or as a TOML array:
+# gemini_api_keys = ["api-key-1", "api-key-2"]
+
 # Optional server-side hook ingest limiter for shared/remote installs. The rate
 # is tokens per second per actor/session source; 0 or unset disables it. Burst
 # defaults to the rate (minimum one token when enabled). Env equivalents:
@@ -122,15 +128,3 @@ enabled = true
 interval_secs = 3600
 max_sessions_per_tick = 1 # per project
 min_session_age_secs = 600
-
-# Gemini (Google Generative Language) API keys.
-# Multiple keys enable round-robin rotation on 429/5xx errors.
-# Set via environment variable: GEMINI_API_KEYS="key1,key2,key3"
-# or GOOGLE_API_KEYS (legacy alias).
-#
-# For LLM provider: AI_MEMORY_LLM_PROVIDER=gemini
-# For embeddings:  AI_MEMORY_EMBEDDING_PROVIDER=google | gemini
-#
-# Example (uncomment to use):
-# [gemini]
-# api_keys = ["your-api-key-1", "your-api-key-2"]
