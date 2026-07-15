@@ -262,7 +262,8 @@ impl RuntimeEnv {
             anthropic_oauth_token: env_secret("ANTHROPIC_OAUTH_TOKEN")
                 .or_else(|| env_secret("CLAUDE_CODE_OAUTH_TOKEN")),
             openai_api_key: env_secret("OPENAI_API_KEY"),
-            gemini_api_key: gemini_key, gemini_api_keys,
+            gemini_api_key: gemini_key,
+            gemini_api_keys,
             llm_api_key: env_secret("LLM_API_KEY"),
             llm_base_url: env_string("LLM_BASE_URL"),
             copilot_github_token: env_secret("COPILOT_GITHUB_TOKEN")
@@ -832,7 +833,8 @@ impl Config {
                 ProviderChoice::OpenAiCompat => {
                     return Err(LlmError::NotConfigured(
                         "AI_MEMORY_LLM_MODEL must be set explicitly for openai-compat \
-                         (no safe default for self-hosted / aggregator endpoints)".into(),
+                         (no safe default for self-hosted / aggregator endpoints)"
+                            .into(),
                     ));
                 }
                 ProviderChoice::OpenCode => OPENCODE_DEFAULT_MODEL.to_string(),
@@ -1261,10 +1263,7 @@ mod tests {
         .unwrap();
         let cfg = Config::load(Some(&cfg_path), Some(tmp.path().to_path_buf())).unwrap();
         assert_eq!(
-            cfg.gemini_api_key
-                .as_ref()
-                .unwrap()
-                .expose_secret(),
+            cfg.gemini_api_key.as_ref().unwrap().expose_secret(),
             "sk-solo"
         );
 
@@ -1308,7 +1307,11 @@ mod tests {
             .expect("plural TOML list wins");
         assert_eq!(keys.len(), 2);
         assert_eq!(
-            cfg.runtime_env.gemini_api_key.as_ref().unwrap().expose_secret(),
+            cfg.runtime_env
+                .gemini_api_key
+                .as_ref()
+                .unwrap()
+                .expose_secret(),
             "p1",
             "plural list supplies the singular runtime key"
         );
@@ -1404,14 +1407,12 @@ mod tests {
     #[test]
     fn resolve_gemini_keys_toml_singular_used_when_no_env() {
         // Single `gemini_api_key` at the TOML root must be accepted now.
-        let (key, keys) = resolve_gemini_keys(
-            None,
-            None,
-            Some(SecretString::from("solo")),
-            vec![],
-        );
+        let (key, keys) = resolve_gemini_keys(None, None, Some(SecretString::from("solo")), vec![]);
         assert_eq!(key.as_ref().map(|s| s.expose_secret()), Some("solo"));
-        assert!(keys.is_none(), "singular TOML key must not synthesize a list");
+        assert!(
+            keys.is_none(),
+            "singular TOML key must not synthesize a list"
+        );
     }
 
     #[test]
@@ -1419,12 +1420,8 @@ mod tests {
         // When both `gemini_api_key` and `gemini_api_keys` are in TOML, the
         // plural list wins (and supplies the singular key too).
         let toml_keys = vec![SecretString::from("p1"), SecretString::from("p2")];
-        let (key, keys) = resolve_gemini_keys(
-            None,
-            None,
-            Some(SecretString::from("solo")),
-            toml_keys,
-        );
+        let (key, keys) =
+            resolve_gemini_keys(None, None, Some(SecretString::from("solo")), toml_keys);
         assert_eq!(key.as_ref().map(|s| s.expose_secret()), Some("p1"));
         let keys = keys.expect("plural TOML keys retained");
         assert_eq!(keys.len(), 2);
@@ -1451,8 +1448,12 @@ mod tests {
         // singular key is derived as its first entry.
         let toml = vec![SecretString::from("toml1")];
         let env = vec![SecretString::from("env1"), SecretString::from("env2")];
-        let (key, keys) =
-            resolve_gemini_keys(Some(SecretString::from("env1")), Some(env.clone()), None, toml);
+        let (key, keys) = resolve_gemini_keys(
+            Some(SecretString::from("env1")),
+            Some(env.clone()),
+            None,
+            toml,
+        );
         assert_eq!(key.as_ref().map(|s| s.expose_secret()), Some("env1"));
         let keys = keys.expect("env keys retained");
         assert_eq!(keys.len(), 2);
