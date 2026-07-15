@@ -1216,21 +1216,65 @@ mod tests {
 
     #[test]
     fn load_env_gemini_api_keys_takes_precedence_over_toml() {
-        // Only meaningful when an env key is actually present (we can't set
-        // it here — crate forbids unsafe_code). When present, env must win.
-        if !gemini_env_present() {
-            return;
-        }
         let tmp = TempDir::new().unwrap();
         let cfg_path = tmp.path().join("config.toml");
         std::fs::write(&cfg_path, "gemini_api_keys = \"toml1,toml2,toml3\"\n").unwrap();
         let cfg = Config::load(Some(&cfg_path), Some(tmp.path().to_path_buf())).unwrap();
-        // Env keys (not the TOML value) must be what the provider sees.
-        let keys = cfg
-            .runtime_env
-            .gemini_api_keys
-            .expect("env gemini_api_keys loaded");
-        assert_ne!(keys.len(), 3);
+
+        if gemini_env_present() {
+            // Env must win over the TOML value, in whichever form it appears.
+            let env_plural = std::env::var("GEMINI_API_KEYS")
+                .or_else(|_| std::env::var("GOOGLE_API_KEYS"))
+                .ok();
+            match env_plural {
+                Some(env_raw) => {
+                    let env_keys: Vec<String> = env_raw
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    let keys = cfg
+                        .runtime_env
+                        .gemini_api_keys
+                        .expect("env plural keys loaded");
+                    assert_eq!(
+                        keys.len(),
+                        env_keys.len(),
+                        "env plural keys must override the toml list"
+                    );
+                    for (got, want) in keys.iter().zip(&env_keys) {
+                        assert_eq!(got.expose_secret(), want);
+                    }
+                }
+                None => {
+                    // Only a singular env key is set: the TOML list must be
+                    // ignored entirely (the singular env key wins).
+                    assert!(
+                        cfg.runtime_env.gemini_api_keys.is_none(),
+                        "toml must be ignored when only a singular env key is set"
+                    );
+                    assert!(
+                        cfg.runtime_env.gemini_api_key.is_some(),
+                        "singular env key must be resolved"
+                    );
+                }
+            }
+        } else {
+            // No env: the TOML value must back the multi-key rotation.
+            let keys = cfg
+                .runtime_env
+                .gemini_api_keys
+                .expect("toml gemini_api_keys loaded");
+            assert_eq!(keys.len(), 3);
+            assert_eq!(
+                cfg.runtime_env
+                    .gemini_api_key
+                    .as_ref()
+                    .unwrap()
+                    .expose_secret(),
+                "toml1"
+            );
+        }
     }
 
     #[test]
