@@ -343,6 +343,30 @@ fn split_api_keys(s: &str) -> Vec<SecretString> {
         .collect()
 }
 
+/// Resolve the effective Gemini keys from env vs. the root-level TOML
+/// `gemini_api_keys` value.
+///
+/// Env wins: when either a singular (`GEMINI_API_KEY`/`GOOGLE_API_KEY`) or
+/// plural (`GEMINI_API_KEYS`/`GOOGLE_API_KEYS`) env key is present, the TOML
+/// value is ignored entirely and the caller's existing env-derived keys are
+/// returned unchanged. Only when no env key is present does the TOML value
+/// back the multi-key rotation, deriving the singular key from its first
+/// entry.
+fn resolve_gemini_keys(
+    env_key: Option<SecretString>,
+    env_keys: Option<Vec<SecretString>>,
+    toml_keys: Vec<SecretString>,
+) -> (Option<SecretString>, Option<Vec<SecretString>>) {
+    if env_key.is_some() || env_keys.is_some() {
+        return (env_key, env_keys);
+    }
+    if toml_keys.is_empty() {
+        return (None, None);
+    }
+    let key = toml_keys.first().cloned();
+    (key, Some(toml_keys))
+}
+
 /// `[auth]` section of `config.toml`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -693,16 +717,17 @@ impl Config {
         config.runtime_env = runtime_env;
 
         // Root-level `gemini_api_keys` in config.toml backs the multi-key
-        // rotation when no `GEMINI_API_KEYS`/`GOOGLE_API_KEYS` env var is
-        // set. Env wins; when present it already populated both the plural
-        // list and the singular key in `RuntimeEnv::from_process`.
+        // rotation only when no Gemini env key (singular or plural) is set.
+        // Env wins; when present it already populated both the plural list and
+        // the singular key in `RuntimeEnv::from_process`.
         let toml_keys = config.gemini_api_keys.clone().unwrap_or_default();
-        if config.runtime_env.gemini_api_keys.is_none() && !toml_keys.is_empty() {
-            config.runtime_env.gemini_api_keys = Some(toml_keys.clone());
-            // TOML plural is authoritative here, so derive the singular key
-            // from it (mirrors `RuntimeEnv::from_process`).
-            config.runtime_env.gemini_api_key = toml_keys.into_iter().next();
-        }
+        let (resolved_key, resolved_keys) = resolve_gemini_keys(
+            config.runtime_env.gemini_api_key.clone(),
+            config.runtime_env.gemini_api_keys.clone(),
+            toml_keys,
+        );
+        config.runtime_env.gemini_api_key = resolved_key;
+        config.runtime_env.gemini_api_keys = resolved_keys;
 
         Ok(config)
     }
@@ -1184,6 +1209,49 @@ mod tests {
             .gemini_api_keys
             .expect("env gemini_api_keys loaded");
         assert_ne!(keys.len(), 3);
+    }
+
+    #[test]
+    fn resolve_gemini_keys_toml_used_when_no_env() {
+        let toml = vec![SecretString::from("t1"), SecretString::from("t2")];
+        let (key, keys) = resolve_gemini_keys(None, None, toml);
+        assert_eq!(key.as_ref().map(|s| s.expose_secret()), Some("t1"));
+        assert_eq!(keys.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn resolve_gemini_keys_singular_env_wins_over_toml() {
+        // Regression for H2: a singular GEMINI_API_KEY env must not be
+        // overridden by a TOML gemini_api_keys value.
+        let toml = vec![SecretString::from("toml1"), SecretString::from("toml2")];
+        let (key, keys) = resolve_gemini_keys(Some(SecretString::from("env1")), None, toml);
+        assert_eq!(key.as_ref().map(|s| s.expose_secret()), Some("env1"));
+        assert!(
+            keys.is_none(),
+            "TOML must be ignored when a singular env key is present"
+        );
+    }
+
+    #[test]
+    fn resolve_gemini_keys_plural_env_wins_over_toml() {
+        // Mirror `RuntimeEnv::from_process`: when GEMINI_API_KEYS is set, the
+        // singular key is derived as its first entry.
+        let toml = vec![SecretString::from("toml1")];
+        let env = vec![SecretString::from("env1"), SecretString::from("env2")];
+        let (key, keys) =
+            resolve_gemini_keys(Some(SecretString::from("env1")), Some(env.clone()), toml);
+        assert_eq!(key.as_ref().map(|s| s.expose_secret()), Some("env1"));
+        let keys = keys.expect("env keys retained");
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].expose_secret(), "env1");
+        assert_eq!(keys[1].expose_secret(), "env2");
+    }
+
+    #[test]
+    fn resolve_gemini_keys_empty_toml_yields_none() {
+        let (key, keys) = resolve_gemini_keys(None, None, vec![]);
+        assert!(key.is_none());
+        assert!(keys.is_none());
     }
 
     #[test]
