@@ -76,7 +76,13 @@ pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
 
 fn effective_mcp_server_url(config: &Config, args: &InstallMcpArgs) -> String {
     if let Some(url) = &args.server_url {
-        return url.clone();
+        // Normalize an explicit --server-url exactly like the config/env
+        // branch below: users habitually pass the BASE url (the same value
+        // `install-hooks --server-url` takes), and returning it verbatim
+        // rendered a config pointing at the server root, which 404s (#185).
+        // `mcp_server_url_from_base` is idempotent for full `/mcp` endpoints,
+        // so callers who already pass the endpoint are unchanged.
+        return mcp_server_url_from_base(url);
     }
     if config.server_url_configured() {
         return mcp_server_url_from_base(&config.server_url);
@@ -907,6 +913,34 @@ mod tests {
         assert_eq!(
             effective_mcp_server_url(&config, &args),
             "http://192.168.0.90:49374/mcp"
+        );
+    }
+
+    /// Regression for #185: an explicit `--server-url` passed as a BASE url
+    /// (the same value `install-hooks --server-url` takes) must gain the
+    /// `/mcp` suffix, or every client renderer emits a config pointing at
+    /// the server root, which 404s. Trailing slashes are trimmed first.
+    #[test]
+    fn mcp_server_url_explicit_base_url_gains_mcp_suffix() {
+        let config = Config::default();
+        let mut args = args_for(McpClient::ClaudeCode);
+        args.server_url = Some("https://memory.example.com".into());
+        assert_eq!(
+            effective_mcp_server_url(&config, &args),
+            "https://memory.example.com/mcp"
+        );
+
+        args.server_url = Some("https://memory.example.com/".into());
+        assert_eq!(
+            effective_mcp_server_url(&config, &args),
+            "https://memory.example.com/mcp"
+        );
+
+        // A reverse-proxy base path keeps its prefix.
+        args.server_url = Some("https://host/prefix".into());
+        assert_eq!(
+            effective_mcp_server_url(&config, &args),
+            "https://host/prefix/mcp"
         );
     }
 

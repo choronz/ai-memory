@@ -1320,9 +1320,12 @@ pub struct InstallMcpArgs {
     /// Which MCP client to render configuration for.
     #[arg(long, value_enum, default_value_t = McpClient::ClaudeCode)]
     pub client: McpClient,
-    /// MCP HTTP endpoint URL the client should connect to. Defaults to the
-    /// configured `server_url` / AI_MEMORY_SERVER_URL plus `/mcp` when set,
-    /// else loopback.
+    /// Server URL the client should connect to — either the base URL
+    /// (`https://host:49374`, the same value `install-hooks --server-url`
+    /// takes) or the full MCP endpoint (`…/mcp`); a missing `/mcp` suffix
+    /// is appended automatically (#185). Defaults to the configured
+    /// `server_url` / AI_MEMORY_SERVER_URL plus `/mcp` when set, else
+    /// loopback.
     ///
     /// `Option` (no `default_value_t`) is deliberate: see the matching
     /// comment on `InstallHooksArgs::server_url` — same bug, same fix.

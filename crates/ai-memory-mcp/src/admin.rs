@@ -21,6 +21,8 @@
 //! - `POST /admin/rename-project` — rename a project (column-only; no files move).
 //! - `POST /admin/rename-workspace` — rename a workspace and refresh scope manifests.
 //! - `POST /admin/delete-workspace` — delete a workspace and all of its projects.
+//! - `POST /admin/merge-workspace` — fold every project of one workspace into
+//!   another, then delete the emptied source workspace.
 //! - `POST /admin/move-project`   — move a project into another workspace
 //!   (copy latest pages via the write path, then purge the source).
 //! - `POST /admin/write-page`     — write or update a wiki page atomically.
@@ -492,6 +494,7 @@ fn hex_to_sha256(hex: &str) -> Result<[u8; 32], String> {
 /// - `POST /admin/purge-project`
 /// - `POST /admin/rename-project`
 /// - `POST /admin/move-project`
+/// - `POST /admin/merge-workspace`
 /// - `POST /admin/write-page`
 /// - `POST /admin/delete-page`
 /// - user-management routes under `/admin/users*`
@@ -543,6 +546,7 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/admin/move-project", post(handle_move_project))
         .route("/admin/delete-workspace", post(handle_delete_workspace))
         .route("/admin/rename-workspace", post(handle_rename_workspace))
+        .route("/admin/merge-workspace", post(handle_merge_workspace))
         .route("/admin/write-page", post(handle_write_page))
         .route("/admin/delete-page", post(handle_delete_page));
     let users = Router::new()
@@ -3130,35 +3134,52 @@ async fn handle_delete_workspace(
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Json(req): Json<DeleteWorkspaceRequest>,
 ) -> impl IntoResponse {
-    let ws_id = match lookup_ws_no_create(&state, &req.workspace).await {
-        Ok(id) => id,
-        Err(e) => return e,
-    };
+    let actor = actor_ext
+        .map(|axum::Extension(a)| a)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    match delete_workspace_core(&state, &req.workspace, req.force, actor).await {
+        Ok(result) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&result).unwrap_or(serde_json::Value::Null)),
+        ),
+        Err(resp) => resp,
+    }
+}
 
-    if !req.force {
+/// Delete a workspace and, via cascade, every project/page under it — returning
+/// the summary as data (or the HTTP error a handler surfaces verbatim). Guarded:
+/// refuses a non-empty workspace unless `force`. Shared by
+/// `handle_delete_workspace` and `handle_merge_workspace` (which drains the
+/// source workspace first, then deletes the now-empty shell with `force=false`).
+async fn delete_workspace_core(
+    state: &Arc<AdminState>,
+    workspace: &str,
+    force: bool,
+    actor: ai_memory_core::ActorContext,
+) -> Result<DeleteWorkspaceResult, MoveErr> {
+    let ws_id = lookup_ws_no_create(state, workspace).await?;
+
+    if !force {
         match state
             .reader
-            .list_projects_with_stats_for_workspace(req.workspace.clone())
+            .list_projects_with_stats_for_workspace(workspace.to_string())
             .await
         {
             Ok(projects) if !projects.is_empty() => {
-                return (
+                return Err((
                     StatusCode::CONFLICT,
                     Json(serde_json::json!({
                         "error": StoreError::WorkspaceNotEmpty(projects.len() as u64).to_string()
                     })),
-                );
+                ));
             }
             Ok(_) => {}
-            Err(e) => return internal_err(e.to_string()),
+            Err(e) => return Err(internal_err(e.to_string())),
         }
     }
 
-    let actor = actor_ext
-        .map(|axum::Extension(a)| a)
-        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
     let purge_ctx = AdmissionContext {
-        workspace: req.workspace.clone(),
+        workspace: workspace.to_string(),
         project: String::new(),
         op: AdmissionOp::PurgeWorkspace,
         actor,
@@ -3170,18 +3191,13 @@ async fn handle_delete_workspace(
         .await
     {
         Ok(ctx) => ctx,
-        Err(e) => return internal_err(e.to_string()),
+        Err(e) => return Err(internal_err(e.to_string())),
     };
 
-    let pre_checkpoint = match checkpoint_or_500(
-        &state.wiki,
-        format!("pre-delete-workspace {}", req.workspace),
-    ) {
-        Ok(oid) => oid,
-        Err(e) => return e,
-    };
+    let pre_checkpoint =
+        checkpoint_or_500(&state.wiki, format!("pre-delete-workspace {workspace}"))?;
 
-    let summary = match state.writer.delete_workspace(ws_id, req.force).await {
+    let summary = match state.writer.delete_workspace(ws_id, force).await {
         Ok(s) => s,
         Err(e) => {
             let status = match &e {
@@ -3189,7 +3205,7 @@ async fn handle_delete_workspace(
                 StoreError::NotFound(_) => StatusCode::NOT_FOUND,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
-            return (status, Json(serde_json::json!({ "error": e.to_string() })));
+            return Err((status, Json(serde_json::json!({ "error": e.to_string() }))));
         }
     };
 
@@ -3204,7 +3220,7 @@ async fn handle_delete_workspace(
     match state.wiki.remove_workspace_dir(ws_id).await {
         Ok(()) => files_deleted.push(ws_root_str.clone()),
         Err(e) => {
-            warn!(error = %e, workspace = %req.workspace, path = %ws_root_str, "delete-workspace: on-disk dir removal failed");
+            warn!(error = %e, workspace = %workspace, path = %ws_root_str, "delete-workspace: on-disk dir removal failed");
             files_failed.push(ws_root_str);
         }
     }
@@ -3218,21 +3234,17 @@ async fn handle_delete_workspace(
     state.wiki.dispatch_purge_workspace(dispatch_ctx.as_ref());
 
     state.active_project.clear_workspace(ws_id);
-    invalidate_scope_cache(&state, ScopeInvalidation::Workspace(ws_id)).await;
+    invalidate_scope_cache(state, ScopeInvalidation::Workspace(ws_id)).await;
 
-    let result = DeleteWorkspaceResult {
-        workspace: req.workspace.clone(),
+    Ok(DeleteWorkspaceResult {
+        workspace: workspace.to_string(),
         projects_deleted: summary.projects_deleted,
         pages_deleted: summary.pages_deleted,
         files_deleted,
         files_failed,
         pre_checkpoint,
-        checkpoint: checkpoint_or_warn(&state.wiki, format!("delete-workspace {}", req.workspace)),
-    };
-    (
-        StatusCode::OK,
-        Json(serde_json::to_value(&result).unwrap_or(serde_json::Value::Null)),
-    )
+        checkpoint: checkpoint_or_warn(&state.wiki, format!("delete-workspace {workspace}")),
+    })
 }
 
 /// JSON request body for `POST /admin/rename-project`.
@@ -3457,6 +3469,12 @@ pub struct PathConflict {
     pub moved_to: String,
 }
 
+/// An error response from a move: the HTTP status + JSON body a handler would
+/// have returned directly. The move core returns this as the `Err` arm so a
+/// single move can be surfaced verbatim by `handle_move_project` or aggregated
+/// by `handle_merge_workspace`.
+type MoveErr = (StatusCode, Json<serde_json::Value>);
+
 /// Lossless cross-workspace move: under the wiki mutation gate, rename the
 /// project's on-disk dir to the destination workspace, then re-stamp its
 /// `workspace_id` across every domain table (one transaction, same
@@ -3469,7 +3487,7 @@ async fn true_move_project(
     src_proj: ProjectId,
     pre_checkpoint: Option<String>,
     actor: ai_memory_core::ActorContext,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> Result<MoveProjectReport, MoveErr> {
     // Ensure the destination workspace ROW exists (FK target for the
     // re-stamp) without creating a new project — the existing project_id is
     // what we move.
@@ -3479,7 +3497,7 @@ async fn true_move_project(
         .await
     {
         Ok(ws) => ws,
-        Err(e) => return internal_err(e.to_string()),
+        Err(e) => return Err(internal_err(e.to_string())),
     };
 
     // A true move targets a FRESH destination, so its dir must not already
@@ -3487,7 +3505,7 @@ async fn true_move_project(
     // exclusive mutation guard before it renames anything.
     let dst_dir = state.wiki.project_root(dst_ws, src_proj);
     if dst_dir.exists() {
-        return (
+        return Err((
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "error": format!(
@@ -3495,7 +3513,7 @@ async fn true_move_project(
                     dst_dir.display()
                 )
             })),
-        );
+        ));
     }
 
     let move_ctx = AdmissionContext {
@@ -3518,20 +3536,20 @@ async fn true_move_project(
     {
         Ok(s) => s,
         Err(WikiError::Store(StoreError::NotFound(msg))) => {
-            return (
+            return Err((
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "error": msg })),
-            );
+            ));
         }
         Err(e @ WikiError::DestinationExists(_)) => {
-            return (
+            return Err((
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({ "error": e.to_string() })),
-            );
+            ));
         }
         Err(e) => {
             warn!(error = %e, "true-move: move aborted before completion");
-            return internal_err(format!("move aborted (nothing changed): {e}"));
+            return Err(internal_err(format!("move aborted (nothing changed): {e}")));
         }
     };
 
@@ -3578,10 +3596,7 @@ async fn true_move_project(
         pre_checkpoint,
         checkpoint,
     };
-    (
-        StatusCode::OK,
-        Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
-    )
+    Ok(report)
 }
 
 /// Token inserted between the original stem and the source-workspace
@@ -3664,34 +3679,54 @@ async fn handle_move_project(
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Json(req): Json<MoveProjectRequest>,
 ) -> impl IntoResponse {
+    // Carry the authenticated actor into both legs (move admission + the
+    // source-purge admission) so a scope-guard webhook authorizes by user.
+    let actor = actor_ext
+        .map(|axum::Extension(a)| a)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    match move_project_core(&state, &req, actor).await {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+        ),
+        Err(resp) => resp,
+    }
+}
+
+/// Validate one move request, pick the true-move vs copy-purge path, and
+/// execute it — returning the report as data (or the HTTP error a handler
+/// surfaces verbatim). Shared by `handle_move_project` (one move) and
+/// `handle_merge_workspace` (a move per source project).
+async fn move_project_core(
+    state: &Arc<AdminState>,
+    req: &MoveProjectRequest,
+    actor: ai_memory_core::ActorContext,
+) -> Result<MoveProjectReport, MoveErr> {
     // Destructive: it purges the source after copying. Require confirm.
     if !req.confirm {
-        return (
+        return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": "destructive operation requires confirm=true"
             })),
-        );
+        ));
     }
 
     // A same-workspace "move" would get-or-create the SAME project as both
     // source and destination, copy it onto itself, then purge it — data
     // loss. Reject; in-workspace renames go through rename-project.
     if req.from_workspace == req.to_workspace {
-        return (
+        return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({
                 "error": "from_workspace and to_workspace are identical; use rename-project instead"
             })),
-        );
+        ));
     }
 
     // Resolve the SOURCE without auto-creating — 404 on a typo.
     let (src_ws, src_proj) =
-        match lookup_ws_proj_no_create(&state, &req.from_workspace, &req.project).await {
-            Ok(ids) => ids,
-            Err(e) => return e,
-        };
+        lookup_ws_proj_no_create(state, &req.from_workspace, &req.project).await?;
 
     // Live-session guard: refuse to move the project the hook router is
     // currently writing to. A live session's next observation/log would carry
@@ -3699,7 +3734,7 @@ async fn handle_move_project(
     // make it fail, but the operator should consciously opt in). `force: true`
     // proceeds — safe because the move republishes the active pointer below.
     if !req.force && state.active_project.contains_project(src_proj) {
-        return (
+        return Err((
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "error": format!(
@@ -3708,7 +3743,7 @@ async fn handle_move_project(
                     req.from_workspace, req.project
                 )
             })),
-        );
+        ));
     }
 
     // Detect MERGE: does the destination workspace already hold a same-named
@@ -3719,19 +3754,16 @@ async fn handle_move_project(
             Ok(Some(_))
         ),
         Ok(None) => false,
-        Err(e) => return internal_err(e.to_string()),
+        Err(e) => return Err(internal_err(e.to_string())),
     };
 
-    let pre_checkpoint = match checkpoint_or_500(
+    let pre_checkpoint = checkpoint_or_500(
         &state.wiki,
         format!(
             "pre-move-project {}/{} -> {}/{}",
             req.from_workspace, req.project, req.to_workspace, req.project
         ),
-    ) {
-        Ok(oid) => oid,
-        Err(e) => return e,
-    };
+    )?;
 
     // FRESH destination (no same-named project there) → lossless TRUE MOVE.
     // Re-stamp the source project's workspace_id across every domain table in
@@ -3741,27 +3773,18 @@ async fn handle_move_project(
     // admission webhook. The copy+purge path below is reserved for the MERGE
     // case, where two project_ids can't be re-stamped into one
     // (UNIQUE(workspace_id, name) collision).
-    // Carry the authenticated actor into both legs (move admission + the
-    // source-purge admission) so a scope-guard webhook authorizes by user.
-    let actor = actor_ext
-        .map(|axum::Extension(a)| a)
-        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
-
     if !merged_into_existing {
-        return true_move_project(&state, &req, src_ws, src_proj, pre_checkpoint, actor).await;
+        return true_move_project(state, req, src_ws, src_proj, pre_checkpoint, actor).await;
     }
 
     // MERGE: the destination already holds a same-named project. Get-or-create
     // it (auto-creating the destination workspace) and copy the source's
     // latest pages into it, then purge the source.
-    let (dst_ws, dst_proj) = match create_ws_proj(&state, &req.to_workspace, &req.project).await {
-        Ok(ids) => ids,
-        Err(e) => return e,
-    };
+    let (dst_ws, dst_proj) = create_ws_proj(state, &req.to_workspace, &req.project).await?;
 
     copy_purge_merge(
-        &state,
-        &req,
+        state,
+        req,
         src_ws,
         src_proj,
         dst_ws,
@@ -3881,7 +3904,7 @@ async fn copy_purge_merge(
     dst_proj: ProjectId,
     pre_checkpoint: Option<String>,
     actor: ai_memory_core::ActorContext,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> Result<MoveProjectReport, MoveErr> {
     // Enumerate the source's latest pages (authoritative on is_latest).
     let summaries = match state
         .reader
@@ -3889,7 +3912,7 @@ async fn copy_purge_merge(
         .await
     {
         Ok(s) => s,
-        Err(e) => return internal_err(e.to_string()),
+        Err(e) => return Err(internal_err(e.to_string())),
     };
 
     // Single pass over the source: load each page's metadata + body
@@ -3910,14 +3933,14 @@ async fn copy_purge_merge(
             .map(|p| p.path_str.clone())
             .collect();
         if !blocking.is_empty() {
-            return (
+            return Err((
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
                     "error": "destination already has pages at these paths with different content; \
                               resolve them or re-run with on_conflict=overwrite or on_conflict=duplicate",
                     "conflicts": blocking,
                 })),
-            );
+            ));
         }
     }
 
@@ -4060,7 +4083,7 @@ async fn copy_purge_merge(
         {
             Ok(pid) => pid,
             // ANY copy failure aborts BEFORE the purge — the source survives.
-            Err(e) => return internal_err(format!("copy of {} failed: {e}", p.path_str)),
+            Err(e) => return Err(internal_err(format!("copy of {} failed: {e}", p.path_str))),
         };
         // Carry the source embedding over (skip the re-embed) when the source
         // had one for the current model.
@@ -4114,10 +4137,7 @@ async fn copy_purge_merge(
             pre_checkpoint,
             checkpoint,
         };
-        return (
-            StatusCode::OK,
-            Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
-        );
+        return Ok(report);
     }
 
     // PURGE the source — only reached when every page copied successfully.
@@ -4140,7 +4160,7 @@ async fn copy_purge_merge(
         .await
     {
         Ok(ctx) => ctx,
-        Err(e) => return internal_err(e.to_string()),
+        Err(e) => return Err(internal_err(e.to_string())),
     };
 
     // The source purge is an internal step of move-project (a distinct op that
@@ -4152,7 +4172,7 @@ async fn copy_purge_merge(
         .await
     {
         Ok(s) => s,
-        Err(e) => return internal_err(e.to_string()),
+        Err(e) => return Err(internal_err(e.to_string())),
     };
 
     // Remove the source's on-disk dir, then dispatch the non-blocking
@@ -4221,9 +4241,165 @@ async fn copy_purge_merge(
         pre_checkpoint,
         checkpoint,
     };
+    Ok(report)
+}
+
+// ---------------------------------------------------------------------
+// merge-workspace
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/merge-workspace`.
+#[derive(Deserialize)]
+struct MergeWorkspaceRequest {
+    /// Source workspace to drain and delete. Must exist; 404 on a typo.
+    from: String,
+    /// Destination workspace. Auto-created if absent (each per-project move
+    /// get-or-creates it).
+    to: String,
+    /// Mandatory confirmation. The merge moves every source project (each a
+    /// destructive move that purges the source project) and deletes the emptied
+    /// source workspace, so without `confirm: true` the server returns 400.
+    /// Defaulted so an omitted flag hits that explicit guard rather than a
+    /// generic deserialization 422.
+    #[serde(default)]
+    confirm: bool,
+    /// Override the live-session guard on every per-project move.
+    #[serde(default)]
+    force: bool,
+    /// Conflict policy for a source project that already exists in the
+    /// destination with colliding page paths (copy-purge merge). Default
+    /// `block`. Projects with no destination twin are lossless true-moves and
+    /// ignore this.
+    #[serde(default)]
+    on_conflict: OnConflict,
+}
+
+/// Wire-format report returned by `POST /admin/merge-workspace`.
+#[derive(Debug, Serialize)]
+pub struct MergeWorkspaceReport {
+    /// Source workspace label.
+    pub from: String,
+    /// Destination workspace label.
+    pub to: String,
+    /// One move report per source project, in the order they were moved.
+    pub projects_merged: Vec<MoveProjectReport>,
+    /// Whether the now-empty source workspace was deleted at the end.
+    pub source_workspace_deleted: bool,
+}
+
+/// `POST /admin/merge-workspace` — fold every project of `from` into `to`, then
+/// delete the emptied `from`. Sugar over move-project: each source project runs
+/// the same validated path, so a project that already exists in `to` merges by
+/// content (copy-purge under `on_conflict`) while a fresh one is a lossless
+/// re-stamp. Destructive (each move purges its source project and the source
+/// workspace is removed), so `confirm=true` is required. Stops at the first
+/// failing project — the moves already committed stand, and the failing project
+/// plus the source workspace are left intact for the operator to resolve and
+/// re-run (moves are idempotent).
+async fn handle_merge_workspace(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    Json(req): Json<MergeWorkspaceRequest>,
+) -> impl IntoResponse {
+    if !req.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "destructive operation requires confirm=true"
+            })),
+        );
+    }
+    if req.from == req.to {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "from and to are identical; nothing to merge"
+            })),
+        );
+    }
+
+    // Resolve the SOURCE without auto-creating — 404 on a typo, so a mistyped
+    // source can't create then immediately delete a phantom workspace.
+    if let Err(e) = lookup_ws_no_create(&state, &req.from).await {
+        return e;
+    }
+
+    let projects = match state
+        .reader
+        .list_projects_with_stats_for_workspace(req.from.clone())
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    let actor = actor_ext
+        .map(|axum::Extension(a)| a)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+
+    let mut merged: Vec<MoveProjectReport> = Vec::with_capacity(projects.len());
+    for p in &projects {
+        let move_req = MoveProjectRequest {
+            from_workspace: req.from.clone(),
+            project: p.project_name.clone(),
+            to_workspace: req.to.clone(),
+            confirm: true,
+            force: req.force,
+            on_conflict: req.on_conflict,
+        };
+        match move_project_core(&state, &move_req, actor.clone()).await {
+            Ok(report) => merged.push(report),
+            Err((status, body)) => {
+                let reason = body
+                    .0
+                    .get("error")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                return (
+                    status,
+                    Json(serde_json::json!({
+                        "error": format!(
+                            "merge stopped at project '{}' in workspace '{}'",
+                            p.project_name, req.from
+                        ),
+                        "failed_project": p.project_name,
+                        "reason": reason,
+                        "projects_merged": merged,
+                        "source_workspace_deleted": false,
+                    })),
+                );
+            }
+        }
+    }
+
+    // Every project moved → the source workspace is now empty. Delete the shell
+    // with force=false: it must be empty, so a race that repopulated it aborts
+    // safely without wiping fresh data.
+    let source_workspace_deleted =
+        match delete_workspace_core(&state, &req.from, false, actor).await {
+            Ok(_) => true,
+            Err((_status, body)) => {
+                // The moves succeeded; only the final empty-shell delete failed
+                // (e.g. a concurrent write recreated a project). No data was
+                // lost, so report success-with-caveat instead of a hard error.
+                warn!(
+                    workspace = %req.from,
+                    "merge-workspace: source drained but shell delete failed: {:?}",
+                    body
+                );
+                false
+            }
+        };
+
+    let report = MergeWorkspaceReport {
+        from: req.from,
+        to: req.to,
+        projects_merged: merged,
+        source_workspace_deleted,
+    };
     (
         StatusCode::OK,
-        Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+        Json(serde_json::to_value(&report).unwrap_or(serde_json::Value::Null)),
     )
 }
 
@@ -6498,6 +6674,196 @@ mod tests {
         assert!(active.get().is_none());
         assert!(active.get_for(&actor).is_none());
         assert!(!active.contains_workspace(ws));
+    }
+
+    #[tokio::test]
+    async fn merge_workspace_folds_projects_and_deletes_empty_source() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let state = admin_state_for_store(&tmp, &store, wiki);
+        let router = admin_router(state);
+
+        // Two fresh projects in the source; the destination has neither.
+        post_write_page(&router, "src", "alpha", "notes/a.md", "alpha body").await;
+        post_write_page(&router, "src", "beta", "notes/b.md", "beta body").await;
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/merge-workspace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "from": "src",
+                            "to": "dst",
+                            "confirm": true,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["source_workspace_deleted"], true);
+        let merged = json["projects_merged"].as_array().unwrap();
+        assert_eq!(merged.len(), 2);
+        // A fresh destination → each project is a lossless true-move.
+        assert!(merged.iter().all(|r| r["moved_via"] == "true-move"));
+
+        // The source workspace is gone; both projects now live under dst.
+        assert!(
+            store
+                .reader
+                .find_workspace("src".to_string())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let dst_ws = store
+            .reader
+            .find_workspace("dst".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .reader
+                .find_project(dst_ws, "alpha".to_string())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .reader
+                .find_project(dst_ws, "beta".to_string())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_workspace_requires_confirm() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let state = admin_state_for_store(&tmp, &store, wiki);
+        let router = admin_router(state);
+
+        post_write_page(&router, "src", "alpha", "notes/a.md", "alpha body").await;
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/merge-workspace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "from": "src",
+                            "to": "dst",
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // Nothing moved: the source workspace + project are untouched.
+        assert!(
+            store
+                .reader
+                .find_workspace("src".to_string())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_workspace_merges_colliding_project_by_content() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let state = admin_state_for_store(&tmp, &store, wiki);
+        let router = admin_router(state);
+
+        // `shared` exists in BOTH workspaces (different page paths) → the move
+        // for that project takes the copy-purge merge path, not a true-move.
+        // `solo` exists only in the source → lossless true-move.
+        post_write_page(&router, "dst", "shared", "notes/dst.md", "dst body").await;
+        post_write_page(&router, "src", "shared", "notes/src.md", "src body").await;
+        post_write_page(&router, "src", "solo", "notes/solo.md", "solo body").await;
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/merge-workspace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "from": "src",
+                            "to": "dst",
+                            "confirm": true,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["source_workspace_deleted"], true);
+        let merged = json["projects_merged"].as_array().unwrap();
+        assert_eq!(merged.len(), 2);
+        let vias: std::collections::HashSet<&str> = merged
+            .iter()
+            .filter_map(|r| r["moved_via"].as_str())
+            .collect();
+        assert!(
+            vias.contains("copy-purge"),
+            "the colliding project merged by copy-purge"
+        );
+        assert!(
+            vias.contains("true-move"),
+            "the solo project was a true-move"
+        );
+
+        // Source is gone; the merged `shared` project holds BOTH pages.
+        assert!(
+            store
+                .reader
+                .find_workspace("src".to_string())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let pages = store.reader.list_pages("dst", "shared").await.unwrap();
+        let paths: std::collections::HashSet<String> = pages.into_iter().map(|p| p.path).collect();
+        assert!(paths.contains("notes/dst.md"));
+        assert!(paths.contains("notes/src.md"));
     }
 
     fn recording_scope_invalidator(

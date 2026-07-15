@@ -1360,6 +1360,53 @@ impl ReaderPool {
         .await
     }
 
+    /// Resolve the `(workspace, project)` where a session's observations
+    /// actually landed, independent of the (possibly stale) `sessions` row.
+    ///
+    /// The `sessions` row is frozen at the first session-start (`begin_session`
+    /// uses `ON CONFLICT(id) DO NOTHING`), so a "hybrid" session that installed
+    /// its scope marker mid-flight stays anchored to the pre-marker scope. The
+    /// observation log, in contrast, carries the correct per-cwd scope for each
+    /// captured event. Returns the scope holding the most observations for the
+    /// session (ties broken by the most recent observation), or `None` when the
+    /// session has no observations.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn session_scope_from_observations(
+        &self,
+        session_id: SessionId,
+    ) -> StoreResult<Option<(WorkspaceId, ProjectId)>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT workspace_id, project_id \
+                 FROM observations \
+                 WHERE session_id = ?1 \
+                 GROUP BY workspace_id, project_id \
+                 ORDER BY COUNT(*) DESC, MAX(created_at) DESC \
+                 LIMIT 1",
+            )?;
+            let mut rows = stmt.query(params![session_id.as_bytes()])?;
+            let Some(row) = rows.next()? else {
+                return Ok(None);
+            };
+            let ws_bytes: Vec<u8> = row.get(0)?;
+            let proj_bytes: Vec<u8> = row.get(1)?;
+            let ws = WorkspaceId::from_slice(&ws_bytes).map_err(|e| {
+                StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(format!(
+                    "bad observation workspace_id: {e}"
+                )))
+            })?;
+            let proj = ProjectId::from_slice(&proj_bytes).map_err(|e| {
+                StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(format!(
+                    "bad observation project_id: {e}"
+                )))
+            })?;
+            Ok(Some((ws, proj)))
+        })
+        .await
+    }
+
     /// Load every `is_latest=1` page's embedding for the project, but
     /// only when the stored `(provider, model, dim)` matches the
     /// caller's expectation. Mismatched rows are skipped (the
