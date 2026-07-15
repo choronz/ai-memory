@@ -543,7 +543,7 @@ Recommended defaults:
 | `openai` | `gpt-5.4-mini` | Cheaper and faster hosted option. |
 | `openai-oauth` | `gpt-5.5` | ChatGPT Pro/Plus/Codex backend via `ai-memory auth login openai-oauth`; no Platform API key. |
 | `copilot` | `gpt-5.5` | GitHub Copilot Chat backend via `ai-memory auth login copilot` or `COPILOT_GITHUB_TOKEN`; requires a Copilot subscription. |
-| `gemini` | `gemini-2.5-flash` | Google-hosted option with a generous free tier. |
+| `gemini` | `gemini-3.1-flash-lite` | Google-hosted option with a generous free tier. |
 | `openai-compat` | no default | OpenRouter, Ollama, vLLM, LM Studio, and other compatible endpoints. |
 
 `openai-oauth` stores a refresh token in `<data_dir>/auth.json` and talks to

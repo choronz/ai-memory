@@ -38,7 +38,7 @@ pub struct GeminiProvider {
 
 impl GeminiProvider {
     /// Construct a provider given a single API key and model id (e.g.
-    /// `gemini-2.5-flash`).
+    /// `gemini-3.1-flash-lite`).
     ///
     /// # Errors
     /// Returns a `reqwest::Error` if the HTTP client cannot be built.
@@ -333,7 +333,7 @@ impl GeminiProvider {
 
 fn default_thinking_config_for(model: &str) -> Option<GeminiThinkingConfig> {
     let model = model.to_ascii_lowercase();
-    if model.contains("gemini-2.5-flash") {
+    if model.contains("gemini-3.1-flash-lite") {
         return Some(GeminiThinkingConfig { thinking_budget: 0 });
     }
     None
@@ -678,7 +678,7 @@ mod tests {
     #[test]
     fn build_request_disables_default_thinking_for_25_flash() {
         let provider =
-            GeminiProvider::new(SecretString::from("test-key"), "gemini-2.5-flash").unwrap();
+            GeminiProvider::new(SecretString::from("test-key"), "gemini-3.1-flash-lite").unwrap();
         let request = ChatRequest::user_prompt("emit json");
         let body = serde_json::to_value(provider.build_request(&request, None)).unwrap();
         assert_eq!(
@@ -737,7 +737,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let count = Arc::new(AtomicUsize::new(0));
         Mock::given(method("POST"))
-            .and(path("/v1beta/models/gemini-2.5-flash:generateContent"))
+            .and(path("/v1beta/models/gemini-3.1-flash-lite:generateContent"))
             .respond_with(RecordingResponder {
                 seen_keys: seen.clone(),
                 request_count: count.clone(),
@@ -750,7 +750,7 @@ mod tests {
 
         let provider = GeminiProvider::new_with_keys(
             vec![SecretString::from("k0"), SecretString::from("k1")],
-            "gemini-2.5-flash",
+            "gemini-3.1-flash-lite",
         )
         .expect("gemini provider builds")
         .with_base_url(server.uri());
@@ -774,7 +774,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let count = Arc::new(AtomicUsize::new(0));
         Mock::given(method("POST"))
-            .and(path("/v1beta/models/gemini-2.5-flash:generateContent"))
+            .and(path("/v1beta/models/gemini-3.1-flash-lite:generateContent"))
             .respond_with(RecordingResponder {
                 seen_keys: seen.clone(),
                 request_count: count.clone(),
@@ -786,7 +786,7 @@ mod tests {
             .await;
 
         let provider =
-            GeminiProvider::new_with_keys(vec![SecretString::from("k0")], "gemini-2.5-flash")
+            GeminiProvider::new_with_keys(vec![SecretString::from("k0")], "gemini-3.1-flash-lite")
                 .expect("gemini provider builds")
                 .with_base_url(server.uri());
 
@@ -809,7 +809,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let count = Arc::new(AtomicUsize::new(0));
         Mock::given(method("POST"))
-            .and(path("/v1beta/models/gemini-2.5-flash:generateContent"))
+            .and(path("/v1beta/models/gemini-3.1-flash-lite:generateContent"))
             .respond_with(RecordingResponder {
                 seen_keys: seen.clone(),
                 request_count: count.clone(),
@@ -826,7 +826,7 @@ mod tests {
                 SecretString::from("k1"),
                 SecretString::from("k2"),
             ],
-            "gemini-2.5-flash",
+            "gemini-3.1-flash-lite",
         )
         .expect("gemini provider builds")
         .with_base_url(server.uri());
@@ -849,7 +849,7 @@ mod tests {
         let server = MockServer::start().await;
         let count = Arc::new(AtomicUsize::new(0));
         Mock::given(method("POST"))
-            .and(path("/v1beta/models/gemini-2.5-flash:generateContent"))
+            .and(path("/v1beta/models/gemini-3.1-flash-lite:generateContent"))
             .respond_with(RecordingResponder {
                 seen_keys: Arc::new(Mutex::new(Vec::new())),
                 request_count: count.clone(),
@@ -861,7 +861,7 @@ mod tests {
             .await;
 
         let provider =
-            GeminiProvider::new_with_keys(vec![SecretString::from("k0")], "gemini-2.5-flash")
+            GeminiProvider::new_with_keys(vec![SecretString::from("k0")], "gemini-3.1-flash-lite")
                 .expect("gemini provider builds")
                 .with_base_url(server.uri());
 
@@ -875,7 +875,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_no_keys_configured_errors() {
-        let provider = GeminiProvider::new_with_keys(vec![], "gemini-2.5-flash")
+        let provider = GeminiProvider::new_with_keys(vec![], "gemini-3.1-flash-lite")
             .expect("gemini provider builds");
 
         let err = provider
@@ -897,7 +897,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let count = Arc::new(AtomicUsize::new(0));
         Mock::given(method("POST"))
-            .and(path("/v1beta/models/gemini-2.5-flash:generateContent"))
+            .and(path("/v1beta/models/gemini-3.1-flash-lite:generateContent"))
             .respond_with(RecordingResponder {
                 seen_keys: seen.clone(),
                 request_count: count.clone(),
@@ -910,7 +910,7 @@ mod tests {
 
         let provider = GeminiProvider::new_with_keys(
             vec![SecretString::from("k0"), SecretString::from("k1")],
-            "gemini-2.5-flash",
+            "gemini-3.1-flash-lite",
         )
         .expect("gemini provider builds")
         .with_base_url(server.uri());
@@ -933,7 +933,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let count = Arc::new(AtomicUsize::new(0));
         Mock::given(method("POST"))
-            .and(path("/v1beta/models/gemini-2.5-flash:generateContent"))
+            .and(path("/v1beta/models/gemini-3.1-flash-lite:generateContent"))
             .respond_with(RecordingResponder {
                 seen_keys: seen.clone(),
                 request_count: count.clone(),
@@ -946,7 +946,7 @@ mod tests {
 
         let provider = GeminiProvider::new_with_keys(
             vec![SecretString::from("k0"), SecretString::from("k1")],
-            "gemini-2.5-flash",
+            "gemini-3.1-flash-lite",
         )
         .expect("gemini provider builds")
         .with_base_url(server.uri());
@@ -973,7 +973,7 @@ mod tests {
 
         let provider = GeminiProvider::new_with_keys(
             vec![SecretString::from("k0"), SecretString::from("k1")],
-            "gemini-2.5-flash",
+            "gemini-3.1-flash-lite",
         )
         .expect("gemini provider builds")
         .with_base_url(dead_uri);
@@ -996,7 +996,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let count = Arc::new(AtomicUsize::new(0));
         Mock::given(method("POST"))
-            .and(path("/v1beta/models/gemini-2.5-flash:generateContent"))
+            .and(path("/v1beta/models/gemini-3.1-flash-lite:generateContent"))
             .respond_with(RecordingResponder {
                 seen_keys: seen.clone(),
                 request_count: count.clone(),
@@ -1009,7 +1009,7 @@ mod tests {
 
         let provider = GeminiProvider::new_with_keys(
             vec![SecretString::from("k0"), SecretString::from("k1")],
-            "gemini-2.5-flash",
+            "gemini-3.1-flash-lite",
         )
         .expect("gemini provider builds")
         .with_base_url(server.uri());

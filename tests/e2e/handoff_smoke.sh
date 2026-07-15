@@ -87,8 +87,8 @@ SERVER_URL="http://127.0.0.1:$PORT"
 
 # Two deliberately different Gemini variants. Both are free-tier;
 # overridable via env when the defaults rotate out.
-MODEL_A="${MODEL_A:-gemini-2.5-flash}"
-MODEL_B="${MODEL_B:-gemini-2.5-flash-lite}"
+MODEL_A="${MODEL_A:-gemini-3.1-flash-lite}"
+MODEL_B="${MODEL_B:-gemini-3.1-flash-lite}"
 
 # Isolate ai-memory's data dir; leave $HOME alone so cargo's target
 # cache + the user's git config etc. stay accessible.
@@ -120,7 +120,7 @@ AUTH_HEADER="Authorization: Bearer $AUTH_TOKEN"
 # Usage: gemini_call <model> <prompt-string>
 # Echoes the model's text response to stdout. thinkingBudget=0
 # disables reasoning tokens so maxOutputTokens is spent on the actual
-# answer (gemini-2.5-flash is a reasoning model by default).
+# answer (gemini-3.1-flash-lite is a reasoning model by default).
 gemini_call() {
     local model="$1" prompt="$2"
     local body
