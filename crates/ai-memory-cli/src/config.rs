@@ -352,20 +352,30 @@ fn split_api_keys(s: &str) -> Vec<SecretString> {
 /// Resolve the effective Gemini keys from env vs. the root-level TOML
 /// `gemini_api_keys` value.
 ///
-/// Env wins: when either a singular (`GEMINI_API_KEY`/`GOOGLE_API_KEY`) or
-/// plural (`GEMINI_API_KEYS`/`GOOGLE_API_KEYS`) env key is present, the TOML
-/// value is ignored entirely and the caller's existing env-derived keys are
-/// returned unchanged. Only when no env key is present does the TOML value
-/// back the multi-key rotation, deriving the singular key from its first
-/// entry.
+/// Precedence (most to least specific):
+/// 1. Plural env (`GEMINI_API_KEYS`/`GOOGLE_API_KEYS`) — wins over everything.
+/// 2. Singular env (`GEMINI_API_KEY`/`GOOGLE_API_KEY`).
+/// 3. TOML `gemini_api_keys`.
+///
+/// Within any of the above, a plural key list always overrides a singular
+/// key: when both a singular and a plural value are present, the plural list
+/// is used and the singular value is ignored (env and TOML alike).
 fn resolve_gemini_keys(
     env_key: Option<SecretString>,
     env_keys: Option<Vec<SecretString>>,
     toml_keys: Vec<SecretString>,
 ) -> (Option<SecretString>, Option<Vec<SecretString>>) {
-    if env_key.is_some() || env_keys.is_some() {
-        return (env_key, env_keys);
+    // Plural env wins outright and subsumes any singular env key.
+    if let Some(keys) = &env_keys
+        && !keys.is_empty()
+    {
+        return (keys.first().cloned(), Some(keys.clone()));
     }
+    // Singular env wins over TOML.
+    if let Some(key) = env_key {
+        return (Some(key), None);
+    }
+    // TOML backs the multi-key rotation when no env key is present.
     if toml_keys.is_empty() {
         return (None, None);
     }
@@ -1318,6 +1328,28 @@ mod tests {
         let (key, keys) = resolve_gemini_keys(None, None, vec![]);
         assert!(key.is_none());
         assert!(keys.is_none());
+    }
+
+    #[test]
+    fn resolve_gemini_keys_plural_env_overrides_singular_env() {
+        // Regression: when both the singular (GEMINI_API_KEY) and plural
+        // (GEMINI_API_KEYS) env vars are present, the plural list must win and
+        // the singular value must be ignored outright.
+        let env = vec![SecretString::from("env1"), SecretString::from("env2")];
+        let (key, keys) = resolve_gemini_keys(
+            Some(SecretString::from("singular")),
+            Some(env.clone()),
+            vec![],
+        );
+        assert_eq!(
+            key.as_ref().map(|s| s.expose_secret()),
+            Some("env1"),
+            "plural env must supply the singular key too"
+        );
+        let keys = keys.expect("plural env keys retained");
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].expose_secret(), "env1");
+        assert_eq!(keys[1].expose_secret(), "env2");
     }
 
     #[test]
