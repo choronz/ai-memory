@@ -1392,10 +1392,16 @@ impl ReaderPool {
             };
             let ws_bytes: Vec<u8> = row.get(0)?;
             let proj_bytes: Vec<u8> = row.get(1)?;
-            let ws = WorkspaceId::from_slice(&ws_bytes)
-                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, 0))?;
-            let proj = ProjectId::from_slice(&proj_bytes)
-                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, 0))?;
+            let ws = WorkspaceId::from_slice(&ws_bytes).map_err(|e| {
+                StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(format!(
+                    "bad observation workspace_id: {e}"
+                )))
+            })?;
+            let proj = ProjectId::from_slice(&proj_bytes).map_err(|e| {
+                StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(format!(
+                    "bad observation project_id: {e}"
+                )))
+            })?;
             Ok(Some((ws, proj)))
         })
         .await

@@ -41,6 +41,15 @@ Webhooks fire on these `op` values today (extensible enum):
   `write-page`, `/admin/write-page`, the lint rewriter, hook synthesis.
 - `consolidate` — LLM consolidation writes from the consolidator
   (SessionEnd opt-in + PreCompact + manual `memory_consolidate`).
+  **Fires up to twice per consolidation**: once as an admission *preflight*
+  before the LLM call — with an **empty body** and the target page path (for
+  multi-page runs, the canonical `sessions/<id>.md` anchor path) — and again
+  as the normal write-time check with the real content. Treat blocking calls
+  as **decisions, not delivery events**: gate on `op` / `actor` / `workspace`
+  / `project` / path, don't reject solely because the body is empty, and
+  don't count blocking calls as one-write-happened side effects (use a
+  non-blocking observer webhook for that). Any mutation returned during the
+  preflight is discarded.
 - `delete` — a single page is removed (`Wiki::delete_page`, triggered by the
   `memory_delete_page` MCP tool). Carries the page path, no body; fired
   **before** the file is removed so a mirror can `git rm` the same path. The
