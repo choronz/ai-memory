@@ -41,32 +41,50 @@ fn try_appender(dir: &Path) -> Option<RollingFileAppender> {
         .ok()
 }
 
-/// Resolve the file appender through the fallback chain, warning on stderr
-/// with the exact failing path at each degradation step. Returns `None`
-/// when no location is writable — the caller then runs stderr-only.
+/// Whether log-location degradation is reported on stderr.
+///
+/// `Loud` is for the long-running server, where an operator genuinely wants
+/// to know persistent logs ended up somewhere else (issue #158). `Quiet` is
+/// for one-shot client commands (`rename-project`, `status`, …): they run
+/// for milliseconds, nobody reads their file logs, and the warning reads
+/// like something went wrong with the command itself — a real user took the
+/// sandbox hint as a claim about *their* environment when it was only the
+/// Docker thin-client wrapper's read-only view (#188-era report).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DegradeWarnings {
+    Loud,
+    Quiet,
+}
+
+/// Resolve the file appender through the fallback chain, collecting a
+/// human-readable notice for each degradation step (printed by `init` only
+/// in [`DegradeWarnings::Loud`] mode). Returns `None` as the appender when
+/// no location is writable — the caller then runs stderr-only.
 fn resolve_file_appender(
     log_dir: &Path,
     temp_dir: &Path,
-) -> Option<(RollingFileAppender, PathBuf)> {
+) -> (Option<(RollingFileAppender, PathBuf)>, Vec<String>) {
+    let mut notices = Vec::new();
     if let Some(appender) = try_appender(log_dir) {
-        return Some((appender, log_dir.to_path_buf()));
+        return (Some((appender, log_dir.to_path_buf())), notices);
     }
-    eprintln!(
-        "ai-memory: cannot write log files under {} (read-only filesystem or \
-         missing permissions); falling back to {}. In a sandbox (e.g. ai-jail), \
-         map the data dir read-write to keep file logs: --rw-map <data-dir>",
-        log_dir.display(),
+    notices.push(format!(
+        "ai-memory: file logging for this run goes to {} — the configured \
+         log dir {} is not writable (read-only mount or missing \
+         permissions). If you expected persistent logs there, make the data \
+         dir writable; in a sandbox (e.g. ai-jail): --rw-map <data-dir>",
         temp_dir.display(),
-    );
+        log_dir.display(),
+    ));
     if let Some(appender) = try_appender(temp_dir) {
-        return Some((appender, temp_dir.to_path_buf()));
+        return (Some((appender, temp_dir.to_path_buf())), notices);
     }
-    eprintln!(
+    notices.push(format!(
         "ai-memory: cannot write log files under {} either; continuing with \
          stderr-only logging",
         temp_dir.display(),
-    );
-    None
+    ));
+    (None, notices)
 }
 
 /// Initialise the global tracing subscriber.
@@ -79,9 +97,14 @@ fn resolve_file_appender(
 /// Currently infallible (kept fallible for future subscriber options); log
 /// I/O problems degrade instead of erroring so a read-only filesystem can
 /// never take down a command that would otherwise succeed.
-pub fn init(config: &Config) -> Result<Option<WorkerGuard>> {
+pub fn init(config: &Config, warnings: DegradeWarnings) -> Result<Option<WorkerGuard>> {
     let log_dir = config.data_dir.join("logs");
-    let file = resolve_file_appender(&log_dir, &std::env::temp_dir());
+    let (file, notices) = resolve_file_appender(&log_dir, &std::env::temp_dir());
+    if warnings == DegradeWarnings::Loud {
+        for notice in &notices {
+            eprintln!("{notice}");
+        }
+    }
 
     let default_filter = format!("{},tracing_appender=warn", config.log_level);
     let env_filter =
@@ -130,10 +153,16 @@ mod tests {
         fs::set_permissions(&log_dir, fs::Permissions::from_mode(0o555)).unwrap();
         let temp = tempfile::tempdir().unwrap();
 
-        let resolved = resolve_file_appender(&log_dir, temp.path());
+        let (resolved, notices) = resolve_file_appender(&log_dir, temp.path());
 
         let (_appender, used) = resolved.expect("must degrade to the temp dir, not panic");
         assert_eq!(used, temp.path());
+        assert_eq!(notices.len(), 1, "one degradation step, one notice");
+        assert!(
+            notices[0].contains(&log_dir.display().to_string()),
+            "the notice names the unwritable dir: {}",
+            notices[0]
+        );
         // Restore permissions so the tempdir cleanup can delete it.
         fs::set_permissions(&log_dir, fs::Permissions::from_mode(0o755)).unwrap();
     }
@@ -153,7 +182,9 @@ mod tests {
         let log_dir = ro("logs");
         let temp_dir = ro("temp");
 
-        assert!(resolve_file_appender(&log_dir, &temp_dir).is_none());
+        let (resolved, notices) = resolve_file_appender(&log_dir, &temp_dir);
+        assert!(resolved.is_none());
+        assert_eq!(notices.len(), 2, "both degradation steps produce notices");
 
         for dir in [log_dir, temp_dir] {
             fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
@@ -166,9 +197,10 @@ mod tests {
         let log_dir = tmp.path().join("logs");
         let temp = tempfile::tempdir().unwrap();
 
-        let (_appender, used) =
-            resolve_file_appender(&log_dir, temp.path()).expect("writable dir must work");
+        let (resolved, notices) = resolve_file_appender(&log_dir, temp.path());
+        let (_appender, used) = resolved.expect("writable dir must work");
         assert_eq!(used, log_dir);
+        assert!(notices.is_empty(), "no degradation, no notices");
         assert!(log_dir.is_dir(), "the chain creates the directory itself");
     }
 }

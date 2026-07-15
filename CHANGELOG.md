@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- One-shot client commands (`rename-project`, `status`, `write-page`, …) no
+  longer print the "cannot write log files … falling back" warning when the
+  log directory is unwritable — they still degrade to temp/stderr logging
+  silently. The warning was written for the long-running server (where an
+  operator should know persistent logs moved) but fired on every Docker
+  thin-client invocation too, where it read as a problem with the command
+  itself and its sandbox hint was misleading. `serve` still warns, with
+  clearer wording that names both the intended and the fallback location.
+
+## [1.14.0] - 2026-07-15
+
 ### Added
 - New admin endpoint `POST /admin/merge-workspace {from, to, confirm}`: fold
   every project of one workspace into another, then delete the emptied source
@@ -21,6 +33,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   idempotent) ([#187]).
 
 ### Fixed
+- Hook query values are now percent-encoded with an RFC 3986 allow-list
+  (everything outside `A-Za-z0-9-_.~`) in both the native helper and the
+  POSIX `hooks/_lib.sh`, and the shell cwd extractor unescapes JSON `\\` /
+  `\/`. Previously a Windows cwd like `C:\dev\myproject` went into the query
+  string with raw backslashes — confirmed to break the shell-script hook
+  fallback outside Git Bash, and the suspected cause of the native
+  session-start hook returning `{}` on Windows while the pending handoff
+  stayed unconsumed. The session-start hook also now prints a stderr
+  warning when the handoff fetch fails (server unreachable, bad URL)
+  instead of being indistinguishable from "no pending handoff" — exit code
+  stays 0, hooks never break the agent ([#188]).
 - `install-mcp --server-url` now appends the `/mcp` path when given a base
   URL (the same value `install-hooks --server-url` takes), instead of
   rendering a client config that points at the server root and 404s. The
@@ -35,7 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the store layer now returns `DataSchemaAhead`, which names the offending
   migration, reports the highest schema version this build ships, and tells the
   operator to run a build at least as new as the one that wrote the data. Every
-  other migration failure is unchanged.
+  other migration failure is unchanged ([#184]).
 - `memory_consolidate` now resolves its target `(workspace, project)` from
   where the session's observations actually landed, rather than trusting the
   `sessions` row. A session that adopts its scope marker mid-run keeps a
@@ -1909,7 +1932,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.13.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.14.0...HEAD
+[1.14.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.14.0
 [1.13.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.13.0
 [1.12.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.12.0
 [1.11.4]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.11.4
