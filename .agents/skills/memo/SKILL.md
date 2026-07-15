@@ -2,7 +2,7 @@ ai-memory.exe starts at folder "C:\\Apps\\ai-memory" running "ai-memory.exe serv
 
 
 
-local project is D:\\Projects\\Forks\\ai-memory. After code changes, it is compiled and copied to C:\\Apps\\ai-memory\\ai-memory.exe and ran.
+local project is D:\\Projects\\Forks\\ai-memory. After code changes, it is compiled and copied to C:\\Apps\\ai-memory\\ai-memory.exe and running at port 49374.
 
 
 
