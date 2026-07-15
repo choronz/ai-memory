@@ -18,6 +18,13 @@ allowed_hosts = ["localhost", "127.0.0.1", "::1"]
 # Default tracing filter (overridable by RUST_LOG).
 log_level = "info"
 
+# llm_provider = "gemini"
+llm_model = "gemini-3.1-flash-lite"
+# Optional: rotate across multiple Gemini API keys for higher rate limits.
+# Provide a comma-separated string or a TOML array, e.g.:
+# gemini_api_keys = "key-one,key-two,key-three"
+# gemini_api_keys = ["key-one", "key-two"]
+
 # Optional server-side hook ingest limiter for shared/remote installs. The rate
 # is tokens per second per actor/session source; 0 or unset disables it. Burst
 # defaults to the rate (minimum one token when enabled). Env equivalents:

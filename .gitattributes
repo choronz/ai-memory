@@ -1,0 +1,4 @@
+# Enforce LF line endings in the working tree for all text files,
+# regardless of the contributor's core.autocrlf setting. The repository
+# is LF-native; this keeps `git status` clean across platforms.
+* text=auto eol=lf
