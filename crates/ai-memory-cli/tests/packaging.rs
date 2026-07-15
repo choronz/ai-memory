@@ -160,7 +160,7 @@ fn docker_publish_jobs_use_prebuilt_binaries() {
     assert!(release.contains("artifact: ai-memory-linux-aarch64"));
     assert!(release.contains("artifact: ai-memory-macos-aarch64"));
     assert!(release.contains("artifact: ai-memory-macos-x86_64"));
-    assert!(release.contains("needs: [binary, macos, windows, validate-version]"));
+    assert!(release.contains("needs: [binary, windows, validate-version]")); // macoos
     assert!(release.contains("target: runtime-prebuilt-amd64"));
     assert!(release.contains("target: runtime-prebuilt-arm64"));
 
