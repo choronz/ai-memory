@@ -382,7 +382,7 @@ min_session_age_secs = 600
 **LLM provider env** (opt-in):
 ```
 AI_MEMORY_LLM_PROVIDER     anthropic | openai | openai-oauth | copilot | gemini | openai-compat
-AI_MEMORY_LLM_MODEL        e.g. claude-sonnet-4-6, gpt-5.5, gemini-3.1-flash-lite
+AI_MEMORY_LLM_MODEL        e.g. claude-sonnet-4-6, gpt-5.5, gemini-2.5-flash
 ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / LLM_API_KEY
 AI_MEMORY_LLM_BASE_URL     for openai-compat (Ollama, vLLM)
 COPILOT_GITHUB_TOKEN       optional GitHub token for copilot
