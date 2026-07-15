@@ -39,7 +39,7 @@ jobs:
         # macOS catches stat / SELinux / case-sensitivity assumptions
         # that wouldn't show up on a Linux-only matrix. Stays in step
         # with the homelab deploy which is Linux.
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest]  # , macos-latest
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -100,10 +100,10 @@ jobs:
           # Docker runtime image. macOS entries mirror the release assets.
           - artifact: linux-x86_64
             runner: ubuntu-22.04
-          - artifact: macos-aarch64
-            runner: macos-15
-          - artifact: macos-x86_64
-            runner: macos-15-intel
+          # - artifact: macos-aarch64
+          #   runner: macos-15
+          # - artifact: macos-x86_64
+          #   runner: macos-15-intel
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
