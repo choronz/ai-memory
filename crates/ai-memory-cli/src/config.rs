@@ -329,7 +329,13 @@ where
     Ok(match Option::<Either>::deserialize(deserializer)? {
         None => None,
         Some(Either::Single(s)) => Some(split_api_keys(&s)),
-        Some(Either::Many(v)) => Some(v.into_iter().map(SecretString::from).collect()),
+        Some(Either::Many(v)) => Some(
+            v.into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .map(SecretString::from)
+                .collect(),
+        ),
     })
 }
 
@@ -1190,6 +1196,22 @@ mod tests {
             .gemini_api_keys
             .expect("merged into runtime_env");
         assert_eq!(keys.len(), 2);
+    }
+
+    #[test]
+    fn load_root_gemini_api_keys_array_drops_blanks() {
+        // Regression (M2): array form must trim and drop blank entries, just
+        // like the comma-separated string form.
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        std::fs::write(&cfg_path, "gemini_api_keys = [\"\", \"a\", \" \", \"b\"]\n").unwrap();
+        let cfg = Config::load(Some(&cfg_path), Some(tmp.path().to_path_buf())).unwrap();
+        let raw = cfg
+            .gemini_api_keys
+            .expect("root-level gemini_api_keys array parsed from TOML");
+        assert_eq!(raw.len(), 2, "blank entries must be dropped");
+        assert_eq!(raw[0].expose_secret(), "a");
+        assert_eq!(raw[1].expose_secret(), "b");
     }
 
     #[test]
