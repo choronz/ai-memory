@@ -46,7 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the store layer now returns `DataSchemaAhead`, which names the offending
   migration, reports the highest schema version this build ships, and tells the
   operator to run a build at least as new as the one that wrote the data. Every
-  other migration failure is unchanged.
+  other migration failure is unchanged ([#184]).
 - `memory_consolidate` now resolves its target `(workspace, project)` from
   where the session's observations actually landed, rather than trusting the
   `sessions` row. A session that adopts its scope marker mid-run keeps a
