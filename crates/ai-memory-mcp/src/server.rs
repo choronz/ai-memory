@@ -1448,7 +1448,14 @@ impl AiMemoryServer {
         gotcha pages plus the session page, all written in one atomic \
         SQL transaction. Off by default; requires \
         AI_MEMORY_LLM_PROVIDER + AI_MEMORY_LLM_MODEL set on the server. \
-        Pass dry_run=true to preview without writing.")]
+        The consolidation target is resolved from where the session's \
+        observations actually landed, so a session that adopted its scope \
+        marker mid-run still consolidates into the right project. Admission \
+        is checked up front, before the LLM, so a rejected scope fails fast \
+        without spending a completion. Pass dry_run=true for a cheap plan: \
+        it runs that admission preflight and reports the resolved page path \
+        WITHOUT calling the LLM (no body preview); run without dry_run to \
+        produce the actual page(s).")]
     async fn memory_consolidate(
         &self,
         Parameters(args): Parameters<ConsolidateArgs>,

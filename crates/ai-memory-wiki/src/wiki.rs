@@ -578,6 +578,39 @@ impl Wiki {
         }
     }
 
+    /// Run just the blocking admission chain for a would-be write, without
+    /// touching the store, disk, or any upstream cost (e.g. an LLM call). A
+    /// `failure_policy = reject` webhook can still abort here, so callers use
+    /// this to fail fast on a scope/actor that admission would refuse anyway.
+    ///
+    /// The webhook receives an empty placeholder body: the blocking chain
+    /// decides on `ctx` (op / actor / workspace / project + path), not on
+    /// content, so no real body is needed and any mutation it returns is
+    /// discarded. Returns `Ok(())` when no chain is attached (nothing to gate).
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] when a reject-policy webhook refuses the write.
+    pub async fn preflight_admission(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: &PagePath,
+        op: AdmissionOp,
+        actor: ActorContext,
+    ) -> WikiResult<()> {
+        if let Some(chain) = &self.admission_chain {
+            let mut ctx = AdmissionContext {
+                op,
+                actor,
+                ..Default::default()
+            };
+            self.resolve_admission_names(workspace_id, project_id, &mut ctx)
+                .await;
+            chain.notify(Some(path.as_str()), &ctx).await?;
+        }
+        Ok(())
+    }
+
     /// Remove the project's on-disk directory without running admission.
     ///
     /// # Errors
@@ -2722,6 +2755,103 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    /// The preflight runs the blocking chain with no body and rejects when a
+    /// `reject`-policy webhook refuses — so a caller can fail fast before
+    /// spending an LLM call — while writing nothing to disk.
+    #[tokio::test]
+    async fn preflight_admission_rejects_without_writing() {
+        use crate::admission::{AdmissionChain, AdmissionOp, FailurePolicy, WebhookConfig};
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use axum::{Json, Router};
+        use tokio::net::TcpListener;
+
+        // A scope-guard-style webhook that refuses the write outright.
+        let app = Router::new().route(
+            "/gate",
+            post(|Json(_payload): Json<serde_json::Value>| async move {
+                (StatusCode::FORBIDDEN, "denied for this scope")
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let chain = AdmissionChain::new(vec![WebhookConfig {
+            name: "gate".into(),
+            url: format!("http://{addr}/gate"),
+            timeout_ms: 1_000,
+            failure_policy: FailurePolicy::Reject,
+            events: vec![AdmissionOp::Consolidate],
+            blocking: true,
+        }])
+        .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_admission_chain(chain)
+            .with_store_reader(store.reader.clone());
+
+        let path = PagePath::new("sessions/abc.md").unwrap();
+        let err = wiki
+            .preflight_admission(
+                ws,
+                proj,
+                &path,
+                AdmissionOp::Consolidate,
+                ai_memory_core::ActorContext::anonymous(),
+            )
+            .await
+            .expect_err("reject-policy webhook must fail the preflight");
+        assert!(
+            format!("{err}").contains("denied for this scope"),
+            "the webhook rejection reason should surface: {err}",
+        );
+        // The preflight never persists anything.
+        assert!(!wiki.abs_path(ws, proj, &path).exists());
+    }
+
+    /// With no admission chain attached there is nothing to gate, so the
+    /// preflight is a no-op that always succeeds.
+    #[tokio::test]
+    async fn preflight_admission_is_noop_without_chain() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        wiki.preflight_admission(
+            ws,
+            proj,
+            &PagePath::new("sessions/abc.md").unwrap(),
+            AdmissionOp::Consolidate,
+            ai_memory_core::ActorContext::anonymous(),
+        )
+        .await
+        .expect("no chain → preflight is a no-op");
     }
 
     /// Two projects writing the same relative path must produce two distinct

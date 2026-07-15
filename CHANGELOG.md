@@ -36,6 +36,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   migration, reports the highest schema version this build ships, and tells the
   operator to run a build at least as new as the one that wrote the data. Every
   other migration failure is unchanged.
+- `memory_consolidate` now resolves its target `(workspace, project)` from
+  where the session's observations actually landed, rather than trusting the
+  `sessions` row. A session that adopts its scope marker mid-run keeps a
+  session row frozen on the pre-marker scope (`begin_session` uses
+  `ON CONFLICT DO NOTHING`), while each observation carries the correct
+  per-cwd scope — so a "hybrid" session used to consolidate into the wrong
+  project. Resolution now prefers the majority observation scope, then the
+  session row, then the server's startup IDs ([#186]).
+
+### Changed
+- `memory_consolidate` runs the blocking admission chain up front, before the
+  LLM, so a rejected scope/actor fails fast and identically in every mode
+  instead of only surfacing at write time — previously a single-page write
+  spent the LLM before the 403, and a multi-page / dry-run request ran the
+  full completion only for the client to time out before seeing the
+  rejection. Consequently `dry_run=true` is now a cheap plan: it runs the
+  admission preflight and reports the resolved page path without calling the
+  LLM (it no longer returns an LLM-generated body preview); a real
+  (non-dry) run still produces the page bodies ([#186]).
 
 ## [1.13.0] - 2026-07-14
 

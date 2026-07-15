@@ -111,18 +111,33 @@ impl Consolidator {
             return Err(ConsolidatorError::EmptySession(session_id));
         }
 
-        // Look up the session's actual (workspace, project) IDs — the
-        // hook router stamped them per-cwd at session start, so this
-        // is the correct target for the resulting wiki page. The
-        // server's startup IDs (self.workspace_id / self.project_id)
-        // are the fallback for sessions that pre-date per-cwd routing.
-        let (ws, proj) = self
-            .reader
-            .session_project_ids(session_id)
-            .await?
-            .unwrap_or((self.workspace_id, self.project_id));
-
+        let (ws, proj) = self.resolve_target(session_id).await?;
         let path = PagePath::new(format!("sessions/{session_id}.md"))?;
+
+        // Run the blocking admission chain BEFORE the LLM so a rejected
+        // scope/actor fails fast without spending a completion. This makes
+        // both dry runs and real writes reject identically and cheaply
+        // (previously the reject only surfaced at write time, after the LLM).
+        self.wiki
+            .preflight_admission(ws, proj, &path, AdmissionOp::Consolidate, actor.clone())
+            .await?;
+
+        // A dry run is a cheap plan: the preflight above already confirmed
+        // admission (a rejected scope errored out), and reporting where the
+        // page would land does not need the LLM. Skip the completion and
+        // return the resolved plan. Callers wanting the actual rewritten body
+        // run a real (non-dry) consolidation.
+        if dry_run {
+            return Ok(ConsolidationOutcome {
+                path,
+                dry_run: true,
+                new_title: String::new(),
+                new_body_markdown: String::new(),
+                page_id: None,
+                tags: Vec::new(),
+            });
+        }
+
         let current_body = self
             .wiki
             .read_page(ws, proj, &path)
@@ -136,17 +151,6 @@ impl Consolidator {
             "consolidating session"
         );
         let page: ConsolidatedPage = complete_structured(&*self.llm, request).await?;
-
-        if dry_run {
-            return Ok(ConsolidationOutcome {
-                path,
-                dry_run: true,
-                new_title: page.title,
-                new_body_markdown: page.body_markdown,
-                page_id: None,
-                tags: page.tags,
-            });
-        }
 
         let frontmatter = build_frontmatter(&page);
         let id = self
@@ -210,6 +214,32 @@ impl Consolidator {
     #[must_use]
     pub fn llm(&self) -> Arc<dyn ai_memory_llm::LlmProvider> {
         self.llm.clone()
+    }
+
+    /// Resolve the `(workspace, project)` the session should consolidate into.
+    ///
+    /// Prefer where the session's observations actually landed: the hook router
+    /// stamps each observation with its per-cwd scope, so this is correct even
+    /// for a "hybrid" session whose `sessions` row froze on a pre-marker scope
+    /// (`begin_session` uses `ON CONFLICT DO NOTHING`, so the row never
+    /// re-anchors). Fall back to the session row, then to the server's startup
+    /// IDs for sessions that pre-date per-cwd routing.
+    async fn resolve_target(
+        &self,
+        session_id: SessionId,
+    ) -> ConsolidatorResult<(WorkspaceId, ProjectId)> {
+        if let Some(scope) = self
+            .reader
+            .session_scope_from_observations(session_id)
+            .await?
+        {
+            return Ok(scope);
+        }
+        Ok(self
+            .reader
+            .session_project_ids(session_id)
+            .await?
+            .unwrap_or((self.workspace_id, self.project_id)))
     }
 
     fn should_skip_high_resistance_slot_update(
@@ -278,13 +308,34 @@ impl Consolidator {
         if observations.is_empty() {
             return Err(ConsolidatorError::EmptySession(session_id));
         }
-        // Resolve the session's actual (workspace, project) IDs from
-        // its row — see `consolidate_session` for the rationale.
-        let (ws, proj) = self
-            .reader
-            .session_project_ids(session_id)
-            .await?
-            .unwrap_or((self.workspace_id, self.project_id));
+        // Resolve the target from where the observations landed — see
+        // `resolve_target` / `consolidate_session` for the rationale.
+        let (ws, proj) = self.resolve_target(session_id).await?;
+
+        // Preflight admission BEFORE the LLM (see `consolidate_session`). The
+        // session page is the canonical episodic anchor, so it stands in for
+        // the batch's scope/actor check; the scope-guard decision is on
+        // op/actor/workspace/project, not the specific path.
+        let anchor = PagePath::new(format!("sessions/{session_id}.md"))?;
+        self.wiki
+            .preflight_admission(ws, proj, &anchor, AdmissionOp::Consolidate, actor.clone())
+            .await?;
+
+        // A dry run is a cheap plan (see `consolidate_session`): admission is
+        // already confirmed and the concrete page set is only knowable after a
+        // real LLM run, so report the resolved scope via the session anchor and
+        // skip the completion. A real (non-dry) run enumerates every page.
+        if dry_run {
+            return Ok(vec![ConsolidationOutcome {
+                path: anchor,
+                dry_run: true,
+                new_title: String::new(),
+                new_body_markdown: String::new(),
+                page_id: None,
+                tags: Vec::new(),
+            }]);
+        }
+
         let slots = self.slot_snapshots(ws, proj).await?;
         let request = build_batch_request_with_slots(session_id, &observations, &slots);
         debug!(
@@ -295,10 +346,12 @@ impl Consolidator {
         let batch: ConsolidatedBatch =
             ai_memory_llm::complete_structured(&*self.llm, request).await?;
 
+        // `dry_run` is always false past the early return above, so every
+        // update here is a real write.
         let mut requests = Vec::with_capacity(batch.updates.len());
         let mut outcomes_preview = Vec::with_capacity(batch.updates.len());
         for upd in &batch.updates {
-            let (req, outcome) = build_update(ws, proj, upd, dry_run, &actor, author_id)?;
+            let (req, outcome) = build_update(ws, proj, upd, false, &actor, author_id)?;
             if self.should_skip_high_resistance_slot_update(ws, proj, &req)? {
                 debug!(
                     path = %req.path.as_str(),
@@ -308,10 +361,6 @@ impl Consolidator {
             }
             requests.push(req);
             outcomes_preview.push(outcome);
-        }
-
-        if dry_run {
-            return Ok(outcomes_preview);
         }
 
         let ids = self.wiki.apply_batch(requests).await?;
@@ -1028,6 +1077,154 @@ mod tests {
         assert!(prompt.contains("Current `_slots/` pages"));
         assert!(prompt.contains("_slots/project_context.md | slot_kind=invariant"));
         assert!(prompt.contains("This is stable unless"));
+    }
+
+    /// An LLM provider that panics if any completion is attempted — proves a
+    /// code path never reaches the model.
+    struct PanicLlm;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for PanicLlm {
+        fn name(&self) -> &'static str {
+            "panic"
+        }
+        fn model(&self) -> &str {
+            "panic"
+        }
+        async fn complete(
+            &self,
+            _request: ChatRequest,
+        ) -> ai_memory_llm::LlmResult<ai_memory_llm::ChatResponse> {
+            panic!("dry_run must not call the LLM");
+        }
+        async fn complete_structured_raw(
+            &self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            panic!("dry_run must not call the LLM");
+        }
+    }
+
+    /// Seed a session plus one observation under `(ws, proj)` via raw SQL so the
+    /// consolidator can resolve a target and (in a real run) read observations.
+    fn seed_session(
+        db_path: &std::path::Path,
+        session: SessionId,
+        ws: WorkspaceId,
+        proj: ProjectId,
+    ) {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let now = 1_700_000_000_000_i64;
+        conn.execute(
+            "INSERT INTO sessions (id, workspace_id, project_id, agent_kind, cwd, started_at) \
+             VALUES (?1, ?2, ?3, 'claude-code', ?4, ?5)",
+            rusqlite::params![
+                session.as_bytes(),
+                ws.as_bytes(),
+                proj.as_bytes(),
+                "/w",
+                now
+            ],
+        )
+        .unwrap();
+        let mut obs = [0u8; 16];
+        obs[15] = 1;
+        conn.execute(
+            "INSERT INTO observations \
+             (id, session_id, workspace_id, project_id, kind, title, body, created_at) \
+             VALUES (?1, ?2, ?3, ?4, 'other', 't', 'x', ?5)",
+            rusqlite::params![
+                &obs[..],
+                session.as_bytes(),
+                ws.as_bytes(),
+                proj.as_bytes(),
+                now
+            ],
+        )
+        .unwrap();
+    }
+
+    async fn consolidator_with_panic_llm(
+        tmp: &std::path::Path,
+    ) -> (
+        ai_memory_store::Store,
+        Consolidator,
+        SessionId,
+        WorkspaceId,
+        ProjectId,
+    ) {
+        let store = ai_memory_store::Store::open(tmp).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let session = SessionId::new();
+        seed_session(store.db_path(), session, ws, proj);
+        let wiki = Wiki::new(tmp, store.writer.clone()).unwrap();
+        let consolidator = Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki,
+            Arc::new(PanicLlm),
+            ws,
+            proj,
+        );
+        (store, consolidator, session, ws, proj)
+    }
+
+    /// A single-page dry run returns the resolved plan (path + dry_run flag)
+    /// without ever touching the LLM.
+    #[tokio::test]
+    async fn single_page_dry_run_returns_plan_without_calling_the_llm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_store, consolidator, session, _ws, _proj) =
+            consolidator_with_panic_llm(tmp.path()).await;
+
+        let outcome = consolidator
+            .consolidate_session(
+                session,
+                true,
+                ai_memory_core::ActorContext::anonymous(),
+                None,
+            )
+            .await
+            .expect("dry_run plan should succeed without the LLM");
+
+        assert!(outcome.dry_run);
+        assert_eq!(outcome.path.as_str(), format!("sessions/{session}.md"));
+        assert!(outcome.new_body_markdown.is_empty());
+        assert!(outcome.new_title.is_empty());
+        assert!(outcome.page_id.is_none());
+    }
+
+    /// A multi-page dry run reports the resolved scope via the session anchor
+    /// (the page set needs a real run) and also never calls the LLM.
+    #[tokio::test]
+    async fn multi_page_dry_run_returns_anchor_plan_without_calling_the_llm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_store, consolidator, session, _ws, _proj) =
+            consolidator_with_panic_llm(tmp.path()).await;
+
+        let outcomes = consolidator
+            .consolidate_session_multi(
+                session,
+                true,
+                ai_memory_core::ActorContext::anonymous(),
+                None,
+            )
+            .await
+            .expect("multi-page dry_run plan should succeed without the LLM");
+
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].dry_run);
+        assert_eq!(outcomes[0].path.as_str(), format!("sessions/{session}.md"));
     }
 
     #[test]
