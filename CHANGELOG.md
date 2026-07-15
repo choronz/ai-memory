@@ -21,6 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   idempotent) ([#187]).
 
 ### Fixed
+- Hook query values are now percent-encoded with an RFC 3986 allow-list
+  (everything outside `A-Za-z0-9-_.~`) in both the native helper and the
+  POSIX `hooks/_lib.sh`, and the shell cwd extractor unescapes JSON `\\` /
+  `\/`. Previously a Windows cwd like `C:\dev\myproject` went into the query
+  string with raw backslashes — confirmed to break the shell-script hook
+  fallback outside Git Bash, and the suspected cause of the native
+  session-start hook returning `{}` on Windows while the pending handoff
+  stayed unconsumed. The session-start hook also now prints a stderr
+  warning when the handoff fetch fails (server unreachable, bad URL)
+  instead of being indistinguishable from "no pending handoff" — exit code
+  stays 0, hooks never break the agent ([#188]).
 - `install-mcp --server-url` now appends the `/mcp` path when given a base
   URL (the same value `install-hooks --server-url` takes), instead of
   rendering a client config that points at the server root and 404s. The

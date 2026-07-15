@@ -47,20 +47,25 @@ pub fn resolve_cwd_with_fallbacks(
         })
 }
 
-/// URL-encode the reserved characters `ai_memory_url_encode` handles.
+/// Percent-encode everything outside the RFC 3986 unreserved set
+/// (`A-Z a-z 0-9 - _ . ~`), byte-wise, so multibyte UTF-8 is encoded
+/// per byte. Parity with `ai_memory_url_encode` in `hooks/_lib.sh`.
+///
+/// An allow-list on purpose: the old deny-list missed `\` (and friends),
+/// so a Windows cwd like `C:\dev\myproject` went into the query string
+/// raw and the HTTP layer refused the request — the session-start hook
+/// printed `{}` and the pending handoff was never fetched (#188).
+/// Over-encoding is always safe; the server percent-decodes uniformly.
 pub fn url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '%' => out.push_str("%25"),
-            '+' => out.push_str("%2B"),
-            '&' => out.push_str("%26"),
-            '=' => out.push_str("%3D"),
-            '?' => out.push_str("%3F"),
-            '#' => out.push_str("%23"),
-            ' ' => out.push_str("%20"),
-            '/' => out.push_str("%2F"),
-            other => out.push(other),
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            other => {
+                out.push_str(&format!("%{other:02X}"));
+            }
         }
     }
     out
@@ -403,7 +408,19 @@ pub async fn get_handoff(
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }
-    let resp = req.send().await.ok()?;
+    // Warn on stderr instead of failing silently: the hook still exits 0 (a
+    // hook must never break the agent), but an unreachable server would
+    // otherwise be indistinguishable from "no pending handoff" (#188).
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "ai-memory hook warning: handoff fetch failed ({e}); \
+                 a pending handoff (if any) was NOT injected"
+            );
+            return None;
+        }
+    };
     if !resp.status().is_success() {
         return None;
     }
@@ -598,6 +615,40 @@ project = "infra" # this is fine
     /// `marker_query_suffix` appends `&workspace=…&project=…` (and
     /// `&project_strategy=…`, `&drop_subagent=…`) when the marker declares them.
     /// Each value is URL-encoded, so a workspace with a space round-trips as `%20`.
+    /// Regression for #188: a Windows cwd must be fully percent-encoded or
+    /// the HTTP layer refuses the request URL and the session-start hook
+    /// silently returns `{}` while the handoff stays pending.
+    #[test]
+    fn url_encode_is_an_unreserved_allow_list() {
+        // The reported case: raw `\` and `:` broke the request outright.
+        assert_eq!(url_encode(r"C:\dev\myproject"), "C%3A%5Cdev%5Cmyproject");
+        // RFC 3986 unreserved passes through untouched.
+        assert_eq!(url_encode("abc-XYZ_0.9~"), "abc-XYZ_0.9~");
+        // Previous deny-list behavior is preserved (space, slash, etc.).
+        assert_eq!(url_encode("/home/u/my repo"), "%2Fhome%2Fu%2Fmy%20repo");
+        // Multibyte UTF-8 is encoded per byte.
+        assert_eq!(url_encode("r\u{e9}po"), "r%C3%A9po");
+    }
+
+    /// The full marker suffix built from a Windows cwd must parse as a real
+    /// URL query — the end-to-end guarantee behind the #188 fix.
+    #[test]
+    fn marker_query_suffix_windows_cwd_yields_parseable_url() {
+        let qs = marker_query_suffix(r"C:\dev\myproject", None);
+        assert!(qs.contains("cwd=C%3A%5Cdev%5Cmyproject"), "{qs}");
+        let url = format!("http://127.0.0.1:49374/handoff?agent=claude-code{qs}");
+        let parsed = reqwest::Url::parse(&url).expect("must be a valid URL");
+        let cwd = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "cwd")
+            .map(|(_, v)| v.into_owned())
+            .expect("cwd param present");
+        assert_eq!(
+            cwd, r"C:\dev\myproject",
+            "round-trips through percent-decoding"
+        );
+    }
+
     #[test]
     fn marker_query_suffix_appends_marker_fields() {
         let tmp = tempfile::TempDir::new().unwrap();
