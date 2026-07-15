@@ -115,83 +115,83 @@ jobs:
             ${{ matrix.artifact }}.tar.gz
             ${{ matrix.artifact }}.tar.gz.sha256
 
-  macos:
-    name: macos ${{ matrix.arch }} binary
-    needs: validate-version
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: aarch64
-            artifact: ai-memory-macos-aarch64
-            runner: macos-15
-          - arch: x86_64
-            artifact: ai-memory-macos-x86_64
-            runner: macos-15-intel
-    steps:
-      - uses: actions/checkout@v4
+  # macos:
+  #   name: macos ${{ matrix.arch }} binary
+  #   needs: validate-version
+  #   runs-on: ${{ matrix.runner }}
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       include:
+  #         - arch: aarch64
+  #           artifact: ai-memory-macos-aarch64
+  #           runner: macos-15
+  #         - arch: x86_64
+  #           artifact: ai-memory-macos-x86_64
+  #           runner: macos-15-intel
+  #   steps:
+  #     - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@1.95
+  #     - uses: dtolnay/rust-toolchain@1.95
 
-      - uses: Swatinem/rust-cache@v2
+  #     - uses: Swatinem/rust-cache@v2
 
-      - name: Build release binary
-        env:
-          TAILWIND_SKIP: "1"
-        run: cargo build --release -p ai-memory-cli
+  #     - name: Build release binary
+  #       env:
+  #         TAILWIND_SKIP: "1"
+  #       run: cargo build --release -p ai-memory-cli
 
-      # Mirrors the Linux tarball, minus Linux-only service assets
-      # (packaging/systemd|sysusers|tmpfiles|env). macOS users get the binary,
-      # hooks bundle, default config template, and the docs a macOS user needs
-      # (install.md + macos.md).
-      - name: Create release tarball
-        env:
-          RELEASE_ARTIFACT: ${{ matrix.artifact }}
-        run: |
-          set -euo pipefail
-          artifact="$RELEASE_ARTIFACT"
-          mkdir -p "dist/$artifact"
-          cp target/release/ai-memory "dist/$artifact/ai-memory"
-          cp -a hooks "dist/$artifact/hooks"
-          mkdir -p "dist/$artifact/crates/ai-memory-cli/templates"
-          cp crates/ai-memory-cli/templates/config.default.toml \
-            "dist/$artifact/crates/ai-memory-cli/templates/config.default.toml"
-          mkdir -p "dist/$artifact/docs"
-          cp README.md LICENSE "dist/$artifact/"
-          cp docs/install.md "dist/$artifact/docs/install.md"
-          cp docs/macos.md "dist/$artifact/docs/macos.md"
-          tar -C "dist/$artifact" -czf "$artifact.tar.gz" .
-          shasum -a 256 "$artifact.tar.gz" > "$artifact.tar.gz.sha256"
+  #     # Mirrors the Linux tarball, minus Linux-only service assets
+  #     # (packaging/systemd|sysusers|tmpfiles|env). macOS users get the binary,
+  #     # hooks bundle, default config template, and the docs a macOS user needs
+  #     # (install.md + macos.md).
+  #     - name: Create release tarball
+  #       env:
+  #         RELEASE_ARTIFACT: ${{ matrix.artifact }}
+  #       run: |
+  #         set -euo pipefail
+  #         artifact="$RELEASE_ARTIFACT"
+  #         mkdir -p "dist/$artifact"
+  #         cp target/release/ai-memory "dist/$artifact/ai-memory"
+  #         cp -a hooks "dist/$artifact/hooks"
+  #         mkdir -p "dist/$artifact/crates/ai-memory-cli/templates"
+  #         cp crates/ai-memory-cli/templates/config.default.toml \
+  #           "dist/$artifact/crates/ai-memory-cli/templates/config.default.toml"
+  #         mkdir -p "dist/$artifact/docs"
+  #         cp README.md LICENSE "dist/$artifact/"
+  #         cp docs/install.md "dist/$artifact/docs/install.md"
+  #         cp docs/macos.md "dist/$artifact/docs/macos.md"
+  #         tar -C "dist/$artifact" -czf "$artifact.tar.gz" .
+  #         shasum -a 256 "$artifact.tar.gz" > "$artifact.tar.gz.sha256"
 
-      - name: Smoke test release tarball
-        env:
-          RELEASE_ARTIFACT: ${{ matrix.artifact }}
-        run: |
-          set -euo pipefail
-          artifact="$RELEASE_ARTIFACT"
-          smoke="dist/smoke-$artifact"
-          mkdir -p "$smoke"
-          tar -xzf "$artifact.tar.gz" -C "$smoke"
-          "$smoke/ai-memory" --version
-          for path in \
-            hooks \
-            crates/ai-memory-cli/templates/config.default.toml \
-            docs/install.md \
-            docs/macos.md \
-            README.md \
-            LICENSE
-          do
-            test -e "$smoke/$path" || { echo "macOS release tarball missing $path" >&2; exit 1; }
-          done
-          grep -Eq "^[0-9a-f]{64}  $artifact\.tar\.gz$" "$artifact.tar.gz.sha256"
+  #     - name: Smoke test release tarball
+  #       env:
+  #         RELEASE_ARTIFACT: ${{ matrix.artifact }}
+  #       run: |
+  #         set -euo pipefail
+  #         artifact="$RELEASE_ARTIFACT"
+  #         smoke="dist/smoke-$artifact"
+  #         mkdir -p "$smoke"
+  #         tar -xzf "$artifact.tar.gz" -C "$smoke"
+  #         "$smoke/ai-memory" --version
+  #         for path in \
+  #           hooks \
+  #           crates/ai-memory-cli/templates/config.default.toml \
+  #           docs/install.md \
+  #           docs/macos.md \
+  #           README.md \
+  #           LICENSE
+  #         do
+  #           test -e "$smoke/$path" || { echo "macOS release tarball missing $path" >&2; exit 1; }
+  #         done
+  #         grep -Eq "^[0-9a-f]{64}  $artifact\.tar\.gz$" "$artifact.tar.gz.sha256"
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: |
-            ${{ matrix.artifact }}.tar.gz
-            ${{ matrix.artifact }}.tar.gz.sha256
+  #     - uses: actions/upload-artifact@v4
+  #       with:
+  #         name: ${{ matrix.artifact }}
+  #         path: |
+  #           ${{ matrix.artifact }}.tar.gz
+  #           ${{ matrix.artifact }}.tar.gz.sha256
 
   windows:
     name: windows x86_64 binary
@@ -483,7 +483,7 @@ jobs:
 
   github-release:
     name: github release
-    needs: [binary, macos, windows, validate-version]
+    needs: [binary, windows, validate-version]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -508,8 +508,8 @@ jobs:
           echo "# Docker" >> body.md
           echo "docker pull akitaonrails/ai-memory:${{ needs.validate-version.outputs.version }}" >> body.md
           echo "" >> body.md
-          echo "# macOS aarch64/x86_64 (no toolchain): download the matching ai-memory-macos-<arch>.tar.gz below," >> body.md
-          echo "# extract it, and follow the bundled docs/macos.md." >> body.md
+          # echo "# macOS aarch64/x86_64 (no toolchain): download the matching ai-memory-macos-<arch>.tar.gz below," >> body.md
+          # echo "# extract it, and follow the bundled docs/macos.md." >> body.md
           echo "" >> body.md
           echo "# Windows x86_64 (no toolchain): download ai-memory-windows-x86_64.zip below," >> body.md
           echo "# extract it, and follow the bundled docs/windows.md." >> body.md
