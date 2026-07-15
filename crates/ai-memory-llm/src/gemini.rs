@@ -965,11 +965,20 @@ mod tests {
         // Both keys resolve to a dead port, so every send is a transport-level
         // connection error. The loop must retry across keys up to the cap and
         // surface the error as `LlmError::Http` (not succeed, not a `Provider`).
+        // Bind a real listener we keep alive for the test so the port can't be
+        // reclaimed by a concurrent test's ephemeral MockServer. An accept loop
+        // that immediately drops each connection turns every request into a
+        // deterministic transport-level failure (ECONNRESET), exercising the
+        // key-rotation path without depending on OS socket-reuse timing.
         let dead = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind ephemeral port");
         let dead_uri = format!("http://{}", dead.local_addr().unwrap());
-        drop(dead); // close the listener so connections are refused
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = dead.accept().await {
+                drop(stream);
+            }
+        });
 
         let provider = GeminiProvider::new_with_keys(
             vec![SecretString::from("k0"), SecretString::from("k1")],
