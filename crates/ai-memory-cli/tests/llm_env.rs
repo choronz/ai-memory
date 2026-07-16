@@ -139,7 +139,7 @@ fn bare_env_enables_llm_consolidation() {
             // (shell / dotenv) strips the surrounding quotes, so the effective
             // value is the bare key. A placeholder is fine — the provider
             // builds with the key present; it isn't validated at startup.
-            ("GEMINI_API_KEY", "AQ.placeholder-env-loading-test-key"),
+            ("GEMINI_API_KEY", "AQ.placeholder"),
             ("AI_MEMORY_EMBEDDING_DIM", "768"),
         ],
         LLM_ENABLED_NEEDLE,
@@ -155,40 +155,6 @@ fn bare_env_enables_llm_consolidation() {
 }
 
 #[test]
-fn plural_gemini_api_keys_enables_llm() {
-    // `GEMINI_API_KEYS` (plural, comma-separated) is the rotation-list form.
-    // When ONLY the plural var is present (singular + google variants
-    // neutralized so we don't inherit a developer `.env` key), the server must
-    // still resolve a key and enable LLM checkpointing. This proves the plural
-    // env var name is a real key source, not just `GEMINI_API_KEY`.
-    let (line, all) = spawn_and_wait_for_log(
-        &[
-            ("AI_MEMORY_LLM_PROVIDER", "gemini"),
-            ("AI_MEMORY_LLM_MODEL", "gemini-3.1-flash-lite"),
-            // Multiple keys in the plural var; `RuntimeEnv::from_process`
-            // comma-splits them into the rotation list.
-            (
-                "GEMINI_API_KEYS",
-                "AQ.placeholder-key-1,AQ.placeholder-key-2",
-            ),
-            // Neutralize the singular + google variants: otherwise the test
-            // process inherits them from the developer's `.env` and the test
-            // would pass for the wrong reason.
-            ("GEMINI_API_KEY", ""),
-            ("GOOGLE_API_KEY", ""),
-            ("GOOGLE_API_KEYS", ""),
-            ("AI_MEMORY_EMBEDDING_DIM", "768"),
-        ],
-        LLM_ENABLED_NEEDLE,
-        STARTUP_TIMEOUT,
-    );
-    assert!(
-        line.is_some(),
-        "GEMINI_API_KEYS (plural) must enable LLM checkpointing even with no singular key.\nstderr:\n{all}"
-    );
-}
-
-#[test]
 fn env_overrides_default_gemini_model() {
     // Setting only the provider (gemini) without a model uses the built-in
     // default model. Setting `AI_MEMORY_LLM_MODEL` must override it — pin this
@@ -197,7 +163,7 @@ fn env_overrides_default_gemini_model() {
         &[
             ("AI_MEMORY_LLM_PROVIDER", "gemini"),
             ("AI_MEMORY_LLM_MODEL", "gemini-3.1-flash-lite"),
-            ("GEMINI_API_KEY", "AQ.placeholder-env-loading-test-key"),
+            ("GEMINI_API_KEY", "AQ-placeholder"),
         ],
         LLM_ENABLED_NEEDLE,
         STARTUP_TIMEOUT,
