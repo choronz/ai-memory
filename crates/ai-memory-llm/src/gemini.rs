@@ -9,21 +9,20 @@
 //! …). See [`prepare_schema_for_gemini`].
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, warn};
 
-use crate::error::{LlmError, LlmResult};
-use crate::provider::LlmProvider;
-use crate::response::{provider_error_body, response_json_limited};
-use crate::types::{ChatRequest, ChatResponse, Role, Usage};
-
-/// Default Gemini API base.
-pub const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
+/// How long a key is excluded from selection after it returns a 429
+/// (rate-limit) response. Gemini's free-tier quota is per-key, so a key
+/// that 429s will keep 429ing for a while; parking it lets the
+/// round-robin cursor move on to a fresh key instead of re-hammering it.
+const KEY_BLACKLIST_DURATION: Duration = Duration::from_secs(60 * 60);
 
 /// Gemini-backed provider.
 pub struct GeminiProvider {
@@ -32,9 +31,21 @@ pub struct GeminiProvider {
     /// Shared cursor so concurrent requests spread their starting key
     /// instead of stampeding a single key (cross-request round-robin).
     next_key: AtomicUsize,
+    /// Per-key 429 blacklist: `Some(instant)` means "do not use this
+    /// key until `instant`". `None` means the key is currently usable.
+    /// Indexed in lock-step with `api_keys`.
+    blacklist: Arc<Mutex<Vec<Option<Instant>>>>,
     base_url: String,
     model: String,
 }
+
+use crate::error::{LlmError, LlmResult};
+use crate::provider::LlmProvider;
+use crate::response::{provider_error_body, response_json_limited};
+use crate::types::{ChatRequest, ChatResponse, Role, Usage};
+
+/// Default Gemini API base.
+pub const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 
 impl GeminiProvider {
     /// Construct a provider given a single API key and model id (e.g.
@@ -55,10 +66,12 @@ impl GeminiProvider {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
             .build()?;
+        let blacklist = vec![None; api_keys.len()];
         Ok(Self {
             client,
             api_keys,
             next_key: AtomicUsize::new(0),
+            blacklist: Arc::new(Mutex::new(blacklist)),
             base_url: DEFAULT_BASE_URL.to_string(),
             model: model.into(),
         })
@@ -250,7 +263,9 @@ impl GeminiProvider {
         } else {
             self.next_key.fetch_add(1, Ordering::Relaxed) % len
         };
-        let mut key_idx = start;
+        // First attempt uses the round-robin starting key; subsequent
+        // failures rotate past any blacklisted keys.
+        let mut key_idx = self.next_usable_key(start, start);
 
         loop {
             let api_key = self.api_keys.get(key_idx).cloned();
@@ -278,7 +293,7 @@ impl GeminiProvider {
                     // rate-limit backoff here — we just switch keys.
                     if attempt < max_attempts.saturating_sub(1) {
                         attempt += 1;
-                        key_idx = (key_idx + 1) % len;
+                        key_idx = self.next_usable_key(key_idx.wrapping_add(1) % len, start);
                         debug!(
                             attempt,
                             key_index = key_idx,
@@ -297,7 +312,14 @@ impl GeminiProvider {
                 status.as_u16() == 429 || (status.as_u16() >= 500 && status.as_u16() < 600);
             if is_retryable && attempt < max_attempts.saturating_sub(1) {
                 attempt += 1;
-                key_idx = (key_idx + 1) % len;
+                // A 429 means the key hit its per-key rate limit; park it
+                // for KEY_BLACKLIST_DURATION so we don't immediately retry
+                // it on the next rotation. 5xx is transient, so we leave
+                // the key eligible and just move on.
+                if status.as_u16() == 429 {
+                    self.blacklist_key(key_idx);
+                }
+                key_idx = self.next_usable_key(key_idx.wrapping_add(1) % len, start);
                 let delay = Self::retry_delay(attempt, start);
                 debug!(
                     attempt,
@@ -328,6 +350,51 @@ impl GeminiProvider {
         let base = 2u64.saturating_pow(attempt.min(4));
         let jitter_ms = (((start_key as u64).wrapping_add(attempt as u64)) * 7919) % 250 + 1;
         Duration::from_millis(base * 1000 + jitter_ms)
+    }
+
+    /// Mark a key as temporarily unusable after it returned a 429. The
+    /// key is skipped by [`next_usable_key`] until the duration elapses.
+    fn blacklist_key(&self, key_idx: usize) {
+        let Ok(mut blacklist) = self.blacklist.lock() else {
+            return;
+        };
+        let Some(slot) = blacklist.get_mut(key_idx) else {
+            return;
+        };
+        *slot = Some(Instant::now() + KEY_BLACKLIST_DURATION);
+        warn!(
+            key_index = key_idx,
+            seconds = KEY_BLACKLIST_DURATION.as_secs(),
+            "gemini key rate-limited (429); blacklisting for the cooldown window"
+        );
+    }
+
+    /// Return the next key at or after `from` that is not currently
+    /// blacklisted, wrapping around. If every key is blacklisted (e.g.
+    /// a total outage), falls back to `start` — the round-robin starting
+    /// index for this call — so the request still attempts instead of
+    /// spinning forever, and a still-cooling-down key isn't re-hit just
+    /// because it happens to be the rotated `from`.
+    fn next_usable_key(&self, from: usize, start: usize) -> usize {
+        let len = self.api_keys.len();
+        if len == 0 {
+            return 0;
+        }
+        let now = Instant::now();
+        let blacklist = self.blacklist.lock().ok();
+        let expired_or_clear = |i: usize| -> bool {
+            match blacklist.as_ref().and_then(|b| b.get(i)) {
+                Some(Some(until)) => now >= *until,
+                _ => true,
+            }
+        };
+        for step in 0..len {
+            let candidate = (from + step) % len;
+            if expired_or_clear(candidate) {
+                return candidate;
+            }
+        }
+        start
     }
 }
 
@@ -1037,5 +1104,91 @@ mod tests {
             vec!["k0".to_string(), "k1".to_string()],
             "consecutive requests must start on rotating keys"
         );
+    }
+
+    #[tokio::test]
+    async fn complete_blacklists_key_on_429_and_skips_it() {
+        // k0 429s (but only on its FIRST touch), k1 always succeeds. The
+        // provider must blacklist k0 after the 429 and never send a second
+        // request to it — instead rotating to k1 and succeeding there.
+        let server = MockServer::start().await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let count = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1beta/models/gemini-3.1-flash-lite:generateContent"))
+            .respond_with(RecordingResponder {
+                seen_keys: seen.clone(),
+                request_count: count.clone(),
+                fail_status: 429,
+                fail_for: 1, // only the very first request to a key fails
+                success_body: generate_success_body(),
+            })
+            .mount(&server)
+            .await;
+
+        let provider = GeminiProvider::new_with_keys(
+            vec![SecretString::from("k0"), SecretString::from("k1")],
+            "gemini-3.1-flash-lite",
+        )
+        .expect("gemini provider builds")
+        .with_base_url(server.uri());
+
+        let response = provider
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .expect("succeeds on k1 after k0 is blacklisted");
+
+        assert_eq!(response.text, "hello");
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        // k0 tried once then blacklisted; only k1 is ever retried.
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["k0".to_string(), "k1".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn permanently_invalid_keys_blacklist_and_give_up() {
+        // Both keys are permanently invalid (always 429). The provider must
+        // blacklist each on its first 429, then — with no usable key left —
+        // fall back to the round-robin start and stop after `max_attempts`
+        // (5 here) instead of hammering a dead key on every attempt or
+        // looping forever. The call must surface the 429, not panic.
+        let server = MockServer::start().await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let count = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1beta/models/gemini-3.1-flash-lite:generateContent"))
+            .respond_with(RecordingResponder {
+                seen_keys: seen.clone(),
+                request_count: count.clone(),
+                fail_status: 429,
+                fail_for: 999, // every request to every key 429s forever
+                success_body: generate_success_body(),
+            })
+            .mount(&server)
+            .await;
+
+        let provider = GeminiProvider::new_with_keys(
+            vec![SecretString::from("dead0"), SecretString::from("dead1")],
+            "gemini-3.1-flash-lite",
+        )
+        .expect("gemini provider builds")
+        .with_base_url(server.uri());
+
+        let err = provider
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .expect_err("all keys invalid -> 429 error");
+        assert!(
+            matches!(err, LlmError::Provider { status: 429, .. }),
+            "surfaces the upstream 429"
+        );
+
+        // max_attempts = max(5, len) = 5: each key tried once, then the
+        // all-blacklisted fallback reuses `start` for the remaining tries.
+        assert_eq!(count.load(Ordering::SeqCst), 5);
+        // No key is retried within the same call beyond the 5-attempt cap.
+        assert!(count.load(Ordering::SeqCst) <= 5);
     }
 }
