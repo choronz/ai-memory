@@ -1,5 +1,7 @@
 use serde::de::DeserializeOwned;
 
+use tracing::warn;
+
 use crate::error::{LlmError, LlmResult};
 use crate::text::truncate_with_ellipsis;
 
@@ -38,6 +40,54 @@ pub(crate) async fn response_json_limited<T: DeserializeOwned>(
 ) -> LlmResult<T> {
     let bytes = response_bytes_limited(resp, MAX_PROVIDER_RESPONSE_BYTES).await?;
     serde_json::from_slice(&bytes).map_err(LlmError::from)
+}
+
+/// Like [`response_json_limited`] but, when the upstream returns HTTP 200
+/// with a body that is not JSON (e.g. an HTML 502 gateway error page served
+/// with a 200 status, or an empty body), surfaces a clear [`LlmError::Provider`]
+/// carrying the status and a body snippet instead of a cryptic `serde` /
+/// `unexpected response shape` error. This is the common case for misbehaving
+/// OpenAI-compatible proxies that wrap failures in a 200 response.
+pub(crate) async fn response_json_or_provider_error<T: DeserializeOwned>(
+    resp: reqwest::Response,
+) -> LlmResult<T> {
+    let status = resp.status().as_u16();
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let bytes = response_bytes_limited(resp, MAX_PROVIDER_RESPONSE_BYTES).await?;
+    let text = String::from_utf8_lossy(&bytes);
+    // A JSON endpoint should answer with JSON. If the body is empty or looks
+    // like HTML (or any non-JSON content type) on a 2xx status, the gateway
+    // likely returned an error page instead of a real response.
+    let looks_json = content_type.contains("json")
+        || text.trim_start().starts_with('{')
+        || text.trim_start().starts_with('[');
+    if !looks_json {
+        warn!(
+            status,
+            content_type = %content_type,
+            body_len = bytes.len(),
+            "LLM endpoint returned a non-JSON body on a 2xx status; treating as provider error"
+        );
+        return Err(LlmError::Provider {
+            status,
+            body: truncate_with_ellipsis(text.as_ref(), DISPLAY_ERROR_BYTES),
+        });
+    }
+    serde_json::from_slice(&bytes).map_err(|e| {
+        warn!(
+            status,
+            content_type = %content_type,
+            body_len = bytes.len(),
+            error = %e,
+            "failed to parse LLM JSON response"
+        );
+        LlmError::from(e)
+    })
 }
 
 pub(crate) async fn provider_error_body(resp: reqwest::Response) -> String {

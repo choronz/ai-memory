@@ -12,7 +12,7 @@ use std::sync::LazyLock;
 use async_trait::async_trait;
 use regex::Regex;
 use secrecy::SecretString;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::error::{LlmError, LlmResult};
 use crate::openai::{OpenAiProvider, RequestDialect, enforce_strict_object_schemas};
@@ -194,15 +194,27 @@ impl LlmProvider for OpenAiCompatProvider {
                     // because some failures truncate the closing brace.
                     let head = truncate_with_ellipsis(&cleaned, 2000);
                     let tail = suffix_within_bytes(&cleaned, 2000);
-                    debug!(
+                    let looks_html = cleaned
+                        .trim_start()
+                        .to_ascii_lowercase()
+                        .starts_with("<!doctype")
+                        || cleaned.trim_start().starts_with("<html");
+                    warn!(
                         head = %head,
                         tail = %tail,
                         total_len = cleaned.len(),
-                        "no balanced JSON object found"
+                        looks_html,
+                        "openai-compat: no balanced JSON object found in response"
                     );
-                    return Err(LlmError::UnexpectedShape(
-                        "openai-compat response did not contain a JSON object".into(),
-                    ));
+                    let msg = if looks_html {
+                        "openai-compat response was HTML, not JSON (the upstream gateway \
+                         likely returned an error page with a 200 status — check the \
+                         endpoint, auth, and that the model is served there)"
+                            .into()
+                    } else {
+                        "openai-compat response did not contain a JSON object".into()
+                    };
+                    return Err(LlmError::UnexpectedShape(msg));
                 };
                 serde_json::from_str::<serde_json::Value>(slice).map_err(LlmError::from)
             }

@@ -12,7 +12,7 @@ use tracing::{debug, warn};
 
 use crate::error::{LlmError, LlmResult};
 use crate::provider::LlmProvider;
-use crate::response::{provider_error_body, response_json_limited};
+use crate::response::{provider_error_body, response_json_or_provider_error};
 use crate::types::{ChatRequest, ChatResponse, Role, Usage};
 
 /// Default OpenAI API base.
@@ -428,12 +428,17 @@ impl OpenAiProvider {
 
             if !status.is_success() {
                 let body = provider_error_body(resp).await;
+                warn!(
+                    status = status.as_u16(),
+                    body_len = body.len(),
+                    "openai-compatible endpoint returned a non-2xx status"
+                );
                 return Err(LlmError::Provider {
                     status: status.as_u16(),
                     body,
                 });
             }
-            return response_json_limited::<OpenAiResponse>(resp).await;
+            return response_json_or_provider_error::<OpenAiResponse>(resp).await;
         }
     }
 
@@ -464,12 +469,17 @@ impl OpenAiProvider {
         let status = resp.status();
         if !status.is_success() {
             let body = provider_error_body(resp).await;
+            warn!(
+                status = status.as_u16(),
+                body_len = body.len(),
+                "openai-compatible endpoint returned a non-2xx status (structured, no retry)"
+            );
             return Err(LlmError::Provider {
                 status: status.as_u16(),
                 body,
             });
         }
-        response_json_limited::<OpenAiResponse>(resp).await
+        response_json_or_provider_error::<OpenAiResponse>(resp).await
     }
 
     /// Exponential backoff (capped) with a small per-request jitter derived
@@ -1358,5 +1368,39 @@ mod tests {
             .await
             .expect_err("all keys invalid -> 429 error");
         assert!(matches!(err, LlmError::Provider { status: 429, .. }));
+    }
+
+    #[tokio::test]
+    async fn complete_surfaces_html_200_as_provider_error() {
+        // A misbehaving OpenAI-compatible gateway can return an HTML 502 /
+        // error page with a 200 status. The parser must surface this as a
+        // clear `Provider` error carrying the status and body snippet, not a
+        // cryptic `unexpected response shape` / serde failure.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .set_body_string("<html><body>502 Bad Gateway</body></html>"),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new_with_keys(vec![SecretString::from("k0")], "gpt-4o-mini")
+            .expect("provider builds")
+            .with_base_url(server.uri());
+
+        let err = provider
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .expect_err("HTML 200 body must surface as a provider error");
+        match err {
+            LlmError::Provider { status, body } => {
+                assert_eq!(status, 200);
+                assert!(body.contains("502 Bad Gateway"), "body: {body}");
+            }
+            other => panic!("expected Provider error, got {other:?}"),
+        }
     }
 }
