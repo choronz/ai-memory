@@ -22,8 +22,8 @@ log_level = "info"
 llm_model = "gemini-3.1-flash-lite"
 # Optional: rotate across multiple Gemini API keys for higher rate limits.
 # Provide a comma-separated string or a TOML array, e.g.:
-# gemini_api_keys = "key-one,key-two,key-three"
-# gemini_api_keys = ["key-one", "key-two"]
+ gemini_api_keys = "sk-1,sk-2,sk-3"
+# gemini_api_keys = ["sk-1", "sk-2", "sk-3"]
 
 # Optional server-side hook ingest limiter for shared/remote installs. The rate
 # is tokens per second per actor/session source; 0 or unset disables it. Burst

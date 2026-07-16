@@ -46,7 +46,16 @@ async fn main() -> Result<()> {
     };
 
     let config = Arc::new(Config::load(config_path.as_deref(), data_dir)?);
-    let _logging_guard = logging::init(&config)?;
+    // Only the long-running server warns when file logging degrades (an
+    // operator wants to know persistent logs moved); one-shot client
+    // commands degrade silently — their file logs are irrelevant and the
+    // warning read like the command itself had a problem.
+    let degrade_warnings = if matches!(command, Command::Serve(_)) {
+        logging::DegradeWarnings::Loud
+    } else {
+        logging::DegradeWarnings::Quiet
+    };
+    let _logging_guard = logging::init(&config, degrade_warnings)?;
 
     info!(
         version = env!("CARGO_PKG_VERSION"),

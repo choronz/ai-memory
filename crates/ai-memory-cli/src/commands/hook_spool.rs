@@ -932,8 +932,15 @@ mod tests {
         );
 
         drop(first);
+        // Bounded wait instead of NoWait: a child process fork+exec'd by a
+        // concurrently running test briefly inherits this flock's fd between
+        // fork and exec (the lock lives until the duplicated descriptor is
+        // closed by exec's CLOEXEC), so an instantaneous re-acquire can
+        // spuriously see the lock still held. The bounded window still
+        // proves release-on-drop; only a leaked/undropped lock would hold
+        // for a full five seconds.
         assert!(
-            acquire_drain_lock(&spool, DrainLockWait::NoWait)
+            acquire_drain_lock(&spool, DrainLockWait::Bounded(Duration::from_secs(5)))
                 .unwrap()
                 .is_some(),
             "lock should release on drop"

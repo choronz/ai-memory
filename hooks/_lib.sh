@@ -41,20 +41,29 @@ ai_memory_parse_toml_key() {
 # not a JSON parser; taking the first match preserves the top-level cwd when
 # tool payloads contain nested `cwd` fields later in the object. Antigravity
 # CLI sends `workspacePaths: ["/repo", ...]` instead of `cwd`.
+# Undo the JSON string escapes that can appear in a path value: \\ -> \
+# and \/ -> /. Windows payloads carry cwd as "C:\\dev\\proj"; without this
+# the doubled backslashes leak into the query string (#188).
+ai_memory_json_unescape_path() {
+    printf '%s' "$1" | sed 's/\\\\/\\/g; s/\\\//\//g'
+}
+
 ai_memory_extract_cwd() {
     payload="${1:-$(cat)}"
     rest=${payload#*\"cwd\"}
     if [ "$rest" != "$payload" ]; then
-        printf '%s' "$rest" \
+        raw=$(printf '%s' "$rest" \
             | sed -n -E 's/^[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' \
-            | head -n 1
+            | head -n 1)
+        ai_memory_json_unescape_path "$raw"
         return 0
     fi
     rest=${payload#*\"workspacePaths\"}
     [ "$rest" = "$payload" ] && return 0
-    printf '%s' "$rest" \
+    raw=$(printf '%s' "$rest" \
         | sed -n -E 's/^[[:space:]]*:[[:space:]]*\[[[:space:]]*"([^"]*)".*/\1/p' \
-        | head -n 1
+        | head -n 1)
+    ai_memory_json_unescape_path "$raw"
 }
 
 # Resolve cwd for agents whose native hook payload omits it. Payload wins,
@@ -76,9 +85,26 @@ ai_memory_resolve_cwd() {
 # URL-encode the minimal set of characters that have meaning in a query
 # string. Sufficient for the schema's value regex (`^[a-z0-9][a-z0-9._-]*$`)
 # plus a defensive pass for anything a hand-edited marker might contain.
+# Percent-encode everything outside the RFC 3986 unreserved set
+# (A-Z a-z 0-9 - _ . ~), byte-wise under LC_ALL=C so multibyte UTF-8 is
+# encoded per byte. Allow-list on purpose: the old deny-list missed
+# backslash, so a Windows cwd went into the query string raw and the
+# request never reached the server (#188). Parity with the native
+# helper's url_encode in hook_capture.rs.
 ai_memory_url_encode() {
-    printf '%s' "$1" \
-        | sed 's/%/%25/g; s/+/%2B/g; s/&/%26/g; s/=/%3D/g; s/?/%3F/g; s/#/%23/g; s/ /%20/g'
+    LC_ALL=C
+    s="$1"
+    out=""
+    while [ -n "$s" ]; do
+        rest="${s#?}"
+        c="${s%"$rest"}"
+        s="$rest"
+        case $c in
+            [A-Za-z0-9._~-]) out="$out$c" ;;
+            *) out="$out$(printf '%%%02X' "'$c")" ;;
+        esac
+    done
+    printf '%s' "$out"
 }
 
 # Resolve the basename of the MAIN git repository root for "$1" (a cwd),
