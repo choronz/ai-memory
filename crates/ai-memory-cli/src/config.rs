@@ -101,6 +101,17 @@ pub struct Config {
     pub gemini_api_key: Option<SecretString>,
     /// Optional LLM base URL override.
     pub llm_base_url: Option<String>,
+    /// Optional LLM API key at the root of `config.toml` (e.g.
+    /// `llm_api_key = "..."`). Used by `openai-compat` (and any provider whose
+    /// `LLM_API_KEY` env var is the key source) so the key can live in
+    /// `config.toml` instead of the environment. Env `LLM_API_KEY` wins when
+    /// both are present.
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "deserialize_optional_secret_string"
+    )]
+    pub llm_api_key: Option<SecretString>,
     /// Opt-in: send `response_format=json_schema` (strict) to the
     /// `openai-compat` provider instead of asking for prose JSON and
     /// extracting the first balanced object. Off by default — the tolerant
@@ -502,6 +513,7 @@ impl Default for Config {
             gemini_api_keys: None,
             gemini_api_key: None,
             llm_base_url: None,
+            llm_api_key: None,
             llm_compat_strict: false,
             consolidate_on_session_end: false,
             embedding_provider: None,
@@ -787,6 +799,18 @@ impl Config {
         config.runtime_env.gemini_api_key = resolved_key;
         config.runtime_env.gemini_api_keys = resolved_keys;
 
+        // Root-level `llm_api_key` in config.toml backs the `openai-compat`
+        // key source (and, as a fallback, `opencode`) only when the
+        // provider-specific env var (`LLM_API_KEY` / `OPENCODE_API_KEY`) is
+        // unset. Env wins; `RuntimeEnv::from_process` already populated them
+        // when present.
+        if config.runtime_env.llm_api_key.is_none() {
+            config.runtime_env.llm_api_key = config.llm_api_key.clone();
+        }
+        if config.runtime_env.opencode_api_key.is_none() {
+            config.runtime_env.opencode_api_key = config.llm_api_key.clone();
+        }
+
         Ok(config)
     }
 
@@ -936,7 +960,11 @@ impl Config {
             ProviderChoice::OpenAiOAuth => None,
             ProviderChoice::Copilot => None,
             ProviderChoice::AnthropicOAuth => None,
-            ProviderChoice::OpenCode => self.runtime_env.opencode_api_key.clone(),
+            ProviderChoice::OpenCode => self
+                .runtime_env
+                .opencode_api_key
+                .clone()
+                .or_else(|| self.runtime_env.llm_api_key.clone()),
         }
     }
 
@@ -1738,6 +1766,54 @@ mod tests {
             }
         );
         assert!(auth.optional_api_key().is_none());
+    }
+
+    #[test]
+    fn openai_compat_toml_llm_api_key_reaches_auth() {
+        // A `llm_api_key` at the TOML root must back the `openai-compat`
+        // `LLM_API_KEY` source (so the key can live in config.toml, not just
+        // the environment). This is what unblocks `openai-compat` against a
+        // remote endpoint that 401s on the silent `dummy` fallback key.
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            "llm_provider = \"openai-compat\"\n\
+             llm_model = \"hy3-free\"\n\
+             llm_base_url = \"https://opencode.ai/zen/v1\"\n\
+             llm_api_key = \"sk-toml-key\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&cfg_path), Some(tmp.path().to_path_buf())).unwrap();
+
+        let auth = cfg.provider_auth(ProviderChoice::OpenAiCompat, None);
+        assert_eq!(
+            auth.optional_api_key().unwrap().expose_secret(),
+            "sk-toml-key",
+            "root llm_api_key must reach openai-compat auth"
+        );
+    }
+
+    #[test]
+    fn opencode_toml_llm_api_key_reaches_auth() {
+        // The `opencode` provider's key normally comes from `OPENCODE_API_KEY`,
+        // but a root `llm_api_key` in config.toml must be accepted as a
+        // fallback so operators can keep a single key field.
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            "llm_provider = \"opencode\"\nllm_api_key = \"sk-toml-key\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&cfg_path), Some(tmp.path().to_path_buf())).unwrap();
+
+        let auth = cfg.provider_auth(ProviderChoice::OpenCode, None);
+        assert_eq!(
+            auth.require_api_key().unwrap().expose_secret(),
+            "sk-toml-key",
+            "root llm_api_key must reach opencode auth when OPENCODE_API_KEY is unset"
+        );
     }
 
     #[test]
