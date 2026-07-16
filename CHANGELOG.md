@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- OpenAI-family LLM providers (`openai`, `openai-compat`, `opencode`) now
+  rotate across multiple API keys on 429/5xx with the same per-key 1-hour
+  cooldown blacklist the Gemini provider already used, when a comma-separated
+  key list is configured via `OPENAI_API_KEYS` / `LLM_API_KEYS` (or
+  `GEMINI_API_KEYS` for Gemini), including the TOML root `llm_api_keys` /
+  `gemini_api_keys` plural-list forms. Single-key configurations are unchanged.
+  Structured-output calls still surface a 429/5xx exactly once (no rotation
+  re-hammer) so downstream fallback logic is preserved.
+
 ### Changed
 - One-shot client commands (`rename-project`, `status`, `write-page`, …) no
   longer print the "cannot write log files … falling back" warning when the

@@ -66,21 +66,26 @@ pub struct OpenAiCompatProvider {
 impl OpenAiCompatProvider {
     /// Construct a provider pointed at `base_url` (`LLM_BASE_URL` or
     /// `OLLAMA_HOST`). API key is optional; many local engines accept
-    /// any non-empty string.
+    /// any non-empty string. When multiple keys are supplied they are
+    /// rotated on 429/5xx, mirroring the OpenAI and Gemini providers.
     ///
     /// # Errors
     /// Returns a `reqwest::Error` if the HTTP client cannot be built.
     pub fn new(
         base_url: impl Into<String>,
-        api_key: Option<SecretString>,
+        api_keys: Vec<SecretString>,
         model: impl Into<String>,
     ) -> LlmResult<Self> {
-        let key = api_key.unwrap_or_else(|| SecretString::from("dummy"));
+        let keys = if api_keys.is_empty() {
+            vec![SecretString::from("dummy")]
+        } else {
+            api_keys
+        };
         // Local / proxy engines speak the legacy OpenAI wire format
         // only — no `max_completion_tokens`, no model-family caps, no
         // temperature massaging. Swap dialect so the inner provider's
         // per-request quirks don't leak into Ollama / vLLM setups.
-        let inner = OpenAiProvider::new(key, model)?
+        let inner = OpenAiProvider::new_with_keys(keys, model)?
             .with_base_url(base_url)
             .with_dialect(RequestDialect::Compat);
         Ok(Self {
@@ -263,7 +268,7 @@ mod tests {
     /// on, mirroring how the factory threads `ProviderConfig::compat_strict`.
     #[test]
     fn strict_defaults_off_and_can_be_overridden() {
-        let p = OpenAiCompatProvider::new("http://localhost:11434/v1", None, "mistral-nemo")
+        let p = OpenAiCompatProvider::new("http://localhost:11434/v1", vec![], "mistral-nemo")
             .expect("provider builds");
         assert!(!p.strict);
         let p = p.with_strict(true);

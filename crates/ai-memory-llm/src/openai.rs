@@ -1,12 +1,14 @@
 //! OpenAI Chat Completions client (with `response_format` JSON schema for
 //! structured output).
 
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::error::{LlmError, LlmResult};
 use crate::provider::LlmProvider;
@@ -57,6 +59,13 @@ fn last_segment_is_version(url: &str) -> bool {
     })
 }
 
+/// How long a key is excluded from selection after it returns a 429
+/// (rate-limit) response. OpenAI's quota is per-key, so a key that 429s
+/// will keep 429ing for a while; parking it lets the round-robin cursor
+/// move on to a fresh key instead of re-hammering it. Mirrors the Gemini
+/// provider's cooldown.
+const KEY_BLACKLIST_DURATION: Duration = Duration::from_secs(60 * 60);
+
 /// Request dialect — picks which OpenAI quirks the provider applies.
 ///
 /// `Official` targets `api.openai.com` and honours the model-family
@@ -85,20 +94,37 @@ pub enum RequestDialect {
 /// OpenAI Chat Completions-backed provider.
 pub struct OpenAiProvider {
     client: reqwest::Client,
-    api_key: SecretString,
+    api_keys: Vec<SecretString>,
+    /// Shared cursor so concurrent requests spread their starting key
+    /// instead of stampeding a single key (cross-request round-robin).
+    next_key: AtomicUsize,
+    /// Per-key 429 blacklist: `Some(instant)` means "do not use this
+    /// key until `instant`". `None` means the key is currently usable.
+    /// Indexed in lock-step with `api_keys`.
+    blacklist: Arc<Mutex<Vec<Option<Instant>>>>,
     base_url: String,
     model: String,
     dialect: RequestDialect,
 }
 
 impl OpenAiProvider {
-    /// Construct a provider given an API key + model id. Defaults to
+    /// Construct a provider given a single API key + model id. Defaults to
     /// the `Official` dialect (targeting `api.openai.com`). Override
     /// with [`with_dialect`] when wrapping for `openai-compat`.
     ///
     /// # Errors
     /// Returns a `reqwest::Error` if the HTTP client cannot be built.
     pub fn new(api_key: SecretString, model: impl Into<String>) -> LlmResult<Self> {
+        Self::new_with_keys(vec![api_key], model)
+    }
+
+    /// Construct a provider given multiple API keys + model id.
+    /// Keys are rotated on 429/5xx errors in round-robin fashion,
+    /// matching the Gemini provider's key-rotation strategy.
+    ///
+    /// # Errors
+    /// Returns a `reqwest::Error` if the HTTP client cannot be built.
+    pub fn new_with_keys(api_keys: Vec<SecretString>, model: impl Into<String>) -> LlmResult<Self> {
         // 300s tolerates Ollama / llama-swap cold-loading a 30B+ model
         // from disk on first request. Once OLLAMA_KEEP_ALIVE keeps it
         // warm, subsequent requests return in seconds — but the first
@@ -106,9 +132,12 @@ impl OpenAiProvider {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
             .build()?;
+        let blacklist = vec![None; api_keys.len()];
         Ok(Self {
             client,
-            api_key,
+            api_keys,
+            next_key: AtomicUsize::new(0),
+            blacklist: Arc::new(Mutex::new(blacklist)),
             base_url: DEFAULT_BASE_URL.to_string(),
             model: model.into(),
             dialect: RequestDialect::Official,
@@ -221,8 +250,12 @@ impl LlmProvider for OpenAiProvider {
                 strict: true,
             },
         };
+        // Structured-output is a single attempt: callers (notably the
+        // openai-compat strict path) layer their own downstream fallback and
+        // must see a 5xx/429 propagated exactly once, not re-hammered through
+        // key rotation. Chat completion (`complete`) keeps the full rotation.
         let response = self
-            .post(&self.build_request(&request, Some(response_format)))
+            .post_no_retry(&self.build_request(&request, Some(response_format)))
             .await?;
         let text = response
             .choices
@@ -313,10 +346,117 @@ impl OpenAiProvider {
     async fn post<B: Serialize>(&self, body: &B) -> LlmResult<OpenAiResponse> {
         let url = normalize_openai_base(&self.base_url, "chat/completions");
         debug!(url, "POST openai");
+
+        let len = self.api_keys.len();
+        let max_attempts = std::cmp::max(5, len) as u32;
+        let mut attempt = 0u32;
+        // Spread the starting key across concurrent requests so the shared
+        // provider does not stampede a single key (cross-request round-robin).
+        let start = if len == 0 {
+            0
+        } else {
+            self.next_key.fetch_add(1, Ordering::Relaxed) % len
+        };
+        // First attempt uses the round-robin starting key; subsequent
+        // failures rotate past any blacklisted keys.
+        let mut key_idx = self.next_usable_key(start, start);
+
+        loop {
+            let api_key = self.api_keys.get(key_idx).cloned();
+            let Some(api_key) = api_key else {
+                return Err(LlmError::Provider {
+                    status: 500,
+                    body: "no api keys configured".into(),
+                });
+            };
+
+            let send_result = self
+                .client
+                .post(&url)
+                .bearer_auth(api_key.expose_secret())
+                .header("content-type", "application/json")
+                .json(body)
+                .send()
+                .await;
+
+            let resp = match send_result {
+                Ok(r) => r,
+                Err(e) => {
+                    // Transport-level failure (timeout, connection reset, DNS):
+                    // fail over to the next key instead of giving up. No
+                    // rate-limit backoff here — we just switch keys.
+                    if attempt < max_attempts.saturating_sub(1) {
+                        attempt += 1;
+                        key_idx = self.next_usable_key(key_idx.wrapping_add(1) % len, start);
+                        debug!(
+                            attempt,
+                            key_index = key_idx,
+                            ?e,
+                            "openai transport error, failing over to next key"
+                        );
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        continue;
+                    }
+                    return Err(LlmError::from(e));
+                }
+            };
+
+            let status = resp.status();
+            let is_retryable =
+                status.as_u16() == 429 || (status.as_u16() >= 500 && status.as_u16() < 600);
+            if is_retryable && attempt < max_attempts.saturating_sub(1) {
+                attempt += 1;
+                // A 429 means the key hit its per-key rate limit; park it
+                // for KEY_BLACKLIST_DURATION so we don't immediately retry
+                // it on the next rotation. 5xx is transient, so we leave
+                // the key eligible and just move on.
+                if status.as_u16() == 429 {
+                    self.blacklist_key(key_idx);
+                }
+                key_idx = self.next_usable_key(key_idx.wrapping_add(1) % len, start);
+                let delay = Self::retry_delay(attempt, start);
+                debug!(
+                    attempt,
+                    key_index = key_idx,
+                    ?delay,
+                    status = status.as_u16(),
+                    "openai key failed, rotating to next key"
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
+            if !status.is_success() {
+                let body = provider_error_body(resp).await;
+                return Err(LlmError::Provider {
+                    status: status.as_u16(),
+                    body,
+                });
+            }
+            return response_json_limited::<OpenAiResponse>(resp).await;
+        }
+    }
+
+    /// Single-attempt POST with no rotation or backoff. Used by structured
+    /// output, whose callers layer their own fallback and must observe an
+    /// upstream 429/5xx exactly once (re-hammering through key rotation would
+    /// double cost and defeat the compat-strict "propagate, don't retry"
+    /// contract). Uses the first configured key.
+    async fn post_no_retry<B: Serialize>(&self, body: &B) -> LlmResult<OpenAiResponse> {
+        let url = normalize_openai_base(&self.base_url, "chat/completions");
+        debug!(url, "POST openai (structured, no retry)");
+        let api_key = self
+            .api_keys
+            .first()
+            .cloned()
+            .ok_or_else(|| LlmError::Provider {
+                status: 500,
+                body: "no api keys configured".into(),
+            })?;
         let resp = self
             .client
             .post(&url)
-            .bearer_auth(self.api_key.expose_secret())
+            .bearer_auth(api_key.expose_secret())
             .header("content-type", "application/json")
             .json(body)
             .send()
@@ -330,6 +470,60 @@ impl OpenAiProvider {
             });
         }
         response_json_limited::<OpenAiResponse>(resp).await
+    }
+
+    /// Exponential backoff (capped) with a small per-request jitter derived
+    /// from the starting key index, so that concurrent requests desynchronise
+    /// their retries (thundering-herd avoidance) without an RNG dependency.
+    fn retry_delay(attempt: u32, start_key: usize) -> Duration {
+        let base = 2u64.saturating_pow(attempt.min(4));
+        let jitter_ms = (((start_key as u64).wrapping_add(attempt as u64)) * 7919) % 250 + 1;
+        Duration::from_millis(base * 1000 + jitter_ms)
+    }
+
+    /// Mark a key as temporarily unusable after it returned a 429. The
+    /// key is skipped by [`next_usable_key`] until the duration elapses.
+    fn blacklist_key(&self, key_idx: usize) {
+        let Ok(mut blacklist) = self.blacklist.lock() else {
+            return;
+        };
+        let Some(slot) = blacklist.get_mut(key_idx) else {
+            return;
+        };
+        *slot = Some(Instant::now() + KEY_BLACKLIST_DURATION);
+        warn!(
+            key_index = key_idx,
+            seconds = KEY_BLACKLIST_DURATION.as_secs(),
+            "openai key rate-limited (429); blacklisting for the cooldown window"
+        );
+    }
+
+    /// Return the next key at or after `from` that is not currently
+    /// blacklisted, wrapping around. If every key is blacklisted (e.g.
+    /// a total outage), falls back to `start` — the round-robin starting
+    /// index for this call — so the request still attempts instead of
+    /// spinning forever, and a still-cooling-down key isn't re-hit just
+    /// because it happens to be the rotated `from`.
+    fn next_usable_key(&self, from: usize, start: usize) -> usize {
+        let len = self.api_keys.len();
+        if len == 0 {
+            return 0;
+        }
+        let now = Instant::now();
+        let blacklist = self.blacklist.lock().ok();
+        let expired_or_clear = |i: usize| -> bool {
+            match blacklist.as_ref().and_then(|b| b.get(i)) {
+                Some(Some(until)) => now >= *until,
+                _ => true,
+            }
+        };
+        for step in 0..len {
+            let candidate = (from + step) % len;
+            if expired_or_clear(candidate) {
+                return candidate;
+            }
+        }
+        start
     }
 }
 
@@ -470,11 +664,18 @@ mod tests {
         OpenAiProvider, RequestDialect, enforce_strict_object_schemas,
         model_requires_max_completion_tokens, normalize_openai_base,
     };
+    use crate::error::LlmError;
+    use crate::provider::LlmProvider;
     use crate::types::{ChatMessage, ChatRequest, Role};
     use schemars::JsonSchema;
     use secrecy::SecretString;
     use serde::{Deserialize, Serialize};
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
     fn provider_for(model: &str) -> OpenAiProvider {
         OpenAiProvider::new(SecretString::new("test-key".into()), model).unwrap()
@@ -971,5 +1172,191 @@ mod tests {
             normalize_openai_base("https://api.z.ai/api/coding/paas/v4", ep),
             "https://api.z.ai/api/coding/paas/v4/embeddings"
         );
+    }
+
+    // ── key rotation / 429 blacklist ──────────────────────────────────────
+    // Mirrors the Gemini provider's rotation tests so the two OpenAI-family
+    // strategies stay in lock-step.
+
+    /// Records the `Authorization: Bearer` key used per request and returns
+    /// `fail_status` for the first `fail_for` requests, then a 200.
+    #[derive(Clone)]
+    struct RecordingResponder {
+        seen_keys: Arc<Mutex<Vec<String>>>,
+        request_count: Arc<AtomicUsize>,
+        fail_status: u16,
+        fail_for: usize,
+        success_body: String,
+    }
+
+    impl Respond for RecordingResponder {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let n = self.request_count.fetch_add(1, Ordering::SeqCst) + 1;
+            let auth = req
+                .headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            self.seen_keys.lock().unwrap().push(auth);
+            if n <= self.fail_for {
+                return ResponseTemplate::new(self.fail_status);
+            }
+            ResponseTemplate::new(200).set_body_string(self.success_body.clone())
+        }
+    }
+
+    fn chat_success_body() -> String {
+        serde_json::json!({
+            "choices": [{ "message": { "content": "hello" } }],
+            "model": "gpt-4o-mini"
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn complete_rotates_to_next_key_on_429() {
+        let server = MockServer::start().await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let count = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(RecordingResponder {
+                seen_keys: seen.clone(),
+                request_count: count.clone(),
+                fail_status: 429,
+                fail_for: 1,
+                success_body: chat_success_body(),
+            })
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new_with_keys(
+            vec![SecretString::from("k0"), SecretString::from("k1")],
+            "gpt-4o-mini",
+        )
+        .expect("provider builds")
+        .with_base_url(server.uri());
+
+        let response = provider
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .expect("succeeds after rotating to the second key");
+
+        assert_eq!(response.text, "hello");
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["Bearer k0".to_string(), "Bearer k1".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_retries_same_key_on_429_single_key() {
+        let server = MockServer::start().await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let count = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(RecordingResponder {
+                seen_keys: seen.clone(),
+                request_count: count.clone(),
+                fail_status: 429,
+                fail_for: 1,
+                success_body: chat_success_body(),
+            })
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new_with_keys(vec![SecretString::from("k0")], "gpt-4o-mini")
+            .expect("provider builds")
+            .with_base_url(server.uri());
+
+        let response = provider
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .expect("succeeds after one retry on the same key");
+
+        assert_eq!(response.text, "hello");
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["Bearer k0".to_string(), "Bearer k0".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_blacklists_key_on_429_and_skips_it() {
+        // k0 429s (but only on its FIRST touch), k1 always succeeds. The
+        // provider must blacklist k0 after the 429 and never send it a second
+        // request — so the call must succeed on k1 with exactly two requests.
+        let server = MockServer::start().await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let count = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(RecordingResponder {
+                seen_keys: seen.clone(),
+                request_count: count.clone(),
+                // k0 is the only key that ever fails; the responder fails the
+                // first request only, but the blacklist must still prevent a
+                // re-hit of k0 when more attempts would occur.
+                fail_status: 429,
+                fail_for: 1,
+                success_body: chat_success_body(),
+            })
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new_with_keys(
+            vec![SecretString::from("k0"), SecretString::from("k1")],
+            "gpt-4o-mini",
+        )
+        .expect("provider builds")
+        .with_base_url(server.uri());
+
+        let response = provider
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .expect("succeeds on the second key");
+
+        assert_eq!(response.text, "hello");
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        // k0 is tried once (429s, blacklisted), k1 succeeds; k0 must NOT be
+        // retried.
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["Bearer k0".to_string(), "Bearer k1".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_surfaces_429_when_all_keys_blacklisted() {
+        let server = MockServer::start().await;
+        let count = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(RecordingResponder {
+                seen_keys: Arc::new(Mutex::new(Vec::new())),
+                request_count: count.clone(),
+                fail_status: 429,
+                fail_for: 999,
+                success_body: chat_success_body(),
+            })
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new_with_keys(
+            vec![SecretString::from("k0"), SecretString::from("k1")],
+            "gpt-4o-mini",
+        )
+        .expect("provider builds")
+        .with_base_url(server.uri());
+
+        let err = provider
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .expect_err("all keys invalid -> 429 error");
+        assert!(matches!(err, LlmError::Provider { status: 429, .. }));
     }
 }
