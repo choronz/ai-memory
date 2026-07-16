@@ -99,6 +99,11 @@ pub struct ProviderConfig {
     /// parser. Ignored by every other provider. Sourced once from
     /// `AI_MEMORY_LLM_COMPAT_STRICT` by `Config::load`.
     pub compat_strict: bool,
+    /// Optional additional API keys for rotation (OpenAI / OpenCode).
+    /// Mirrors the Gemini/`api_keys` path: when set, the provider rotates
+    /// across keys on 429/5xx with a per-key cooldown. Empty for single-key
+    /// or key-less providers.
+    pub api_keys: Vec<SecretString>,
 }
 
 /// Embedding providers available to ai-memory.
@@ -213,8 +218,13 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             Ok(Arc::new(AnthropicProvider::new(key, config.model)?))
         }
         ProviderChoice::OpenAi => {
-            let key = config.auth.require_api_key()?;
-            Ok(Arc::new(OpenAiProvider::new(key, config.model)?))
+            let keys = config.auth.api_keys();
+            let keys = if keys.is_empty() {
+                vec![config.auth.require_api_key()?]
+            } else {
+                keys
+            };
+            Ok(Arc::new(OpenAiProvider::new_with_keys(keys, config.model)?))
         }
         ProviderChoice::Gemini => {
             let keys = config.auth.api_keys();
@@ -230,7 +240,7 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
                 .base_url
                 .ok_or_else(|| LlmError::NotConfigured("LLM_BASE_URL".into()))?;
             Ok(Arc::new(
-                OpenAiCompatProvider::new(base, config.auth.optional_api_key(), config.model)?
+                OpenAiCompatProvider::new(base, config.auth.api_keys(), config.model)?
                     .with_strict(config.compat_strict),
             ))
         }
@@ -251,8 +261,13 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             Ok(Arc::new(provider))
         }
         ProviderChoice::OpenCode => {
-            let key = config.auth.require_api_key()?;
-            Ok(Arc::new(OpenCodeProvider::new(key, config.model)?))
+            let keys = config.auth.api_keys();
+            let keys = if keys.is_empty() {
+                vec![config.auth.require_api_key()?]
+            } else {
+                keys
+            };
+            Ok(Arc::new(OpenCodeProvider::new(keys, config.model)?))
         }
     }
 }
@@ -309,6 +324,7 @@ mod tests {
             auth: ProviderAuth::required_api_key_from_env("OPENAI_API_KEY", None),
             base_url: None,
             compat_strict: false,
+            api_keys: Vec::new(),
         };
 
         let err = match build_provider(cfg) {

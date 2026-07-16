@@ -101,6 +101,17 @@ pub struct Config {
     pub gemini_api_key: Option<SecretString>,
     /// Optional LLM base URL override.
     pub llm_base_url: Option<String>,
+    /// Optional LLM API keys (comma-separated string or TOML array) at the
+    /// root of `config.toml`, enabling round-robin rotation on 429/5xx for the
+    /// OpenAI-family providers (`openai`, `openai-compat`, `opencode`). Loaded
+    /// from `LLM_API_KEYS`, or the root `llm_api_keys` TOML field; env takes
+    /// precedence when both are present. Mirrors `gemini_api_keys`.
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "deserialize_api_keys_string_or_vec_option"
+    )]
+    pub llm_api_keys: Option<Vec<SecretString>>,
     /// Optional LLM API key at the root of `config.toml` (e.g.
     /// `llm_api_key = "..."`). Used by `openai-compat` (and any provider whose
     /// `LLM_API_KEY` env var is the key source) so the key can live in
@@ -225,7 +236,9 @@ pub struct RuntimeEnv {
     anthropic_api_key: Option<SecretString>,
     anthropic_oauth_token: Option<SecretString>,
     openai_api_key: Option<SecretString>,
+    openai_api_keys: Option<Vec<SecretString>>,
     gemini_api_key: Option<SecretString>,
+    llm_api_keys: Option<Vec<SecretString>>,
     gemini_api_keys: Option<Vec<SecretString>>,
     llm_api_key: Option<SecretString>,
     llm_base_url: Option<String>,
@@ -273,7 +286,23 @@ impl RuntimeEnv {
             anthropic_oauth_token: env_secret("ANTHROPIC_OAUTH_TOKEN")
                 .or_else(|| env_secret("CLAUDE_CODE_OAUTH_TOKEN")),
             openai_api_key: env_secret("OPENAI_API_KEY"),
+            openai_api_keys: env_secret("OPENAI_API_KEYS").map(|s| {
+                s.expose_secret()
+                    .split(',')
+                    .map(|k| k.trim())
+                    .filter(|k| !k.is_empty())
+                    .map(SecretString::from)
+                    .collect()
+            }),
             gemini_api_key: gemini_key,
+            llm_api_keys: env_secret("LLM_API_KEYS").map(|s| {
+                s.expose_secret()
+                    .split(',')
+                    .map(|k| k.trim())
+                    .filter(|k| !k.is_empty())
+                    .map(SecretString::from)
+                    .collect()
+            }),
             gemini_api_keys,
             llm_api_key: env_secret("LLM_API_KEY"),
             llm_base_url: env_string("LLM_BASE_URL"),
@@ -431,6 +460,43 @@ fn resolve_gemini_keys(
     (None, None)
 }
 
+/// Resolve the effective OpenAI-family LLM keys from env vs. the root-level
+/// TOML `llm_api_key` (singular) and `llm_api_keys` (plural) values.
+///
+/// Precedence (most to least specific):
+/// 1. Plural env (`OPENAI_API_KEYS` / `LLM_API_KEYS`).
+/// 2. Singular env (`OPENAI_API_KEY` / `LLM_API_KEY`).
+/// 3. TOML `llm_api_keys` (plural list).
+/// 4. TOML `llm_api_key` (singular).
+///
+/// A plural key list always overrides a singular value when both are present
+/// (env and TOML alike), mirroring [`resolve_gemini_keys`]. Used to back
+/// round-robin rotation for `openai`, `openai-compat`, and `opencode` when the
+/// operator supplies multiple keys.
+fn resolve_llm_keys(
+    env_key: Option<SecretString>,
+    env_keys: Option<Vec<SecretString>>,
+    toml_key: Option<SecretString>,
+    toml_keys: Vec<SecretString>,
+) -> (Option<SecretString>, Option<Vec<SecretString>>) {
+    if let Some(keys) = &env_keys
+        && !keys.is_empty()
+    {
+        return (keys.first().cloned(), Some(keys.clone()));
+    }
+    if let Some(key) = env_key {
+        return (Some(key), None);
+    }
+    if !toml_keys.is_empty() {
+        let key = toml_keys.first().cloned();
+        return (key, Some(toml_keys));
+    }
+    if let Some(key) = toml_key {
+        return (Some(key), None);
+    }
+    (None, None)
+}
+
 /// `[auth]` section of `config.toml`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -513,6 +579,7 @@ impl Default for Config {
             gemini_api_keys: None,
             gemini_api_key: None,
             llm_base_url: None,
+            llm_api_keys: None,
             llm_api_key: None,
             llm_compat_strict: false,
             consolidate_on_session_end: false,
@@ -799,16 +866,28 @@ impl Config {
         config.runtime_env.gemini_api_key = resolved_key;
         config.runtime_env.gemini_api_keys = resolved_keys;
 
-        // Root-level `llm_api_key` in config.toml backs the `openai-compat`
-        // key source (and, as a fallback, `opencode`) only when the
-        // provider-specific env var (`LLM_API_KEY` / `OPENCODE_API_KEY`) is
-        // unset. Env wins; `RuntimeEnv::from_process` already populated them
-        // when present.
-        if config.runtime_env.llm_api_key.is_none() {
-            config.runtime_env.llm_api_key = config.llm_api_key.clone();
-        }
+        // Root-level `llm_api_key` / `llm_api_keys` in config.toml back the
+        // OpenAI-family key sources (openai, openai-compat, opencode) only
+        // when no LLM env key (singular or plural) is set. Env wins; when
+        // present it already populated both the plural list and the singular
+        // key in `RuntimeEnv::from_process`. When both TOML forms are present,
+        // the plural list wins over the singular key.
+        let toml_key = config.llm_api_key.clone();
+        let toml_keys = config.llm_api_keys.clone().unwrap_or_default();
+        let (resolved_key, resolved_keys) = resolve_llm_keys(
+            config.runtime_env.llm_api_key.clone(),
+            config.runtime_env.llm_api_keys.clone(),
+            toml_key,
+            toml_keys,
+        );
+        config.runtime_env.llm_api_key = resolved_key;
+        config.runtime_env.llm_api_keys = resolved_keys.clone();
+
+        // `opencode` falls back to the resolved LLM key/keys when its own
+        // provider-specific env var is unset. Env wins; `RuntimeEnv::from_process`
+        // already populated `opencode_api_key` when present.
         if config.runtime_env.opencode_api_key.is_none() {
-            config.runtime_env.opencode_api_key = config.llm_api_key.clone();
+            config.runtime_env.opencode_api_key = config.runtime_env.llm_api_key.clone();
         }
 
         Ok(config)
@@ -876,6 +955,7 @@ impl Config {
                 .clone()
                 .or_else(|| self.runtime_env.llm_base_url.clone()),
             compat_strict: self.llm_compat_strict,
+            api_keys: Vec::new(),
         }))
     }
 
@@ -968,6 +1048,29 @@ impl Config {
         }
     }
 
+    /// Resolve the configured multi-key list for a provider, if the operator
+    /// set a comma-separated `KEYS` env var or a `llm_api_keys` /
+    /// `gemini_api_keys` TOML list. OpenAI-family providers (OpenAI,
+    /// OpenCode, openai-compat) read `OPENAI_API_KEYS` / `LLM_API_KEYS`;
+    /// Gemini reads `GEMINI_API_KEYS`/`GOOGLE_API_KEYS`. Returns `None` when no
+    /// list is configured so single-key resolution remains the default path.
+    fn multi_api_keys_for(&self, provider: ProviderChoice) -> Option<Vec<SecretString>> {
+        match provider {
+            ProviderChoice::Gemini => self.runtime_env.gemini_api_keys.clone(),
+            ProviderChoice::OpenAi | ProviderChoice::OpenCode => self
+                .runtime_env
+                .openai_api_keys
+                .clone()
+                .or_else(|| self.runtime_env.llm_api_keys.clone()),
+            ProviderChoice::OpenAiCompat => self.runtime_env.llm_api_keys.clone(),
+            // These providers have no multi-key rotation surface.
+            ProviderChoice::Anthropic
+            | ProviderChoice::OpenAiOAuth
+            | ProviderChoice::Copilot
+            | ProviderChoice::AnthropicOAuth => None,
+        }
+    }
+
     /// Shared provider auth token file path.
     #[must_use]
     pub fn auth_token_path(&self) -> PathBuf {
@@ -1016,9 +1119,11 @@ impl Config {
     ) -> ProviderAuth {
         match provider.auth_requirement() {
             AuthRequirement::RequiredApiKey { env_var } => {
-                // For Gemini, use multi-key auth if available from env
-                if provider == ProviderChoice::Gemini
-                    && let Some(ref keys) = self.runtime_env.gemini_api_keys
+                // For Gemini and OpenAI-family providers, use multi-key auth
+                // if a comma-separated key list is configured (e.g.
+                // GEMINI_API_KEYS / OPENAI_API_KEYS), enabling round-robin
+                // rotation on 429/5xx like the Gemini provider.
+                if let Some(ref keys) = self.multi_api_keys_for(provider)
                     && !keys.is_empty()
                 {
                     return ProviderAuth::required_api_keys_from_env(
@@ -1359,6 +1464,119 @@ mod tests {
         assert_eq!(raw.len(), 2, "blank entries must be dropped");
         assert_eq!(raw[0].expose_secret(), "a");
         assert_eq!(raw[1].expose_secret(), "b");
+    }
+
+    /// `LLM_API_KEYS` env (or a TOML `llm_api_keys` list) backs round-robin
+    /// rotation for the OpenAI-family providers, mirroring Gemini's handling.
+    #[test]
+    fn load_root_llm_api_keys_string_parsed() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            "llm_provider = \"openai\"\nllm_api_keys = \"sk-1,sk-2,sk-3\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&cfg_path), Some(tmp.path().to_path_buf())).unwrap();
+
+        if std::env::var("LLM_API_KEYS").is_ok() || std::env::var("OPENAI_API_KEYS").is_ok() {
+            return;
+        }
+        let keys = cfg
+            .runtime_env
+            .llm_api_keys
+            .expect("root-level llm_api_keys parsed from TOML");
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys[0].expose_secret(), "sk-1");
+    }
+
+    #[test]
+    fn load_root_llm_api_keys_plural_overrides_singular() {
+        // When both `llm_api_key` and `llm_api_keys` are in TOML, the plural
+        // list wins (and supplies the singular runtime_env key too).
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            "llm_provider = \"openai\"\nllm_api_key = \"sk-solo\"\nllm_api_keys = \"p1,p2\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&cfg_path), Some(tmp.path().to_path_buf())).unwrap();
+
+        if std::env::var("LLM_API_KEYS").is_ok()
+            || std::env::var("OPENAI_API_KEYS").is_ok()
+            || std::env::var("LLM_API_KEY").is_ok()
+            || std::env::var("OPENAI_API_KEY").is_ok()
+        {
+            return;
+        }
+        let keys = cfg.runtime_env.llm_api_keys.expect("plural TOML list wins");
+        assert_eq!(keys.len(), 2);
+        assert_eq!(
+            cfg.runtime_env
+                .llm_api_key
+                .as_ref()
+                .unwrap()
+                .expose_secret(),
+            "p1",
+            "plural list supplies the singular runtime key"
+        );
+    }
+
+    #[test]
+    fn load_env_llm_api_keys_takes_precedence_over_toml() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        std::fs::write(&cfg_path, "llm_api_keys = \"toml1,toml2,toml3\"\n").unwrap();
+        let cfg = Config::load(Some(&cfg_path), Some(tmp.path().to_path_buf())).unwrap();
+
+        if let Some(env_raw) = std::env::var("LLM_API_KEYS")
+            .ok()
+            .or_else(|| std::env::var("OPENAI_API_KEYS").ok())
+        {
+            let env_keys: Vec<String> = env_raw
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let keys = cfg
+                .runtime_env
+                .llm_api_keys
+                .expect("env plural keys loaded");
+            assert_eq!(
+                keys.len(),
+                env_keys.len(),
+                "env plural keys override toml list"
+            );
+            for (got, want) in keys.iter().zip(&env_keys) {
+                assert_eq!(got.expose_secret(), want);
+            }
+        } else if std::env::var("LLM_API_KEY").is_ok() || std::env::var("OPENAI_API_KEY").is_ok() {
+            // Only a singular env key is set: the TOML list must be ignored
+            // (the singular env key wins).
+            assert!(
+                cfg.runtime_env.llm_api_keys.is_none(),
+                "toml must be ignored when only a singular env key is set"
+            );
+        }
+    }
+
+    #[test]
+    fn llm_api_keys_reach_openai_provider_auth() {
+        // A TOML `llm_api_keys` list must back the OpenAI provider's
+        // multi-key rotation (and surface through `api_keys()`).
+        let cfg = Config {
+            llm_provider: Some("openai".into()),
+            runtime_env: RuntimeEnv {
+                llm_api_keys: Some(vec![SecretString::from("sk-a"), SecretString::from("sk-b")]),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+        let auth = cfg.provider_auth(ProviderChoice::OpenAi, None);
+        let keys = auth.api_keys();
+        assert_eq!(keys.len(), 2, "llm_api_keys must reach openai auth");
+        assert_eq!(keys[0].expose_secret(), "sk-a");
     }
 
     #[test]

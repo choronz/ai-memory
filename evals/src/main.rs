@@ -371,6 +371,7 @@ impl From<ResolvedConfig> for ProviderConfig {
             // The eval harness benchmarks the default tolerant path; strict
             // mode is an operator opt-in not modeled by these comparisons.
             compat_strict: false,
+            api_keys: Vec::new(),
         }
     }
 }

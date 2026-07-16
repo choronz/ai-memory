@@ -2,7 +2,9 @@
 //!
 //! Thin wrapper around [`OpenAiCompatProvider`] that bakes in the OpenCode
 //! Zen API base URL (`https://opencode.ai/zen/go/v1`) and names the provider
-//! `"opencode"`. Accepts an `sk-...` API key from `OPENCODE_API_KEY`.
+//! `"opencode"`. Accepts an `sk-...` API key from `OPENCODE_API_KEY`; when
+//! multiple keys are configured they rotate on 429/5xx like the other
+//! OpenAI-family providers.
 
 use async_trait::async_trait;
 use secrecy::SecretString;
@@ -32,8 +34,8 @@ impl OpenCodeProvider {
     ///
     /// # Errors
     /// Returns a `reqwest::Error` if the HTTP client cannot be built.
-    pub fn new(api_key: SecretString, model: impl Into<String>) -> LlmResult<Self> {
-        let inner = OpenAiCompatProvider::new(OPENCODE_ZEN_BASE_URL, Some(api_key), model.into())?;
+    pub fn new(api_keys: Vec<SecretString>, model: impl Into<String>) -> LlmResult<Self> {
+        let inner = OpenAiCompatProvider::new(OPENCODE_ZEN_BASE_URL, api_keys, model.into())?;
         Ok(Self { inner })
     }
 }

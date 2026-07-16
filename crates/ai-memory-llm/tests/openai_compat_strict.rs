@@ -24,7 +24,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 fn strict_provider(base_url: String) -> OpenAiCompatProvider {
-    OpenAiCompatProvider::new(base_url, None, "mistral-nemo")
+    OpenAiCompatProvider::new(base_url, vec![], "mistral-nemo")
         .expect("provider builds")
         .with_strict(true)
 }
