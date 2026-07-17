@@ -420,7 +420,7 @@ pub struct RenameProjectArgs {
     pub to: String,
 }
 
-    /// Arguments for `rename-workspace`.
+/// Arguments for `rename-workspace`.
 #[derive(Debug, Args)]
 pub struct RenameWorkspaceArgs {
     /// Current workspace name. Defaults to `default`.
