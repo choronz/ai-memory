@@ -76,9 +76,7 @@ pub(crate) fn antigravity_hooks_path() -> anyhow::Result<std::path::PathBuf> {
 
 /// `~/.grok/hooks/ai-memory.json` — Grok Build CLI lifecycle hooks.
 pub(crate) fn grok_hooks_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(home_dir()
-        .context("could not locate $HOME for ~/.grok/hooks/ai-memory.json")?
-        .join(".grok")
+    Ok(install_mcp::grok_home()?
         .join("hooks")
         .join("ai-memory.json"))
 }
@@ -147,7 +145,7 @@ pub(crate) fn pi_extension_path() -> anyhow::Result<std::path::PathBuf> {
 /// Returns an error if the hook script directory cannot be located.
 pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
     let inferred = if args.server_url.is_none() {
-        infer_installed_mcp_config(args.agent)
+        infer_installed_mcp_config(args.agent)?
     } else {
         None
     };
@@ -360,38 +358,117 @@ fn apply_base_path_to_hook_url(url: &str, base_path: &str) -> String {
     }
 }
 
-fn infer_installed_mcp_config(agent: AgentChoice) -> Option<InferredMcpConfig> {
-    let client = mcp_client_for_agent(agent)?;
-    let path = install_mcp::mcp_config_path(client).ok()?;
-    let content = fs::read_to_string(path).ok()?;
+fn infer_installed_mcp_config(agent: AgentChoice) -> Result<Option<InferredMcpConfig>> {
+    if agent == AgentChoice::Grok {
+        let cwd = std::env::current_dir()
+            .context("could not resolve current dir for Grok project configuration")?;
+        let repo_root = ai_memory_consolidate::discover_repo_root(&cwd).ok();
+        if let Some(project_config) = find_grok_project_overlay(&cwd, repo_root.as_deref()) {
+            anyhow::bail!(
+                "Grok project configuration {} may override GROK_HOME; pass explicit --server-url and --auth-token rather than inferring MCP settings",
+                project_config.display()
+            );
+        }
+    }
+    let Some(client) = mcp_client_for_agent(agent) else {
+        return Ok(None);
+    };
+    let path = install_mcp::mcp_config_path(client)?;
+    let Ok(content) = fs::read_to_string(path) else {
+        return Ok(None);
+    };
     match client {
-        McpClient::ClaudeCode => {
-            infer_json_mcp_config(&content, &["mcpServers", "ai-memory"], "url")
-        }
-        McpClient::Codex => infer_codex_mcp_config(&content),
-        McpClient::OpenCode => infer_json_mcp_config(&content, &["mcp", "ai-memory"], "url"),
-        McpClient::Cursor => infer_json_mcp_config(&content, &["mcpServers", "ai-memory"], "url"),
-        McpClient::GeminiCli => {
-            infer_json_mcp_config(&content, &["mcpServers", "ai-memory"], "httpUrl")
-        }
-        McpClient::Openclaw => {
-            infer_json_mcp_config(&content, &["mcp", "servers", "ai-memory"], "url")
-        }
-        McpClient::Omp => infer_json_mcp_config(&content, &["mcpServers", "ai-memory"], "url"),
-        McpClient::Zero => infer_json_mcp_config(&content, &["mcp", "servers", "ai-memory"], "url"),
-        McpClient::Pi => None,
-        McpClient::AntigravityCli => {
-            infer_json_mcp_config(&content, &["mcpServers", "ai-memory"], "serverUrl")
-        }
-        McpClient::Devin => infer_json_mcp_config(&content, &["mcpServers", "ai-memory"], "url"),
-        McpClient::ClaudeDesktop => None,
+        McpClient::ClaudeCode => Ok(infer_json_mcp_config(
+            &content,
+            &["mcpServers", "ai-memory"],
+            "url",
+        )),
+        // Codex uses `http_headers`; Grok uses `headers`. The shared TOML
+        // inferencer accepts both.
+        McpClient::Codex => Ok(infer_toml_mcp_config(&content)),
+        McpClient::Grok => infer_grok_mcp_config(&content),
+        McpClient::OpenCode => Ok(infer_json_mcp_config(
+            &content,
+            &["mcp", "ai-memory"],
+            "url",
+        )),
+        McpClient::Cursor => Ok(infer_json_mcp_config(
+            &content,
+            &["mcpServers", "ai-memory"],
+            "url",
+        )),
+        McpClient::GeminiCli => Ok(infer_json_mcp_config(
+            &content,
+            &["mcpServers", "ai-memory"],
+            "httpUrl",
+        )),
+        McpClient::Openclaw => Ok(infer_json_mcp_config(
+            &content,
+            &["mcp", "servers", "ai-memory"],
+            "url",
+        )),
+        McpClient::Omp => Ok(infer_json_mcp_config(
+            &content,
+            &["mcpServers", "ai-memory"],
+            "url",
+        )),
+        McpClient::Zero => Ok(infer_json_mcp_config(
+            &content,
+            &["mcp", "servers", "ai-memory"],
+            "url",
+        )),
+        McpClient::Pi => Ok(None),
+        McpClient::AntigravityCli => Ok(infer_json_mcp_config(
+            &content,
+            &["mcpServers", "ai-memory"],
+            "serverUrl",
+        )),
+        McpClient::Devin => Ok(infer_json_mcp_config(
+            &content,
+            &["mcpServers", "ai-memory"],
+            "url",
+        )),
+        McpClient::ClaudeDesktop => Ok(None),
         // MCP-only client: no AgentChoice counterpart routes here.
         // Reachable only if a future install_hooks flow targets VS
         // Code Copilot directly.
-        McpClient::VsCodeCopilot => {
-            infer_json_mcp_config(&content, &["servers", "ai-memory"], "url")
-        }
+        McpClient::VsCodeCopilot => Ok(infer_json_mcp_config(
+            &content,
+            &["servers", "ai-memory"],
+            "url",
+        )),
     }
+}
+
+/// Grok loads project settings from every directory between the repository
+/// root and CWD. Outside a repository, only the active directory is relevant.
+fn grok_project_overlay_paths(cwd: &Path, repo_root: Option<&Path>) -> Vec<PathBuf> {
+    let start = repo_root
+        .filter(|root| cwd.starts_with(root))
+        .unwrap_or(cwd);
+    let mut directories = Vec::new();
+    let mut current = cwd;
+    loop {
+        directories.push(current.to_path_buf());
+        if current == start {
+            break;
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent;
+    }
+    directories.reverse();
+    directories
+        .into_iter()
+        .map(|directory| directory.join(".grok").join("config.toml"))
+        .collect()
+}
+
+fn find_grok_project_overlay(cwd: &Path, repo_root: Option<&Path>) -> Option<PathBuf> {
+    grok_project_overlay_paths(cwd, repo_root)
+        .into_iter()
+        .find(|path| path.exists())
 }
 
 fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
@@ -405,9 +482,11 @@ fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
         AgentChoice::Openclaw => Some(McpClient::Openclaw),
         AgentChoice::AntigravityCli => Some(McpClient::AntigravityCli),
         AgentChoice::Zero => Some(McpClient::Zero),
-        // Grok and Devin manage their own MCP config under ~/.grok/ and ~/.devin/;
-        // we don't auto-infer a hook server URL from it.
-        AgentChoice::Pi | AgentChoice::Grok | AgentChoice::Devin => None,
+        AgentChoice::Grok => Some(McpClient::Grok),
+        AgentChoice::Devin => Some(McpClient::Devin),
+        // Pi bridges MCP through its generated extension, not a native
+        // mcp.json the installer can scrape.
+        AgentChoice::Pi => None,
     }
 }
 
@@ -436,12 +515,14 @@ fn infer_json_mcp_config(
     })
 }
 
-fn infer_codex_mcp_config(content: &str) -> Option<InferredMcpConfig> {
+/// Infer hook server URL + bearer from a TOML `[mcp_servers.ai-memory]`
+/// entry (Codex `http_headers` or Grok `headers`).
+fn infer_toml_mcp_config(content: &str) -> Option<InferredMcpConfig> {
     let doc: toml_edit::DocumentMut = content.parse().ok()?;
     // `toml_edit::Item`'s `Index` impl panics on missing keys, so this
     // walks the table chain with `.get()` instead. A user with
     // `[mcp_servers.context7]` but no `[mcp_servers.ai-memory]` is a
-    // perfectly valid hooks-only Codex setup (issue #53) — return None
+    // perfectly valid hooks-only Codex/Grok setup (issue #53) — return None
     // rather than abort the whole install with a stack trace.
     let server = doc.get("mcp_servers")?.get("ai-memory")?;
 
@@ -462,6 +543,82 @@ fn infer_codex_mcp_config(content: &str) -> Option<InferredMcpConfig> {
         hook_server_url,
         auth_token,
     })
+}
+
+/// Infer Grok's TOML entry after resolving its supported `${VAR}` and
+/// `${VAR:-default}` placeholders. Refuse missing variables so generated hook
+/// commands never contain a literal placeholder.
+fn infer_grok_mcp_config(content: &str) -> Result<Option<InferredMcpConfig>> {
+    let doc: toml_edit::DocumentMut = match content.parse() {
+        Ok(doc) => doc,
+        Err(_) => return Ok(None),
+    };
+    let Some(server) = doc
+        .get("mcp_servers")
+        .and_then(|servers| servers.get("ai-memory"))
+    else {
+        return Ok(None);
+    };
+    let hook_server_url = server
+        .get("url")
+        .and_then(|value| value.as_str())
+        .map(expand_grok_placeholders)
+        .transpose()?
+        .as_deref()
+        .and_then(hook_server_url_from_mcp_url);
+    let auth_token = server
+        .get("headers")
+        .and_then(|headers| headers.get("Authorization"))
+        .and_then(|value| value.as_str())
+        .map(expand_grok_placeholders)
+        .transpose()?
+        .as_deref()
+        .and_then(bearer_token_from_header);
+    if hook_server_url.is_none() && auth_token.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(InferredMcpConfig {
+        hook_server_url,
+        auth_token,
+    }))
+}
+
+fn expand_grok_placeholders(value: &str) -> Result<String> {
+    expand_grok_placeholders_with(value, |name| std::env::var(name).ok())
+}
+
+fn expand_grok_placeholders_with(
+    value: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<String> {
+    let mut output = String::with_capacity(value.len());
+    let mut remaining = value;
+    while let Some(start) = remaining.find("${") {
+        output.push_str(&remaining[..start]);
+        let after_start = &remaining[start + 2..];
+        let end = after_start
+            .find('}')
+            .context("unterminated Grok ${...} placeholder")?;
+        let expression = &after_start[..end];
+        let (name, default) = expression
+            .split_once(":-")
+            .map_or((expression, None), |(name, default)| (name, Some(default)));
+        if name.is_empty()
+            || !name.chars().enumerate().all(|(index, ch)| {
+                ch == '_' || ch.is_ascii_alphanumeric() && (index > 0 || ch.is_ascii_alphabetic())
+            })
+        {
+            anyhow::bail!("invalid Grok environment placeholder `${{{expression}}}`");
+        }
+        let replacement = lookup(name)
+            .filter(|value| !value.is_empty())
+            .or_else(|| default.map(ToOwned::to_owned))
+            .with_context(|| format!("Grok MCP placeholder `${{{name}}}` is unset; pass explicit --server-url and --auth-token"))?;
+        output.push_str(&replacement);
+        remaining = &after_start[end + 1..];
+    }
+    output.push_str(remaining);
+    Ok(output)
 }
 
 fn hook_server_url_from_mcp_url(url: &str) -> Option<String> {
@@ -2574,12 +2731,19 @@ fn render_grok(
     );
     let serialized =
         serde_json::to_string_pretty(&payload).context("serializing grok hook config")?;
-    println!("# Grok Build CLI hook config — write to ~/.grok/hooks/ai-memory.json");
+    let config_path = grok_hooks_path()?;
+    println!(
+        "# Grok Build CLI hook config — write to {}",
+        config_path.display()
+    );
     println!("# Hook scripts: {}", hooks_dir.display());
     println!("# AI-memory server URL: {server_url}");
     if auth_token.is_some() {
         println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
-        println!("#       Treat ~/.grok/hooks/ai-memory.json as sensitive (chmod 600).");
+        println!(
+            "#       Treat {} as sensitive (chmod 600).",
+            config_path.display()
+        );
     }
     println!("# NOTE: Grok ignores hook stdout on SessionStart — capture works,");
     println!("#       but handoff injection does not. Recover a prior session's");
@@ -3289,11 +3453,31 @@ mod tests {
 
     #[test]
     fn codex_mcp_inference_accepts_block_form_config() {
-        let inferred = infer_codex_mcp_config(
+        let inferred = infer_toml_mcp_config(
             r#"[mcp_servers.ai-memory]
 url = "http://homelab:49374/mcp"
 
 [mcp_servers.ai-memory.http_headers]
+Authorization = "Bearer secret-token"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            inferred.hook_server_url.as_deref(),
+            Some("http://homelab:49374")
+        );
+        assert_eq!(inferred.auth_token.as_deref(), Some("secret-token"));
+    }
+
+    #[test]
+    fn grok_mcp_inference_accepts_headers_key() {
+        let inferred = infer_toml_mcp_config(
+            r#"[mcp_servers.ai-memory]
+url = "http://homelab:49374/mcp"
+enabled = true
+
+[mcp_servers.ai-memory.headers]
 Authorization = "Bearer secret-token"
 "#,
         )
@@ -3314,7 +3498,7 @@ Authorization = "Bearer secret-token"
     /// server — must return None, not abort the whole install.
     #[test]
     fn codex_mcp_inference_returns_none_when_ai_memory_entry_missing() {
-        let inferred = infer_codex_mcp_config(
+        let inferred = infer_toml_mcp_config(
             r#"[mcp_servers.context7]
 url = "http://localhost:9000/mcp"
 
@@ -3334,7 +3518,7 @@ args = ["node-repl"]
     /// None rather than panic on the first index.
     #[test]
     fn codex_mcp_inference_returns_none_when_no_mcp_servers_table() {
-        let inferred = infer_codex_mcp_config(
+        let inferred = infer_toml_mcp_config(
             r#"# fresh codex config
 model = "gpt-5"
 "#,
@@ -3345,7 +3529,7 @@ model = "gpt-5"
     /// And the empty-file edge case the parser still accepts.
     #[test]
     fn codex_mcp_inference_returns_none_for_empty_doc() {
-        assert!(infer_codex_mcp_config("").is_none());
+        assert!(infer_toml_mcp_config("").is_none());
     }
 
     /// An ai-memory entry that exists but ships neither a `url` nor an
@@ -3354,7 +3538,7 @@ model = "gpt-5"
     /// present but unhelpful" — both yield None, neither panics.
     #[test]
     fn codex_mcp_inference_returns_none_for_bare_ai_memory_entry() {
-        let inferred = infer_codex_mcp_config(
+        let inferred = infer_toml_mcp_config(
             r#"[mcp_servers.ai-memory]
 # intentionally empty — no url, no headers.
 "#,
@@ -4789,5 +4973,57 @@ model = "gpt-5"
             script_content.contains("else\n    printf '{}\\n'\nfi"),
             "Devin session-start.sh must print {{}} only when no handoff is available"
         );
+    }
+
+    #[test]
+    fn grok_placeholder_expansion_resolves_values_and_defaults() {
+        let expanded = expand_grok_placeholders_with("${HOST}/mcp ${TOKEN:-fallback}", |name| {
+            (name == "HOST").then(|| "https://memory.example".to_string())
+        })
+        .unwrap();
+        assert_eq!(expanded, "https://memory.example/mcp fallback");
+    }
+
+    #[test]
+    fn grok_placeholder_expansion_rejects_missing_variable() {
+        let err = expand_grok_placeholders_with("${MISSING}", |_| None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("pass explicit --server-url and --auth-token")
+        );
+    }
+
+    #[test]
+    fn grok_project_overlays_cover_repo_root_through_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let parent = root.join("nested");
+        let cwd = parent.join("leaf");
+        fs::create_dir_all(&cwd).unwrap();
+
+        for directory in [&root, &parent, &cwd] {
+            let overlay = directory.join(".grok/config.toml");
+            fs::create_dir_all(overlay.parent().unwrap()).unwrap();
+            fs::write(&overlay, "# override").unwrap();
+            assert_eq!(find_grok_project_overlay(&cwd, Some(&root)), Some(overlay));
+            fs::remove_file(directory.join(".grok/config.toml")).unwrap();
+        }
+        assert_eq!(find_grok_project_overlay(&cwd, Some(&root)), None);
+    }
+
+    #[test]
+    fn grok_project_overlay_outside_repo_checks_only_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("outside").join("leaf");
+        fs::create_dir_all(&cwd).unwrap();
+        let parent_overlay = cwd.parent().unwrap().join(".grok/config.toml");
+        fs::create_dir_all(parent_overlay.parent().unwrap()).unwrap();
+        fs::write(&parent_overlay, "# ignored").unwrap();
+        assert_eq!(find_grok_project_overlay(&cwd, None), None);
+
+        let cwd_overlay = cwd.join(".grok/config.toml");
+        fs::create_dir_all(cwd_overlay.parent().unwrap()).unwrap();
+        fs::write(&cwd_overlay, "# active").unwrap();
+        assert_eq!(find_grok_project_overlay(&cwd, None), Some(cwd_overlay));
     }
 }

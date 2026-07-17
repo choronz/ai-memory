@@ -563,9 +563,10 @@ differences:
 
 The `SessionStart` hook injects pending handoffs through Devin's
 `hookSpecificOutput.additionalContext`. Real Devin `SessionStart` and
-`PostToolUse` payloads may omit `session_id` and `cwd`; ai-memory derives stable
-session/cwd context from its hook state and process environment so those events
-are still captured.
+`PostToolUse` payloads may omit `session_id` and `cwd`; ai-memory now infers cwd
+from `DEVIN_PROJECT_DIR` or the hook process working directory when the payload
+omits it, and mints/reuses a per-host session id from hook state when necessary,
+so those events are still captured. A payload-provided value always wins.
 
 ### OpenCode
 
@@ -690,6 +691,10 @@ docker run --rm akitaonrails/ai-memory:latest \
     --server-url "http://homelab:49374"
 
 docker run --rm akitaonrails/ai-memory:latest \
+    install-mcp --client grok            --auth-token "$TOKEN" \
+    --server-url "http://homelab:49374/mcp"
+
+docker run --rm akitaonrails/ai-memory:latest \
     install-hooks --agent grok            --auth-token "$TOKEN" \
     --server-url "http://homelab:49374"
 
@@ -706,16 +711,18 @@ docker run --rm akitaonrails/ai-memory:latest \
     --server-url "http://homelab:49374/mcp"
 ```
 
-Cursor, Gemini CLI, Antigravity CLI, and OpenClaw support both `install-mcp` and
-`install-hooks`. Grok Build CLI is hook-only in ai-memory's installer today:
-`install-hooks --agent grok` captures lifecycle events, but Grok ignores
-`SessionStart` stdout, so handoffs must be accepted through MCP with
+Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, and OpenClaw support both
+`install-mcp` and `install-hooks`. Grok's `install-mcp --client grok` writes
+`$GROK_HOME/config.toml` (default `~/.grok/config.toml`); its hooks live under
+`$GROK_HOME/hooks` (default `~/.grok/hooks`). `install-hooks --agent grok`
+captures lifecycle events.
+Grok ignores `SessionStart` stdout, so handoffs must be accepted through MCP with
 `memory_handoff_accept` when resuming. Claude Desktop and VS Code Copilot are MCP-only here,
 so you'll need to nudge the model to call `memory_query` /
 `memory_handoff_accept` itself.
 For clients with `install-hooks` support, the capture path handles
 handoff injection at session start or the client's closest equivalent, except
-for Grok's no-stdout SessionStart behavior (Antigravity CLI uses `PreInvocation`).
+for Grok's (and Zero's) no-stdout SessionStart behavior (Antigravity CLI uses `PreInvocation`).
 
 ---
 
@@ -1114,7 +1121,7 @@ without that marker are preserved unless you explicitly force replacement.
 |---|---|
 | `--no-skills` | Refresh only the markered instruction block. |
 | `--skills-scope <scope>` | Choose project-local or user-global skill roots. Values: `project`, `global`. Defaults to `project`. |
-| `--skills-agent <agent>` | Choose `.claude/skills`, `.agents/skills`, `.devin/skills`, or both Claude/Agents roots. Values: `claude-code`, `agents`, `devin`, `both`. By default, `CLAUDE.md` targets imply `claude-code`, `AGENTS.md` targets imply `agents`, and both instruction files imply `both`. |
+| `--skills-agent <agent>` | Choose `.claude/skills`, `.agents/skills`, `.devin/skills`, `.grok/skills`, or both Claude/Agents roots. Values: `claude-code`, `agents`, `devin`, `grok`, `both`. By default, `CLAUDE.md` targets imply `claude-code`, `AGENTS.md` targets imply `agents`, and both instruction files imply `both`. |
 | `--skills-target-dir <dir>` | Write managed skill directories below an explicit root instead of inferring from scope and agent. |
 | `--skills-force` | Replace unmanaged same-name skills during `install-instructions`; without it, they are left untouched and the command exits with an actionable error. |
 
@@ -1125,6 +1132,7 @@ Agent Skill files need a refresh:
 ai-memory install-skills
 ai-memory install-skills --scope global --agent agents
 ai-memory install-skills --scope global --agent devin
+ai-memory install-skills --scope global --agent grok
 ai-memory install-skills --agent both --print
 ai-memory install-skills --target-dir .custom/skills --force
 ```
@@ -1134,17 +1142,17 @@ ai-memory install-skills --target-dir .custom/skills --force
 | Flag | Meaning |
 |---|---|
 | `--scope <scope>` | Install into this project or the current user's global skill roots. Values: `project`, `global`. Defaults to `project`. |
-| `--agent <agent>` | Install into Claude Code's skill root, the cross-agent skill root, Devin's skill root, or both Claude/Agents roots. Values: `claude-code`, `agents`, `devin`, `both`. Defaults to `claude-code`. |
+| `--agent <agent>` | Install into Claude Code's skill root, the cross-agent skill root, Devin's skill root, Grok's skill root, or both Claude/Agents roots. Values: `claude-code`, `agents`, `devin`, `grok`, `both`. Defaults to `claude-code`. |
 | `--target-dir <dir>` | Write managed skill directories below an explicit root; `--scope` and `--agent` are ignored. |
 | `--print` | Print target paths and `SKILL.md` contents without writing files. |
 | `--force` | Replace unmanaged same-name skills; without it, user-authored same-name skills are preserved. |
 
 Default skill target roots:
 
-| Scope | `--agent claude-code` | `--agent agents` | `--agent devin` |
-|---|---|---|---|
-| `project` | `.claude/skills` | `.agents/skills` | `.devin/skills` |
-| `global` | `~/.claude/skills` | `~/.agents/skills` | Windows: `%APPDATA%\devin\skills`; non-Windows: `~/.devin/skills` |
+| Scope | `--agent claude-code` | `--agent agents` | `--agent devin` | `--agent grok` |
+|---|---|---|---|---|
+| `project` | `.claude/skills` | `.agents/skills` | `.devin/skills` | `.grok/skills` |
+| `global` | `~/.claude/skills` | `~/.agents/skills` | Windows: `%APPDATA%\devin\skills`; non-Windows: `~/.devin/skills` | `$GROK_HOME/skills` (default `~/.grok/skills`) |
 
 Each managed skill is written as `<root>/<skill-name>/SKILL.md`.
 

@@ -72,7 +72,8 @@ pub enum Command {
     HookDrain(HookDrainArgs),
     /// Print MCP server registration snippets for any supported client
     /// (Claude Code, Codex, OpenCode, Cursor, Claude Desktop, Gemini
-    /// CLI, OpenClaw, OMP, Pi). See docs/mcp-install.md for the full guide.
+    /// CLI, OpenClaw, OMP, Pi, Grok, Zero, Devin, Antigravity CLI, VS Code
+    /// Copilot). See docs/mcp-install.md for the full guide.
     InstallMcp(InstallMcpArgs),
     /// Stage + commit the wiki tree under git.
     Commit(CommitArgs),
@@ -535,6 +536,8 @@ pub enum InstallSkillsAgent {
     Agents,
     /// Devin's `.devin/skills` directory.
     Devin,
+    /// Grok Build CLI's `.grok/skills` directory.
+    Grok,
     /// Install into both Claude Code and `.agents` skill directories.
     Both,
 }
@@ -829,7 +832,7 @@ pub struct ReindexArgs {}
 
 /// Agent CLI to install hooks/extensions for. For MCP-only clients
 /// (Claude Desktop), use `install-mcp --client <name>` instead.
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum AgentChoice {
     /// Anthropic Claude Code.
     ClaudeCode,
@@ -985,6 +988,12 @@ pub enum McpClient {
     Zero,
     /// Devin CLI — `~/.devin/config.json`.
     Devin,
+    /// xAI Grok Build CLI — `~/.grok/config.toml` under
+    /// `[mcp_servers.<name>]` with native HTTP `url` + `headers`.
+    /// Pair with `install-hooks --agent grok` for lifecycle capture.
+    /// Grok ignores SessionStart stdout, so handoffs are recovered via
+    /// MCP `memory_handoff_accept` rather than hook injection.
+    Grok,
     /// VS Code GitHub Copilot (agent mode) — per-workspace
     /// `.vscode/mcp.json`. Copilot's agent mode reads MCP servers
     /// from VS Code's own MCP framework (top-level `servers` key),
@@ -1805,6 +1814,23 @@ mod tests {
             panic!("expected install-hooks command for grok");
         };
         assert!(matches!(hook_args.agent, AgentChoice::Grok));
+    }
+
+    #[test]
+    fn grok_mcp_client_parses() {
+        let mcp_cli = Cli::try_parse_from([
+            "ai-memory",
+            "install-mcp",
+            "--client",
+            "grok",
+            "--server-url",
+            "http://example.test:49374",
+        ])
+        .unwrap_or_else(|e| panic!("failed to parse install-mcp --client grok: {e}"));
+        let Command::InstallMcp(mcp_args) = mcp_cli.command else {
+            panic!("expected install-mcp command for grok");
+        };
+        assert!(matches!(mcp_args.client, McpClient::Grok));
     }
 
     #[test]

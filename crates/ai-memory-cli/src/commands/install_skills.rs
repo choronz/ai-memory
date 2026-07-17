@@ -4,13 +4,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ai_memory_core::routing_skills::{
-    AGENTS_SKILL_DIR, CLAUDE_SKILL_DIR, DEVIN_SKILL_DIR, MANAGED_MARKER, MANAGED_SKILLS,
-    ManagedSkill, SKILLS_DIR,
+    AGENTS_SKILL_DIR, CLAUDE_SKILL_DIR, DEVIN_SKILL_DIR, GROK_SKILL_DIR, MANAGED_MARKER,
+    MANAGED_SKILLS, ManagedSkill, SKILLS_DIR,
 };
 use anyhow::{Context, Result, bail};
 
 use crate::cli::{InstallSkillsAgent, InstallSkillsArgs, InstallSkillsScope};
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic};
+use crate::commands::install_mcp;
 use crate::commands::path_util::home_dir;
 use crate::config::Config;
 
@@ -83,11 +84,16 @@ fn resolve_target_roots_from_env(args: &InstallSkillsArgs) -> Result<Vec<TargetR
     let cwd = std::env::current_dir().context("getting CWD for install-skills target")?;
     let home = home_dir();
     let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
+    let grok_home = (args.scope == InstallSkillsScope::Global
+        && args.agent == InstallSkillsAgent::Grok)
+        .then(install_mcp::grok_home)
+        .transpose()?;
     resolve_target_roots_for_platform(
         args,
         &cwd,
         home.as_deref(),
         appdata.as_deref(),
+        grok_home.as_deref(),
         SkillHostPlatform::current(),
     )
 }
@@ -98,7 +104,7 @@ fn resolve_target_roots(
     cwd: &Path,
     home: Option<&Path>,
 ) -> Result<Vec<TargetRoot>> {
-    resolve_target_roots_for_platform(args, cwd, home, None, SkillHostPlatform::Other)
+    resolve_target_roots_for_platform(args, cwd, home, None, None, SkillHostPlatform::Other)
 }
 
 fn resolve_target_roots_for_platform(
@@ -106,6 +112,7 @@ fn resolve_target_roots_for_platform(
     cwd: &Path,
     home: Option<&Path>,
     appdata: Option<&Path>,
+    grok_home: Option<&Path>,
     platform: SkillHostPlatform,
 ) -> Result<Vec<TargetRoot>> {
     if let Some(target_dir) = &args.target_dir {
@@ -120,6 +127,7 @@ fn resolve_target_roots_for_platform(
                 cwd,
                 home,
                 appdata,
+                grok_home,
                 platform,
             )?]
         }
@@ -130,6 +138,7 @@ fn resolve_target_roots_for_platform(
                 cwd,
                 home,
                 appdata,
+                grok_home,
                 platform,
             )?]
         }
@@ -140,6 +149,18 @@ fn resolve_target_roots_for_platform(
                 cwd,
                 home,
                 appdata,
+                grok_home,
+                platform,
+            )?]
+        }
+        InstallSkillsAgent::Grok => {
+            vec![agent_root(
+                args.scope,
+                SkillRootKind::Grok,
+                cwd,
+                home,
+                appdata,
+                grok_home,
                 platform,
             )?]
         }
@@ -150,6 +171,7 @@ fn resolve_target_roots_for_platform(
                 cwd,
                 home,
                 appdata,
+                grok_home,
                 platform,
             )?,
             agent_root(
@@ -158,6 +180,7 @@ fn resolve_target_roots_for_platform(
                 cwd,
                 home,
                 appdata,
+                grok_home,
                 platform,
             )?,
         ],
@@ -187,6 +210,7 @@ enum SkillRootKind {
     Claude,
     Agents,
     Devin,
+    Grok,
 }
 
 fn agent_root(
@@ -195,6 +219,7 @@ fn agent_root(
     cwd: &Path,
     home: Option<&Path>,
     appdata: Option<&Path>,
+    grok_home: Option<&Path>,
     platform: SkillHostPlatform,
 ) -> Result<PathBuf> {
     if scope == InstallSkillsScope::Global
@@ -204,6 +229,13 @@ fn agent_root(
         let appdata = appdata
             .context("could not locate %APPDATA% for global Devin skill install on Windows")?;
         return Ok(appdata.join("devin").join(SKILLS_DIR));
+    }
+
+    if scope == InstallSkillsScope::Global
+        && kind == SkillRootKind::Grok
+        && let Some(grok_home) = grok_home
+    {
+        return Ok(grok_home.join(SKILLS_DIR));
     }
 
     let base = match scope {
@@ -216,6 +248,7 @@ fn agent_root(
         SkillRootKind::Claude => CLAUDE_SKILL_DIR,
         SkillRootKind::Agents => AGENTS_SKILL_DIR,
         SkillRootKind::Devin => DEVIN_SKILL_DIR,
+        SkillRootKind::Grok => GROK_SKILL_DIR,
     };
     Ok(base.join(agent_dir).join(SKILLS_DIR))
 }
@@ -353,6 +386,14 @@ mod tests {
         .unwrap();
         assert_eq!(root_names(&project_devin), ["/repo/.devin/skills"]);
 
+        let project_grok = resolve_target_roots(
+            &args(InstallSkillsScope::Project, InstallSkillsAgent::Grok),
+            cwd,
+            Some(home),
+        )
+        .unwrap();
+        assert_eq!(root_names(&project_grok), ["/repo/.grok/skills"]);
+
         let project_both = resolve_target_roots(
             &args(InstallSkillsScope::Project, InstallSkillsAgent::Both),
             cwd,
@@ -382,6 +423,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(root_names(&global_devin), ["/home/alice/.devin/skills"]);
+
+        let global_grok = resolve_target_roots(
+            &args(InstallSkillsScope::Global, InstallSkillsAgent::Grok),
+            cwd,
+            Some(home),
+        )
+        .unwrap();
+        assert_eq!(root_names(&global_grok), ["/home/alice/.grok/skills"]);
     }
 
     #[test]
@@ -395,6 +444,7 @@ mod tests {
             cwd,
             Some(home),
             Some(appdata),
+            None,
             SkillHostPlatform::Windows,
         )
         .unwrap();
@@ -415,11 +465,26 @@ mod tests {
             cwd,
             Some(home),
             None,
+            None,
             SkillHostPlatform::Windows,
         )
         .unwrap_err();
 
         assert!(err.to_string().contains("%APPDATA%"));
+    }
+
+    #[test]
+    fn global_grok_skill_root_uses_injected_grok_home_override() {
+        let roots = resolve_target_roots_for_platform(
+            &args(InstallSkillsScope::Global, InstallSkillsAgent::Grok),
+            Path::new("/repo"),
+            Some(Path::new("/home/alice")),
+            None,
+            Some(Path::new("/custom/grok")),
+            SkillHostPlatform::Other,
+        )
+        .unwrap();
+        assert_eq!(root_names(&roots), ["/custom/grok/skills"]);
     }
 
     #[test]
