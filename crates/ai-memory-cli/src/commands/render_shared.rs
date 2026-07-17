@@ -1844,8 +1844,9 @@ mod tests {
         for (event, script) in KIMI_CODE_EVENTS {
             assert!(events.contains(&event), "missing Kimi Code event {event}");
             let (_, cmd) = commands.iter().find(|(e, _)| *e == event).unwrap();
+            let expected = root.join(script);
             assert!(
-                cmd.contains(&format!("/host/hooks/kimi-code/{script}")),
+                cmd.contains(expected.to_string_lossy().as_ref()),
                 "{event}: command must point at the staged script: {cmd}"
             );
         }
