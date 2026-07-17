@@ -51,6 +51,28 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{StoreError, StoreResult};
 
+/// Summary returned by [`purge_session`] and exposed via
+/// [`crate::writer::WriterHandle::purge_session`].
+#[derive(Debug, Default, Clone)]
+pub struct PurgeSessionSummary {
+    /// The purged session id (rendered as a UUID string).
+    pub session_id: String,
+    /// Human-readable `workspace/project` label of the session's scope.
+    pub label: String,
+    /// Number of `observations` rows deleted (cascade from the session).
+    pub observations_deleted: u64,
+    /// Number of `handoffs` rows deleted (those authored by the session).
+    pub handoffs_deleted: u64,
+    /// Number of `pages` rows deleted — the session's summary page
+    /// (`sessions/<id>.md`), all versions.
+    pub pages_deleted: u64,
+    /// Number of `page_embeddings` rows deleted (cascades through the page).
+    pub embeddings_deleted: u64,
+    /// Whether the session's summary page existed and was targeted for
+    /// on-disk removal. The admin handler uses this to clean up the file.
+    pub had_summary_page: bool,
+}
+
 /// One embedding upsert requested by a backfill or embed command.
 #[derive(Debug)]
 pub struct EmbeddingWrite {
@@ -1474,6 +1496,132 @@ pub fn purge_project(
         observations_deleted,
         handoffs_deleted,
         embeddings_deleted,
+    })
+}
+
+/// Delete a single session and everything it owns, in one transaction.
+///
+/// Keyed by session id (which also pins the scope: a session belongs to
+/// exactly one `(workspace_id, project_id)`). The cleanup mirrors
+/// [`purge_project`] but is scoped to one session:
+///
+/// * `observations` cascade from `sessions(id)` — a single
+///   `DELETE FROM sessions` removes them.
+/// * `handoffs` are keyed by `from_session_id` with `ON DELETE SET NULL`,
+///   so we explicitly delete the handoffs the session authored.
+/// * `summary_page_id` is `ON DELETE SET NULL`, so the summary page row and
+///   its on-disk file are NOT removed by the cascade — we read the page id
+///   first, delete the `pages` row here (cascading its embeddings), and
+///   return `had_summary_page` so the caller can remove the file.
+///
+/// The workspace and project rows are intentionally left intact.
+///
+/// # Errors
+/// [`StoreError::NotFound`] when the session id does not exist; the standard
+/// transaction/IO errors otherwise.
+pub fn purge_session(
+    conn: &mut Connection,
+    session_id: &SessionId,
+    workspace_project_label: &str,
+    author_id: Option<ai_memory_core::UserId>,
+) -> StoreResult<PurgeSessionSummary> {
+    let tx = conn.transaction()?;
+
+    // Resolve the session (and its summary page) up front so we can 404 on a
+    // missing id and know whether a summary page file must be removed.
+    let scope = tx
+        .query_row(
+            "SELECT workspace_id, project_id, summary_page_id \
+             FROM sessions WHERE id = ?1",
+            params![session_id.as_bytes()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let (ws_bytes, proj_bytes, summary_page_id) = match scope {
+        Some(s) => s,
+        None => return Err(StoreError::NotFound(format!("session {session_id}"))),
+    };
+    let ws_id = ai_memory_core::WorkspaceId::from_slice(&ws_bytes)?;
+    let proj_id = ai_memory_core::ProjectId::from_slice(&proj_bytes)?;
+
+    let count = |sql: &str, id: &[u8]| -> StoreResult<u64> {
+        let n: Option<i64> = tx
+            .query_row(sql, rusqlite::params![id], |row| row.get(0))
+            .optional()?;
+        Ok(u64::try_from(n.unwrap_or(0)).unwrap_or(0))
+    };
+
+    // Capture counts before deleting.
+    let observations_deleted = count(
+        "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+        session_id.as_bytes(),
+    )?;
+    let handoffs_deleted = count(
+        "SELECT COUNT(*) FROM handoffs WHERE from_session_id = ?1",
+        session_id.as_bytes(),
+    )?;
+
+    // Summary page counts (the page rows + their embeddings).
+    let pages_deleted = if let Some(ref pid) = summary_page_id {
+        count("SELECT COUNT(*) FROM pages WHERE id = ?1", &pid[..])?
+    } else {
+        0
+    };
+    let embeddings_deleted = if let Some(ref pid) = summary_page_id {
+        count(
+            "SELECT COUNT(*) FROM page_embeddings WHERE page_id = ?1",
+            &pid[..],
+        )?
+    } else {
+        0
+    };
+    let had_summary_page = summary_page_id.is_some();
+
+    // Delete handoffs authored by this session first (FK allows NULL, but the
+    // caller asked for a full purge so we drop them).
+    tx.execute(
+        "DELETE FROM handoffs WHERE from_session_id = ?1",
+        params![session_id.as_bytes()],
+    )?;
+
+    // Delete the summary page rows (all versions share the page id). Embeds
+    // cascade. We key by `id` (not path) so a renamed page still resolves.
+    if let Some(ref pid) = summary_page_id {
+        tx.execute("DELETE FROM pages WHERE id = ?1", params![&pid[..]])?;
+    }
+
+    // Cascade removes the session's observations. This is the row that
+    // everything else hangs off of.
+    tx.execute(
+        "DELETE FROM sessions WHERE id = ?1",
+        params![session_id.as_bytes()],
+    )?;
+
+    audit(
+        &tx,
+        "purge_session",
+        Some(ws_id.as_bytes()),
+        Some(proj_id.as_bytes()),
+        None,
+        author_id.as_ref().map(ai_memory_core::UserId::as_bytes),
+        Timestamp::now().as_microsecond(),
+    )?;
+
+    tx.commit()?;
+    Ok(PurgeSessionSummary {
+        session_id: session_id.to_string(),
+        label: workspace_project_label.to_string(),
+        observations_deleted,
+        handoffs_deleted,
+        pages_deleted,
+        embeddings_deleted,
+        had_summary_page,
     })
 }
 
@@ -3975,6 +4123,163 @@ mod tests {
             Some(&author.as_bytes()[..]),
             "audit row must carry the purging operator"
         );
+    }
+
+    /// End-to-end store-level smoke test for `purge_session`: a session with
+    /// observations, a linked summary page, and a session-authored handoff is
+    /// wiped — rows and the summary page are gone, the project survives, and
+    /// the operation is audited.
+    #[test]
+    fn purge_session_deletes_observations_summary_page_and_handoffs() {
+        use ai_memory_core::{
+            AgentKind, HandoffId, NewHandoff, NewObservation, ObservationKind, SessionId,
+        };
+
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+
+        let sid = SessionId::new();
+        begin_session(
+            &mut conn,
+            &ai_memory_core::NewSession {
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+            },
+        )
+        .unwrap();
+
+        for i in 0..4u8 {
+            insert_observation(
+                &mut conn,
+                &NewObservation {
+                    session_id: sid,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: format!("obs {i}"),
+                    body: "body".into(),
+                    importance: 5,
+                },
+            )
+            .unwrap();
+        }
+
+        // Summary page + link it to the session.
+        let page_id = upsert_page(
+            &mut conn,
+            &page(
+                ws,
+                proj,
+                "sessions/d24d39c2-f012-500a-b64d-1e3776c5c211.md",
+                "summary",
+            ),
+        )
+        .unwrap();
+        end_session(&mut conn, &sid, Some(&page_id)).unwrap();
+
+        // A handoff authored by this session.
+        let _: HandoffId = insert_handoff(
+            &mut conn,
+            &NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: Some(sid),
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "handoff".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+            },
+        )
+        .unwrap();
+
+        // Sanity: data present before purge.
+        let obs_before: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+                [sid.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(obs_before, 4);
+
+        let report = purge_session(&mut conn, &sid, "default/scratch", None)
+            .expect("purge_session must succeed");
+        assert_eq!(report.observations_deleted, 4);
+        assert_eq!(report.handoffs_deleted, 1);
+        assert_eq!(report.pages_deleted, 1);
+
+        // Rows gone.
+        let obs_after: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+                [sid.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(obs_after, 0, "observations deleted");
+
+        let session_exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM sessions WHERE id = ?1",
+                [sid.as_bytes()],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .unwrap()
+            .is_some();
+        assert!(!session_exists, "session row deleted");
+
+        let handoffs: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM handoffs WHERE from_session_id = ?1",
+                [sid.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(handoffs, 0, "session-authored handoff deleted");
+
+        let pages: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pages WHERE id = ?1",
+                [page_id.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pages, 0, "summary page deleted");
+
+        // Project survives (only the session was purged).
+        let proj_exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM projects WHERE id = ?1",
+                [proj.as_bytes()],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .unwrap()
+            .is_some();
+        assert!(proj_exists, "project survives the session purge");
+
+        // Audited.
+        let (count, _) = audit_row_for(&conn, "purge_session");
+        assert_eq!(count, 1, "exactly one purge_session audit row");
+    }
+
+    /// A `purge_session` whose session is already gone must return `NotFound`
+    /// rather than silently succeeding — mirrors `purge_project`'s honesty.
+    #[test]
+    fn purge_session_missing_session_returns_not_found() {
+        let (_tmp, mut conn, _ws, _proj) = fresh_db();
+        let sid = SessionId::new();
+        let err = purge_session(&mut conn, &sid, "default/scratch", None)
+            .expect_err("missing session must error");
+        assert!(matches!(err, StoreError::NotFound(_)));
     }
 
     /// A `rename_project` writes an attributed audit row, committed

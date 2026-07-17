@@ -39,6 +39,7 @@ use std::future::Future;
 use std::io::Seek;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::str::FromStr;
 
 use ai_memory_consolidate::{
     AutoImproveReviewConfig, AutoImproveTelemetryParams, AutoImproveTelemetryReport, Bootstrap,
@@ -542,6 +543,7 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/admin/checkpoints", get(handle_checkpoints))
         .route("/admin/restore-page", post(handle_restore_page))
         .route("/admin/purge-project", post(handle_purge_project))
+        .route("/admin/purge-session", post(handle_purge_session))
         .route("/admin/rename-project", post(handle_rename_project))
         .route("/admin/move-project", post(handle_move_project))
         .route("/admin/delete-workspace", post(handle_delete_workspace))
@@ -3019,8 +3021,191 @@ async fn handle_purge_project(
 }
 
 // ---------------------------------------------------------------------
-// rename-project
+// purge-session
 // ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/purge-session`.
+#[derive(Deserialize)]
+struct PurgeSessionRequest {
+    /// Session UUID to delete. The session pins its own `(workspace, project)`
+    /// scope, so no workspace/project args are needed.
+    id: String,
+}
+
+/// Wire-format summary returned by `POST /admin/purge-session`.
+#[derive(Debug, Serialize)]
+pub struct PurgeSessionReport {
+    /// The purged session id (UUID string).
+    pub session_id: String,
+    /// Human-readable `workspace/project` label of the session's scope.
+    pub label: String,
+    /// Number of `observations` rows deleted.
+    pub observations_deleted: u64,
+    /// Number of `handoffs` rows deleted (authored by the session).
+    pub handoffs_deleted: u64,
+    /// Number of `pages` rows deleted (the session's summary page).
+    pub pages_deleted: u64,
+    /// Number of `page_embeddings` rows deleted.
+    pub embeddings_deleted: u64,
+    /// Whether the session's summary page file was removed from disk.
+    pub file_deleted: bool,
+    /// Summary page file path that could not be removed (non-fatal).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_failed: Option<String>,
+    /// Pre-purge checkpoint, if the tree had uncommitted changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_checkpoint: Option<String>,
+    /// Post-purge checkpoint, if the purge changed the tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+}
+
+async fn handle_purge_session(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
+    Json(req): Json<PurgeSessionRequest>,
+) -> impl IntoResponse {
+    let author_id = author_ext.map(|axum::Extension(u)| u);
+
+    // Parse the session id up front; a malformed id is a 400.
+    let session_id = match ai_memory_core::SessionId::from_str(&req.id) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid session id: {e}") })),
+            );
+        }
+    };
+
+    // Resolve the session's scope without auto-creating anything. A missing
+    // session 404s (fail closed).
+    let (ws_id, proj_id, _) = match state.reader.find_session_scope(session_id).await {
+        Ok(Some(scope)) => scope,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": format!("session {session_id} not found") })),
+            );
+        }
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    // Fetch names for the label + admission context.
+    let ws_name = state
+        .reader
+        .workspace_name_by_id(ws_id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "<unknown>".to_string());
+    let proj_name = state
+        .reader
+        .project_name_by_id(ws_id, proj_id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "<unknown>".to_string());
+    let label = format!("{ws_name}/{proj_name}");
+
+    // Admission must run before any destructive work (mirrors purge-project).
+    let actor = actor_ext
+        .map(|axum::Extension(a)| a)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    let purge_ctx = AdmissionContext {
+        workspace: ws_name.clone(),
+        project: proj_name.clone(),
+        op: AdmissionOp::PurgeProject,
+        actor,
+        ..Default::default()
+    };
+    let resolved_purge_ctx = match state
+        .wiki
+        .admit_purge_project(ws_id, proj_id, Some(purge_ctx))
+        .await
+    {
+        Ok(ctx) => ctx,
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    let pre_checkpoint =
+        match checkpoint_or_500(&state.wiki, format!("pre-purge-session {session_id}")) {
+            Ok(oid) => oid,
+            Err(e) => return e,
+        };
+
+    let summary = match state
+        .writer
+        .purge_session(session_id, &label, author_id)
+        .await
+    {
+        Ok(s) => s,
+        // NotFound means a concurrent delete raced us — treat as 404.
+        Err(ai_memory_store::StoreError::NotFound(_)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": format!("session {session_id} not found") })),
+            );
+        }
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    // Remove the session's summary page file from disk. The DB rows are gone;
+    // the file lives at <wiki>/<ws>/<proj>/sessions/<session_id>.md. We route
+    // through Wiki::delete_page so admission + quarantine semantics match a
+    // normal page delete. Skip when the session had no summary page.
+    let summary_path = ai_memory_core::PagePath::new(format!("sessions/{session_id}.md"))
+        .expect("sessions/<uuid>.md is a valid page path");
+    let mut file_deleted = false;
+    let mut file_failed: Option<String> = None;
+    if summary.had_summary_page {
+        match state
+            .wiki
+            .delete_page(
+                ws_id,
+                proj_id,
+                &summary_path,
+                resolved_purge_ctx.clone(),
+                author_id,
+            )
+            .await
+        {
+            Ok(()) => file_deleted = true,
+            Err(e) => {
+                warn!(
+                    path = %summary_path.as_str(),
+                    error = %e,
+                    "purge-session: failed to remove summary page file"
+                );
+                file_failed = Some(summary_path.as_str().to_string());
+            }
+        }
+    }
+
+    state.active_project.clear_project(proj_id);
+    invalidate_scope_cache(&state, ScopeInvalidation::Project(proj_id)).await;
+
+    let checkpoint = checkpoint_or_warn(&state.wiki, format!("purge-session {session_id}"));
+
+    let report = PurgeSessionReport {
+        session_id: summary.session_id,
+        label: summary.label,
+        observations_deleted: summary.observations_deleted,
+        handoffs_deleted: summary.handoffs_deleted,
+        pages_deleted: summary.pages_deleted,
+        embeddings_deleted: summary.embeddings_deleted,
+        file_deleted,
+        file_failed,
+        pre_checkpoint,
+        checkpoint,
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+    )
+}
 
 /// JSON request body for `POST /admin/rename-workspace`.
 #[derive(Deserialize)]

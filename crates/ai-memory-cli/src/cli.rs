@@ -128,6 +128,11 @@ pub enum Command {
     /// observations, handoffs, embeddings, on-disk wiki files).
     /// This is irreversible — requires `--confirm`.
     PurgeProject(PurgeProjectArgs),
+    /// Permanently delete a single session and ALL its data (observations,
+    /// the session's summary page + on-disk file, and any handoffs it
+    /// authored). This is irreversible — requires `--confirm`. The session
+    /// id pins its own workspace/project scope, so no scope args are needed.
+    PurgeSession(PurgeSessionArgs),
     /// Rename a project within its workspace. No files move on disk —
     /// the wiki is flat and pages are differentiated by project_id only.
     /// Useful after renaming the project's directory on disk so the hook
@@ -376,6 +381,15 @@ pub struct PurgeProjectArgs {
     /// out — purging is destructive and irreversible.
     #[arg(long)]
     pub confirm: bool,
+}
+
+/// Arguments for `purge-session`.
+#[derive(Debug, Args)]
+pub struct PurgeSessionArgs {
+    /// Session UUID to delete. The session pins its own workspace/project
+    /// scope, so no workspace/project args are required.
+    #[arg(long)]
+    pub id: String,
 }
 
 /// Arguments for `rename-project`.

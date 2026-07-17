@@ -685,11 +685,7 @@ mod tests {
     async fn existing_scope_lookup_is_case_insensitive() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
-        let ws = store
-            .writer
-            .get_or_create_workspace("Team")
-            .await
-            .unwrap();
+        let ws = store.writer.get_or_create_workspace("Team").await.unwrap();
         let project = store
             .writer
             .get_or_create_project(ws, "Scratch", None)
@@ -723,8 +719,10 @@ mod tests {
         );
 
         // A genuinely absent name still 404s.
-        assert!(lookup_existing_scope(&store.reader, "team", "nope")
-            .await
-            .is_err());
+        assert!(
+            lookup_existing_scope(&store.reader, "team", "nope")
+                .await
+                .is_err()
+        );
     }
 }
