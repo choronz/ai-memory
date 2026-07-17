@@ -40,6 +40,8 @@ pub mod purge_session;
 pub mod read_page;
 pub mod reindex;
 pub mod rename_project;
+pub mod rename_workspace;
+pub mod delete_workspace;
 pub mod render_shared;
 pub mod reorg;
 pub mod reset;
