@@ -3776,7 +3776,7 @@ impl ReaderPool {
         self.with_conn(move |conn| {
             let row_opt = conn
                 .query_row(
-                    "SELECT id FROM workspaces WHERE name = ?1",
+                    "SELECT id FROM workspaces WHERE name = ?1 COLLATE NOCASE",
                     params![name],
                     |row| {
                         let bytes: Vec<u8> = row.get(0)?;
@@ -3805,7 +3805,7 @@ impl ReaderPool {
         self.with_conn(move |conn| {
             let row_opt = conn
                 .query_row(
-                    "SELECT id FROM projects WHERE workspace_id = ?1 AND name = ?2",
+                    "SELECT id FROM projects WHERE workspace_id = ?1 AND name = ?2 COLLATE NOCASE",
                     params![workspace_id.as_bytes(), name],
                     |row| {
                         let bytes: Vec<u8> = row.get(0)?;

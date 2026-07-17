@@ -680,4 +680,51 @@ mod tests {
         let again = create_global_scope(&store.writer).await.unwrap();
         assert_eq!(again, created);
     }
+
+    #[tokio::test]
+    async fn existing_scope_lookup_is_case_insensitive() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("Team")
+            .await
+            .unwrap();
+        let project = store
+            .writer
+            .get_or_create_project(ws, "Scratch", None)
+            .await
+            .unwrap();
+
+        // Workspace and project lookups must match regardless of case so
+        // destructive admin calls like `purge-project` resolve a typo'd
+        // casing instead of 404-ing.
+        let resolved = lookup_existing_scope(&store.reader, "team", "scratch")
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved.as_tuple(),
+            (ws, project),
+            "existing scope lookup must be case-insensitive"
+        );
+        assert_eq!(
+            lookup_existing_workspace(&store.reader, "TEAM")
+                .await
+                .unwrap(),
+            ws
+        );
+        assert_eq!(
+            store
+                .reader
+                .find_project(ws, "SCRATCH".into())
+                .await
+                .unwrap(),
+            Some(project)
+        );
+
+        // A genuinely absent name still 404s.
+        assert!(lookup_existing_scope(&store.reader, "team", "nope")
+            .await
+            .is_err());
+    }
 }

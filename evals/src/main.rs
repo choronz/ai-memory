@@ -372,6 +372,8 @@ impl From<ResolvedConfig> for ProviderConfig {
             // mode is an operator opt-in not modeled by these comparisons.
             compat_strict: false,
             api_keys: Vec::new(),
+            // Concurrency is not modeled by the eval comparisons; default to 2.
+            max_concurrency: Some(2),
         }
     }
 }

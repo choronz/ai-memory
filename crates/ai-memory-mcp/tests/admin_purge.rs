@@ -391,6 +391,44 @@ async fn purge_project_rejecting_admission_leaves_source_intact() {
     );
 }
 
+/// `purge-project` must resolve the project name case-insensitively so a
+/// differently-cased `--project` argument still purges the right project.
+#[tokio::test]
+async fn purge_project_resolves_name_case_insensitively() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+
+    let (ws, _keep, doomed) = seed_two_projects(&store, &state.wiki).await;
+    let doomed_dir = state.wiki.project_root(ws, doomed);
+
+    // Request with ALL-CAPS casing of both workspace and project names.
+    let resp = post(
+        state,
+        "/admin/purge-project",
+        json!({ "workspace": "DEFAULT", "project": "DOOMED", "confirm": true }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "case-insensitive scope lookup must resolve the project"
+    );
+
+    assert!(
+        !doomed_dir.exists(),
+        "case-mismatched purge must still remove the project directory"
+    );
+    assert!(
+        store
+            .reader
+            .find_project(ws, "DOOMED".to_string())
+            .await
+            .unwrap()
+            .is_none(),
+        "case-mismatched purge must delete the project row"
+    );
+}
+
 /// After purging `doomed`, `keep` must still have all its data and files intact.
 #[tokio::test]
 async fn purge_project_preserves_sibling_project() {
