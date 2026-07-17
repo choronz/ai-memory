@@ -436,14 +436,17 @@ impl OpenAiProvider {
                 status.as_u16() == 429 || (status.as_u16() >= 500 && status.as_u16() < 600);
             if is_retryable && attempt < max_attempts.saturating_sub(1) {
                 attempt += 1;
-                // A 429 means the key hit its per-key rate limit; park it
-                // for KEY_BLACKLIST_DURATION so we don't immediately retry
-                // it on the next rotation. 5xx is transient, so we leave
-                // the key eligible and just move on.
                 if status.as_u16() == 429 {
+                    // A 429 means *this key* hit its per-key rate limit; park
+                    // it for KEY_BLACKLIST_DURATION and rotate to the next key.
                     self.blacklist_key(key_idx);
+                    key_idx = self.next_usable_key(key_idx.wrapping_add(1) % len, start);
+                } else {
+                    // 5xx (and other transient server errors) are not the key's
+                    // fault — reuse the same key on retry instead of burning
+                    // through the rotation pool on a server-side outage.
+                    key_idx = self.next_usable_key(key_idx, start);
                 }
-                key_idx = self.next_usable_key(key_idx.wrapping_add(1) % len, start);
                 let delay = Self::retry_after_from_response(&resp)
                     .unwrap_or_else(|| Self::retry_delay(attempt, start));
                 debug!(
@@ -451,7 +454,7 @@ impl OpenAiProvider {
                     key_index = key_idx,
                     ?delay,
                     status = status.as_u16(),
-                    "openai key failed, rotating to next key"
+                    "openai key failed, retrying"
                 );
                 tokio::time::sleep(delay).await;
                 continue;
@@ -477,7 +480,9 @@ impl OpenAiProvider {
                 Ok(ok) => return Ok(ok),
                 Err(err) if err.is_retryable() && attempt < max_attempts.saturating_sub(1) => {
                     attempt += 1;
-                    key_idx = self.next_usable_key(key_idx.wrapping_add(1) % len, start);
+                    // Server-side transient (gateway error page / truncated
+                    // JSON): reuse the same key rather than rotating.
+                    key_idx = self.next_usable_key(key_idx, start);
                     let delay = Self::retry_delay(attempt, start);
                     warn!(
                         attempt,
@@ -1407,6 +1412,47 @@ mod tests {
 
         assert_eq!(response.text, "hello");
         assert_eq!(count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["Bearer k0".to_string(), "Bearer k0".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_reuses_same_key_on_5xx_with_multiple_keys() {
+        // A 5xx is a transient server-side error, not a problem with the key,
+        // so the provider must retry with the SAME key rather than rotating
+        // through the pool and burning other keys on an outage.
+        let server = MockServer::start().await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let count = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(RecordingResponder {
+                seen_keys: seen.clone(),
+                request_count: count.clone(),
+                fail_status: 503,
+                fail_for: 1,
+                success_body: chat_success_body(),
+            })
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new_with_keys(
+            vec![SecretString::from("k0"), SecretString::from("k1")],
+            "gpt-4o-mini",
+        )
+        .expect("provider builds")
+        .with_base_url(server.uri());
+
+        let response = provider
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .expect("succeeds after retrying on the same key");
+
+        assert_eq!(response.text, "hello");
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        // k0 is retried on the 5xx; k1 must NOT be touched.
         assert_eq!(
             *seen.lock().unwrap(),
             vec!["Bearer k0".to_string(), "Bearer k0".to_string()]
