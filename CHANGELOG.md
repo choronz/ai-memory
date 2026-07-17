@@ -10,18 +10,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Grok Build CLI is now a first-class MCP client as well as a hook agent:
   `install-mcp --client grok` renders and `--apply` merges a native HTTP
-  entry into `~/.grok/config.toml` (`[mcp_servers.ai-memory]` with
+  entry into `$GROK_HOME/config.toml` (default `~/.grok/config.toml`)
+  (`[mcp_servers.ai-memory]` with
   `url` / `enabled` / `[mcp_servers.ai-memory.headers]` — not Codex's
   `http_headers` key). `install-hooks --agent grok` reuses that entry to
   infer server URL and bearer token; `uninstall` strips the MCP table;
   `setup-agent --agent grok` prints the companion `install-mcp` tip.
-  Managed routing skills can target `.grok/skills` / `~/.grok/skills` via
+  Managed routing skills can target `.grok/skills` / `$GROK_HOME/skills`
+  (default `~/.grok/skills`) via
   `install-skills --agent grok` and `memory_install_self_routing`
   `target_hints`. Lifecycle capture was already present; handoff injection
   remains unavailable because Grok ignores SessionStart stdout — recover
   via MCP `memory_handoff_accept`.
 
 ### Changed
+- `install-hooks --agent devin` now infers the server URL and bearer token from
+  `~/.devin/config.json` when flags and environment settings are absent, keeping
+  hooks aligned with an existing Devin MCP registration.
+- Grok routing guidance now treats Grok Build CLI as an AGENTS-based client and
+  directs its managed skills to `.grok/skills` or `$GROK_HOME/skills` (default
+  `~/.grok/skills`). The MCP self-routing payload and installed prompt surface
+  now guard those targets;
+  Grok (like Zero) still resumes handoffs through `memory_handoff_accept`
+  because it ignores SessionStart stdout.
 - One-shot client commands (`rename-project`, `status`, `write-page`, …) no
   longer print the "cannot write log files … falling back" warning when the
   log directory is unwritable — they still degrade to temp/stderr logging

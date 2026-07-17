@@ -780,7 +780,7 @@ pub struct ReindexArgs {}
 
 /// Agent CLI to install hooks/extensions for. For MCP-only clients
 /// (Claude Desktop), use `install-mcp --client <name>` instead.
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum AgentChoice {
     /// Anthropic Claude Code.
     ClaudeCode,

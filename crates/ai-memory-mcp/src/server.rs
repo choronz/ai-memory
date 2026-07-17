@@ -2415,7 +2415,7 @@ impl AiMemoryServer {
         `markered_block` for the slim CLAUDE.md / AGENTS.md snippet, \
         `agent_filenames` for rules-file targets, `managed_skills` for \
         Agent Skill files, and `target_hints` for project/global \
-        `.claude/skills`, `.agents/skills`, `.devin/skills`, `.grok/skills`, and Devin Windows global roots. Use when the user \
+        `.claude/skills`, `.agents/skills`, `.devin/skills`, `.grok/skills`, `$GROK_HOME/skills` (default `~/.grok/skills`), and Devin Windows global roots. Use when the user \
         asks to install or refresh ai-memory routing in this project. \
         After calling, use your Write/Edit tool to preserve non-ai-memory \
         user content: replace only an existing `<!-- ai-memory:start -->` \
@@ -2471,7 +2471,7 @@ impl AiMemoryServer {
                         "windows": "%APPDATA%\\devin\\skills",
                         "non_windows": "~/.devin/skills"
                     },
-                    "grok": "~/.grok/skills"
+                    "grok": "$GROK_HOME/skills (default: ~/.grok/skills)"
                 }
             },
             "overwrite_guidance": {
@@ -2484,7 +2484,7 @@ impl AiMemoryServer {
                 "If the target file already contains <!-- ai-memory:start --> / <!-- ai-memory:end --> delimiters alone on their own lines, replace ONLY that line-delimited block in place; ignore inline mentions and preserve every other line.",
                 "If the file doesn't exist, create it with just the markered_block (plus a trailing newline).",
                 "If the file exists but has no ai-memory markers, append the markered_block with one blank line of separation from existing content.",
-                "Install each managed_skills item under the selected skill root from target_hints using its relative_path, for example .claude/skills/<relative_path>, .agents/skills/<relative_path>, .devin/skills/<relative_path>, .grok/skills/<relative_path>, or %APPDATA%\\devin\\skills\\<relative_path> on Windows global Devin installs.",
+                "Install each managed_skills item under the selected skill root from target_hints using its relative_path, for example .claude/skills/<relative_path>, .agents/skills/<relative_path>, .devin/skills/<relative_path>, .grok/skills/<relative_path>, $GROK_HOME/skills/<relative_path> (default ~/.grok/skills), or %APPDATA%\\devin\\skills\\<relative_path> on Windows global Devin installs.",
                 "Existing skill files containing the managed marker <!-- ai-memory-managed: routing-skill --> may be replaced; unmanaged same-name skills must not be overwritten unless the human explicitly forces replacement."
             ]
         });
@@ -3113,6 +3113,15 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn installed_prompt_surface_routes_grok_to_agents_md() {
+        let installed = installed_ai_memory_prompt_surface();
+        assert!(
+            installed.contains("Grok Build CLI") && installed.contains("Grok -> `AGENTS.md`"),
+            "installed snippet and managed skills must route Grok to AGENTS.md"
+        );
+    }
     #[test]
     fn prompts_separate_briefing_from_handoff_lifecycle() {
         assert_detailed_prompt_surfaces(|label, prompt| {
@@ -3326,6 +3335,20 @@ mod tests {
                 expected.name
             );
         }
+        let routing_install_skill = managed_skills
+            .iter()
+            .find(|skill| skill["name"].as_str() == Some("ai-memory-routing-install"))
+            .expect("routing-install skill must be included in the install payload");
+        let routing_install_content = routing_install_skill["content"]
+            .as_str()
+            .expect("routing-install skill content must be text");
+        assert!(
+            routing_install_content.contains("target_hints")
+                && routing_install_content.contains(".grok/skills")
+                && routing_install_content.contains("$GROK_HOME/skills")
+                && routing_install_content.contains("~/.grok/skills"),
+            "routing-install skill must treat target_hints as authoritative and include Grok roots"
+        );
 
         assert_eq!(
             response["target_hints"]["project"]["claude_code"]
@@ -3377,7 +3400,7 @@ mod tests {
         );
         assert_eq!(
             response["target_hints"]["global"]["grok"].as_str().unwrap(),
-            "~/.grok/skills"
+            "$GROK_HOME/skills (default: ~/.grok/skills)"
         );
         assert_eq!(
             response["agent_filenames"]["grok"].as_str().unwrap(),
@@ -3418,7 +3441,8 @@ mod tests {
             desc.contains(".claude/skills")
                 && desc.contains(".agents/skills")
                 && desc.contains(".devin/skills")
-                && desc.contains(".grok/skills"),
+                && desc.contains(".grok/skills")
+                && desc.contains("$GROK_HOME/skills"),
             "tool description must name Claude, .agents, Devin, and Grok skill targets; got: {desc}"
         );
         assert!(

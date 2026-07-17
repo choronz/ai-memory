@@ -27,6 +27,9 @@ files for OpenClaw / OpenCode / OMP) and are covered in the
 Git Bash `.sh` hooks rather than the PowerShell default used by other
 script-hook agents. Grok and Zero capture lifecycle events, but both ignore
 SessionStart stdout, so ai-memory does not auto-inject handoffs for them.
+SessionStart handoff injection works only for clients that consume startup-hook
+stdout (or their equivalent context-injection result); Grok and Zero must call
+`memory_handoff_accept` when resuming.
 
 Claude Desktop and VS Code Copilot are **MCP-only** here: they expose
 long-term memory to their LLMs via ai-memory's MCP tools
@@ -37,7 +40,7 @@ endpoint. The trade-off:
 | | What you get | What you don't get |
 |---|---|---|
 | **MCP only** | LLM can query the wiki, accept handoffs, run memory_consolidate, and run `memory_auto_improve` learning reviews | No automatic session-end summaries; no auto-handoff at session boundaries |
-| **MCP + hooks** | All of the above *plus* every prompt/tool-call captured automatically; handoffs surface at SessionStart with no human prompting | - |
+| **MCP + hooks** | All of the above *plus* every prompt/tool-call captured automatically; handoffs surface at SessionStart with no human prompting **only when the client consumes startup-hook output or an equivalent context-injection result** | Grok and Zero discard SessionStart stdout; ask them to call `memory_handoff_accept` when resuming. |
 
 For MCP-only use, you can still cover the session-boundary gap by asking
 the LLM to call `memory_handoff_begin` manually before quitting.
@@ -453,9 +456,11 @@ resumed session.
 `ai-memory install-hooks --agent grok --apply`. ❌ No automatic handoff
 injection (Grok ignores SessionStart stdout — same policy as Zero).
 
-**Config file:** `~/.grok/config.toml` (user scope). Project scope is
-`<repo>/.grok/config.toml`; pass `--config-file` if you want the
-installer to write there.
+**Config file:** `install-mcp --client grok --apply` writes the user config at
+`$GROK_HOME/config.toml` (default `~/.grok/config.toml`). To use a project or
+custom config file, pass its exact path with `--config-file`; the CLI does not
+infer a project config location. Provide the MCP URL and token explicitly for
+that lane, and remove a custom config entry manually when uninstalling.
 
 ```bash
 ai-memory install-mcp --client grok --apply \
@@ -483,15 +488,17 @@ Authorization = "Bearer <token>"
   `--header` for bearer auth).
 
 Lifecycle capture is separate: `ai-memory install-hooks --agent grok
---apply` writes `~/.grok/hooks/ai-memory.json` (Grok discovers every
-`~/.grok/hooks/*.json`, so third-party hook files stay untouched). Events
+--apply` writes `$GROK_HOME/hooks/ai-memory.json` (default
+`~/.grok/hooks/ai-memory.json`; Grok discovers every
+`$GROK_HOME/hooks/*.json`, so third-party hook files stay untouched). Events
 mirror Claude Code's vocabulary (`SessionStart`, `UserPromptSubmit`,
 `PreToolUse`, `PostToolUse`, `PreCompact`, `Stop`, `SessionEnd`,
 `SubagentStart`, `SubagentStop`) with a Grok-specific script bundle /
 native `ai-memory hook --event … --agent grok` commands. Session-end
 handoff *creation* works; handoff *injection* does not — ask Grok to
 call `memory_handoff_accept` (or install the managed routing skills under
-`.grok/skills` / `~/.grok/skills`) at the start of a resumed session.
+`.grok/skills` / `$GROK_HOME/skills` (default `~/.grok/skills`)) at the start
+of a resumed session.
 
 Grok can also load MCP from Claude Code / Cursor compat sources when those
 compat flags are enabled, but first-party `install-mcp --client grok` is
@@ -686,8 +693,9 @@ If the model sees the tools but does not call them proactively, refresh the
 managed routing package. The `memory_install_self_routing` tool is read-only:
 it returns the slim markered instruction block, marker strings, agent filename
 hints, managed skill payloads (`name`, `description`, `relative_path`,
-`content`), project/global target hints for `.claude/skills` and
-`.agents/skills`, and overwrite guidance. Agents should use their own file
+`content`), and authoritative project/global target hints for `.claude/skills`,
+`.agents/skills`, `.grok/skills`, and `$GROK_HOME/skills` (default
+`~/.grok/skills`), plus overwrite guidance. Agents should use their own file
 editing tools to write those artifacts while preserving unrelated user content.
 
 If the model doesn't see any of those tools, the MCP registration
@@ -720,7 +728,7 @@ that *starts* the next one - to play nicely with ai-memory:
 | Side | What's needed | Covered by |
 |---|---|---|
 | **Ending side** | The agent must create a handoff, either through a true session-end hook, the supported Codex manual finalizer, or by calling `memory_handoff_begin`. | Built-in automatically for Claude Code, Devin CLI, Cursor, Gemini CLI, Grok Build CLI, Zero, OpenClaw, OpenCode, and OMP. Codex has no reliable true session-end event, so run `ai-memory finalize-session` when you need the final summary/handoff/auto-improve eligibility. Antigravity CLI has no true session-end event in the current integration, so ask it to call `memory_handoff_begin` before quitting when you need a handoff. |
-| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model proactively calls `memory_handoff_accept` on first turn. | (a) is built-in for Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / OpenClaw / OpenCode / OMP. Grok is explicitly excluded because it ignores SessionStart stdout; use (b). (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
+| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model proactively calls `memory_handoff_accept` on first turn. | (a) is built-in for Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / OpenClaw / OpenCode / OMP. It requires a client that consumes startup-hook stdout or an equivalent context-injection result. Grok and Zero are explicitly excluded because they discard SessionStart stdout; use (b). (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
 
 OpenCode uses its official `session.deleted` plugin event for true session-end
 delivery. Its generated plugin also sends a deduped best-effort close for any

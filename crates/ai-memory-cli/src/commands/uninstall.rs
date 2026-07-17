@@ -310,7 +310,13 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
         let cwd = std::env::current_dir().context("getting CWD for skill removal")?;
         let home = home_dir();
         let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
-        for root in skill_roots(&cwd, home.as_deref(), appdata.as_deref()) {
+        let grok_home = install_mcp::grok_home().ok();
+        for root in skill_roots(
+            &cwd,
+            home.as_deref(),
+            appdata.as_deref(),
+            grok_home.as_deref(),
+        ) {
             for skill in MANAGED_SKILLS {
                 push_generated_delete(
                     &mut plan,
@@ -324,7 +330,12 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
     Ok(plan)
 }
 
-fn skill_roots(cwd: &Path, home: Option<&Path>, appdata: Option<&Path>) -> Vec<PathBuf> {
+fn skill_roots(
+    cwd: &Path,
+    home: Option<&Path>,
+    appdata: Option<&Path>,
+    grok_home: Option<&Path>,
+) -> Vec<PathBuf> {
     let mut roots = Vec::with_capacity(9);
     push_unique_skill_root(&mut roots, cwd.join(CLAUDE_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(AGENTS_SKILL_DIR).join(SKILLS_DIR));
@@ -334,7 +345,10 @@ fn skill_roots(cwd: &Path, home: Option<&Path>, appdata: Option<&Path>) -> Vec<P
         push_unique_skill_root(&mut roots, home.join(CLAUDE_SKILL_DIR).join(SKILLS_DIR));
         push_unique_skill_root(&mut roots, home.join(AGENTS_SKILL_DIR).join(SKILLS_DIR));
         push_unique_skill_root(&mut roots, home.join(DEVIN_SKILL_DIR).join(SKILLS_DIR));
-        push_unique_skill_root(&mut roots, home.join(GROK_SKILL_DIR).join(SKILLS_DIR));
+        let grok_root = grok_home
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| home.join(GROK_SKILL_DIR));
+        push_unique_skill_root(&mut roots, grok_root.join(SKILLS_DIR));
     }
     // Windows global Devin installs live under %APPDATA%\devin\skills, not
     // $HOME/.devin/skills — sweep it too or uninstall orphans those skills.
@@ -981,13 +995,13 @@ mod tests {
         let home = Path::new("/home/alice");
         let appdata = Path::new("C:/Users/Alice/AppData/Roaming");
 
-        let roots = skill_roots(cwd, Some(home), Some(appdata));
+        let roots = skill_roots(cwd, Some(home), Some(appdata), None);
         assert!(
             roots.contains(&appdata.join("devin").join(SKILLS_DIR)),
             "{roots:?}"
         );
 
-        let without = skill_roots(cwd, Some(home), None);
+        let without = skill_roots(cwd, Some(home), None, None);
         assert_eq!(
             without.len(),
             8,
@@ -1001,6 +1015,21 @@ mod tests {
             without.contains(&home.join(GROK_SKILL_DIR).join(SKILLS_DIR)),
             "{without:?}"
         );
+    }
+
+    #[test]
+    fn skill_roots_use_injected_grok_home_override() {
+        let roots = skill_roots(
+            Path::new("/repo"),
+            Some(Path::new("/home/alice")),
+            None,
+            Some(Path::new("/custom/grok")),
+        );
+        assert!(
+            roots.contains(&PathBuf::from("/custom/grok/skills")),
+            "{roots:?}"
+        );
+        assert!(!roots.contains(&PathBuf::from("/home/alice/.grok/skills")));
     }
 
     #[test]

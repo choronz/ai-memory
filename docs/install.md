@@ -563,9 +563,10 @@ differences:
 
 The `SessionStart` hook injects pending handoffs through Devin's
 `hookSpecificOutput.additionalContext`. Real Devin `SessionStart` and
-`PostToolUse` payloads may omit `session_id` and `cwd`; ai-memory derives stable
-session/cwd context from its hook state and process environment so those events
-are still captured.
+`PostToolUse` payloads may omit `session_id` and `cwd`; ai-memory now infers cwd
+from `DEVIN_PROJECT_DIR` or the hook process working directory when the payload
+omits it, and mints/reuses a per-host session id from hook state when necessary,
+so those events are still captured. A payload-provided value always wins.
 
 ### OpenCode
 
@@ -712,7 +713,9 @@ docker run --rm akitaonrails/ai-memory:latest \
 
 Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, and OpenClaw support both
 `install-mcp` and `install-hooks`. Grok's `install-mcp --client grok` writes
-`~/.grok/config.toml`; `install-hooks --agent grok` captures lifecycle events.
+`$GROK_HOME/config.toml` (default `~/.grok/config.toml`); its hooks live under
+`$GROK_HOME/hooks` (default `~/.grok/hooks`). `install-hooks --agent grok`
+captures lifecycle events.
 Grok ignores `SessionStart` stdout, so handoffs must be accepted through MCP with
 `memory_handoff_accept` when resuming. Claude Desktop and VS Code Copilot are MCP-only here,
 so you'll need to nudge the model to call `memory_query` /
@@ -1125,7 +1128,7 @@ Default skill target roots:
 | Scope | `--agent claude-code` | `--agent agents` | `--agent devin` | `--agent grok` |
 |---|---|---|---|---|
 | `project` | `.claude/skills` | `.agents/skills` | `.devin/skills` | `.grok/skills` |
-| `global` | `~/.claude/skills` | `~/.agents/skills` | Windows: `%APPDATA%\devin\skills`; non-Windows: `~/.devin/skills` | `~/.grok/skills` |
+| `global` | `~/.claude/skills` | `~/.agents/skills` | Windows: `%APPDATA%\devin\skills`; non-Windows: `~/.devin/skills` | `$GROK_HOME/skills` (default `~/.grok/skills`) |
 
 Each managed skill is written as `<root>/<skill-name>/SKILL.md`.
 

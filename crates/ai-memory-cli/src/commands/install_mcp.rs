@@ -58,7 +58,7 @@ pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
     let snippet = match args.client {
         McpClient::ClaudeCode => render_claude_code(&args)?,
         McpClient::Codex => render_codex(&args),
-        McpClient::Grok => render_grok(&args),
+        McpClient::Grok => render_grok(&args)?,
         McpClient::OpenCode => render_opencode(&args)?,
         McpClient::Cursor => render_cursor(&args)?,
         McpClient::ClaudeDesktop => render_claude_desktop(&args)?,
@@ -120,10 +120,9 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
         // in `claude mcp list`.)
         McpClient::ClaudeCode => home()?.join(".claude.json"),
         McpClient::Codex => home()?.join(".codex").join("config.toml"),
-        // Grok discovers MCP under ~/.grok/config.toml (user scope). Project
-        // scope is `.grok/config.toml` under cwd/repo; pass --config-file for
-        // that case rather than inventing a second default.
-        McpClient::Grok => home()?.join(".grok").join("config.toml"),
+        // Project scope is `.grok/config.toml` under cwd/repo; pass
+        // --config-file for that case rather than inventing a second default.
+        McpClient::Grok => grok_home()?.join("config.toml"),
         McpClient::OpenCode => home()?
             .join(".config")
             .join("opencode")
@@ -180,6 +179,17 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
             .join(".vscode")
             .join("mcp.json"),
     })
+}
+
+/// Resolve Grok Build CLI's user configuration root. Grok honours
+/// `GROK_HOME`; otherwise it uses `~/.grok`.
+pub(crate) fn grok_home() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("GROK_HOME").filter(|path| !path.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+    Ok(home_dir()
+        .context("could not locate $HOME for Grok configuration")?
+        .join(".grok"))
 }
 
 /// Resolve the user-config file for this client. Honours
@@ -452,23 +462,7 @@ fn codex_upsert_mcp_server(
     doc: &mut toml_edit::DocumentMut,
     args: &InstallMcpArgs,
 ) -> anyhow::Result<()> {
-    use toml_edit::{Item, Table, Value, value};
-
-    // Capture sibling entries from either inline-table or block-table
-    // storage so we can rebuild in block form without dropping them.
-    let preserved: Vec<(String, Item)> = match doc.get("mcp_servers") {
-        Some(Item::Table(t)) => t
-            .iter()
-            .filter(|(k, _)| *k != args.name.as_str())
-            .map(|(k, v)| (k.to_string(), v.clone()))
-            .collect(),
-        Some(Item::Value(Value::InlineTable(it))) => it
-            .iter()
-            .filter(|(k, _)| *k != args.name.as_str())
-            .map(|(k, v)| (k.to_string(), Item::Value(v.clone())))
-            .collect(),
-        _ => Vec::new(),
-    };
+    use toml_edit::{Item, Table, value};
 
     // Build our `[mcp_servers.<name>]` as a block-style table.
     //
@@ -522,17 +516,7 @@ fn codex_upsert_mcp_server(
         server["http_headers"] = Item::Table(headers);
     }
 
-    // Replace `mcp_servers` wholesale with a fresh implicit parent
-    // table. Implicit = render only the dotted `[mcp_servers.<name>]`
-    // headers, never a bare `[mcp_servers]` header.
-    let mut parent = Table::new();
-    parent.set_implicit(true);
-    for (k, v) in preserved {
-        parent.insert(&k, v);
-    }
-    parent.insert(&args.name, Item::Table(server));
-
-    doc.insert("mcp_servers", Item::Table(parent));
+    upsert_toml_mcp_server(doc, &args.name, server);
     Ok(())
 }
 
@@ -550,21 +534,7 @@ fn grok_upsert_mcp_server(
     doc: &mut toml_edit::DocumentMut,
     args: &InstallMcpArgs,
 ) -> anyhow::Result<()> {
-    use toml_edit::{Item, Table, Value, value};
-
-    let preserved: Vec<(String, Item)> = match doc.get("mcp_servers") {
-        Some(Item::Table(t)) => t
-            .iter()
-            .filter(|(k, _)| *k != args.name.as_str())
-            .map(|(k, v)| (k.to_string(), v.clone()))
-            .collect(),
-        Some(Item::Value(Value::InlineTable(it))) => it
-            .iter()
-            .filter(|(k, _)| *k != args.name.as_str())
-            .map(|(k, v)| (k.to_string(), Item::Value(v.clone())))
-            .collect(),
-        _ => Vec::new(),
-    };
+    use toml_edit::{Item, Table, value};
 
     let mut server = Table::new();
     server["url"] = value(args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL));
@@ -575,15 +545,37 @@ fn grok_upsert_mcp_server(
         server["headers"] = Item::Table(headers);
     }
 
+    upsert_toml_mcp_server(doc, &args.name, server);
+    Ok(())
+}
+
+/// Replace one server while preserving siblings and canonicalising an inline
+/// `mcp_servers` map to block-form TOML tables.
+fn upsert_toml_mcp_server(doc: &mut toml_edit::DocumentMut, name: &str, server: toml_edit::Table) {
+    use toml_edit::{Item, Table, Value};
+
+    let preserved: Vec<(String, Item)> = match doc.get("mcp_servers") {
+        Some(Item::Table(table)) => table
+            .iter()
+            .filter(|(key, _)| *key != name)
+            .map(|(key, value)| (key.to_string(), value.clone()))
+            .collect(),
+        Some(Item::Value(Value::InlineTable(table))) => table
+            .iter()
+            .filter(|(key, _)| *key != name)
+            .map(|(key, value)| (key.to_string(), Item::Value(value.clone())))
+            .collect(),
+        _ => Vec::new(),
+    };
+
     let mut parent = Table::new();
     parent.set_implicit(true);
     for (k, v) in preserved {
         parent.insert(&k, v);
     }
-    parent.insert(&args.name, Item::Table(server));
+    parent.insert(name, Item::Table(server));
 
     doc.insert("mcp_servers", Item::Table(parent));
-    Ok(())
 }
 
 fn render_claude_code(args: &InstallMcpArgs) -> Result<String> {
@@ -651,12 +643,15 @@ fn render_codex(args: &InstallMcpArgs) -> String {
     out
 }
 
-fn render_grok(args: &InstallMcpArgs) -> String {
+fn render_grok(args: &InstallMcpArgs) -> Result<String> {
     // Grok Build CLI uses TOML under ~/.grok/config.toml. Schema differs
     // from Codex: static auth lives under `.headers` (not `http_headers`),
     // and `enabled = true` is the documented toggle.
+    let mut doc = toml_edit::DocumentMut::new();
+    grok_upsert_mcp_server(&mut doc, args)?;
+    let config_path = grok_home()?.join("config.toml");
     let mut out = format!(
-        "# Grok Build CLI — append to ~/.grok/config.toml\n\
+        "# Grok Build CLI — append to {config_path}\n\
          #\n\
          # Native HTTP transport. Pair with:\n\
          #   ai-memory install-hooks --agent grok --apply\n\
@@ -671,18 +666,14 @@ fn render_grok(args: &InstallMcpArgs) -> String {
          enabled = true\n",
         name = args.name,
         url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL),
+        config_path = config_path.display(),
     );
-    if let Some(b) = bearer_header_value(args.auth_token.as_deref()) {
-        out.push_str(&format!(
-            "\n[mcp_servers.{name}.headers]\n\
-             Authorization = \"{b}\"\n\
-             # Prefer env expansion to avoid embedding the token:\n\
-             # Authorization = \"Bearer ${{AI_MEMORY_AUTH_TOKEN}}\"\n",
-            name = args.name,
-            b = b,
-        ));
-    }
-    out
+    let config_start = out
+        .find("[mcp_servers.")
+        .context("internal: generated Grok TOML table missing")?;
+    out.truncate(config_start);
+    out.push_str(&doc.to_string());
+    Ok(out)
 }
 
 fn render_opencode(args: &InstallMcpArgs) -> Result<String> {
@@ -889,7 +880,7 @@ mod tests {
         match args.client {
             McpClient::ClaudeCode => render_claude_code(&args).unwrap(),
             McpClient::Codex => render_codex(&args),
-            McpClient::Grok => render_grok(&args),
+            McpClient::Grok => render_grok(&args).unwrap(),
             McpClient::OpenCode => render_opencode(&args).unwrap(),
             McpClient::Cursor => render_cursor(&args).unwrap(),
             McpClient::ClaudeDesktop => render_claude_desktop(&args).unwrap(),
@@ -971,7 +962,7 @@ mod tests {
         match args.client {
             McpClient::ClaudeCode => render_claude_code(&args).unwrap(),
             McpClient::Codex => render_codex(&args),
-            McpClient::Grok => render_grok(&args),
+            McpClient::Grok => render_grok(&args).unwrap(),
             McpClient::OpenCode => render_opencode(&args).unwrap(),
             McpClient::Cursor => render_cursor(&args).unwrap(),
             McpClient::ClaudeDesktop => render_claude_desktop(&args).unwrap(),
@@ -1094,7 +1085,15 @@ mod tests {
         let grok = render_for_test(McpClient::Grok);
         assert!(grok.contains("[mcp_servers.ai-memory]"));
         assert!(grok.contains("enabled = true"));
-        assert!(grok.contains("~/.grok/config.toml"));
+        assert!(
+            grok.contains(
+                &grok_home()
+                    .unwrap()
+                    .join("config.toml")
+                    .display()
+                    .to_string()
+            )
+        );
         // Grok uses `headers`, never Codex's `http_headers`.
         let grok_token = render_with_token(McpClient::Grok);
         assert!(grok_token.contains("[mcp_servers.ai-memory.headers]"));
@@ -1416,6 +1415,28 @@ mod tests {
         assert_eq!(
             first_content, second_content,
             "second apply must produce identical bytes"
+        );
+    }
+
+    #[test]
+    fn grok_print_uses_apply_toml_builder_for_dotted_names_and_quotes() {
+        let mut args = args_with_token(McpClient::Grok);
+        args.name = "ai.memory".into();
+        args.server_url = Some("https://memory.example/mcp?note=\"quoted\"".into());
+
+        let printed = render_grok(&args).unwrap();
+        let mut applied = toml_edit::DocumentMut::new();
+        grok_upsert_mcp_server(&mut applied, &args).unwrap();
+        let expected = applied.to_string();
+
+        assert!(printed.ends_with(&expected), "print output:\n{printed}");
+        let parsed: toml_edit::DocumentMut = expected.parse().unwrap();
+        assert!(
+            parsed
+                .get("mcp_servers")
+                .unwrap()
+                .get("ai.memory")
+                .is_some()
         );
     }
 }
