@@ -133,6 +133,15 @@ pub enum Command {
     /// Useful after renaming the project's directory on disk so the hook
     /// router keeps writing into the same logical project.
     RenameProject(RenameProjectArgs),
+    /// Rename a workspace. Column-only — the on-disk dir is UUID-keyed, so
+    /// nothing moves on disk. Useful to relabel a workspace without
+    /// disrupting the projects it contains.
+    RenameWorkspace(RenameWorkspaceArgs),
+    /// Permanently delete a workspace and ALL its data (every project,
+    /// page, session, observation, handoff, embedding, and on-disk wiki
+    /// file). This is irreversible — requires `--confirm`, and `--force`
+    /// when the workspace is non-empty.
+    DeleteWorkspace(DeleteWorkspaceArgs),
     /// Move a project into another workspace. A fresh destination is a
     /// lossless TRUE MOVE (re-stamp workspace_id, keep project_id, rename the
     /// dir) — sessions/observations/handoffs and history all survive. A
@@ -394,6 +403,35 @@ pub struct RenameProjectArgs {
     /// New project name. Must be non-empty and contain no slashes.
     #[arg(long)]
     pub to: String,
+}
+
+    /// Arguments for `rename-workspace`.
+#[derive(Debug, Args)]
+pub struct RenameWorkspaceArgs {
+    /// Current workspace name. Defaults to `default`.
+    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
+    pub from: String,
+    /// New workspace name. Must be non-empty, contain no slashes, and not
+    /// already be in use. Workspaces are UUID-keyed on disk, so nothing
+    /// moves on disk — this is a column-only rename.
+    #[arg(long)]
+    pub to: String,
+}
+
+/// Arguments for `delete-workspace`.
+#[derive(Debug, Args)]
+pub struct DeleteWorkspaceArgs {
+    /// Workspace name to delete. Defaults to `default`.
+    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
+    pub workspace: String,
+    /// REQUIRED for the delete to run. Without this flag the CLI errors
+    /// out — deleting a workspace is destructive and irreversible.
+    #[arg(long)]
+    pub confirm: bool,
+    /// Allow deleting a non-empty workspace. Without this flag the server
+    /// refuses (409) when the workspace still contains projects.
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// Arguments for `move-project`.
