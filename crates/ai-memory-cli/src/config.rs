@@ -139,12 +139,12 @@ pub struct Config {
     /// default (4); set to `0` to disable the limiter. Configured via the
     /// `llm_max_concurrency` TOML field or `AI_MEMORY_LLM_MAX_CONCURRENCY`.
     pub llm_max_concurrency: Option<usize>,
-    /// Opt-in: run LLM consolidation on SessionEnd (in addition to the
-    /// always-written heuristic session page), when an LLM provider is
-    /// configured. Off by default — SessionEnd stays cheap and
-    /// fire-and-forget; the LLM checkpoint otherwise happens on PreCompact
-    /// and via manual `memory_consolidate`. Set with
-    /// `AI_MEMORY_CONSOLIDATE_ON_SESSION_END=true`.
+    /// Run LLM consolidation on SessionEnd (in addition to the always-written
+    /// heuristic session page), when an LLM provider is configured. On by
+    /// default — SessionEnd compiles observations into wiki pages; set
+    /// `AI_MEMORY_CONSOLIDATE_ON_SESSION_END=false` to disable and keep
+    /// SessionEnd cheap and fire-and-forget. The LLM checkpoint also runs on
+    /// PreCompact and via manual `memory_consolidate`.
     pub consolidate_on_session_end: bool,
     /// Optional embedding provider (`openai`, `voyage`, `google` / `gemini`).
     pub embedding_provider: Option<String>,
@@ -590,7 +590,7 @@ impl Default for Config {
             llm_max_concurrency: None,
             llm_api_key: None,
             llm_compat_strict: false,
-            consolidate_on_session_end: false,
+            consolidate_on_session_end: true,
             embedding_provider: None,
             embedding_model: None,
             embedding_dim: None,

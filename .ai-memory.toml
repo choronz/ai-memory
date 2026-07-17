@@ -1,0 +1,11 @@
+workspace = "tools"
+
+project = "ai-memory"
+# project_strategy = "repo-root"
+
+default_global = "workspace"
+
+[briefing]
+inject_on_session_start = "false"
+
+max_chars = 6000
