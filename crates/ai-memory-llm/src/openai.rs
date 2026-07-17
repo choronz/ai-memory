@@ -1564,6 +1564,9 @@ mod tests {
             }
             .is_retryable()
         );
+        // A truncated/corrupted JSON body (gateway cut the stream under
+        // throttling) is retryable.
+        assert!(LlmError::Serde("expected `,` or `}` at line 12".into()).is_retryable());
     }
 
     #[tokio::test]
@@ -1601,6 +1604,44 @@ mod tests {
         assert!(
             attempts.load(Ordering::SeqCst) >= 2,
             "expected at least one retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_retries_truncated_json_then_succeeds() {
+        // Gateway throttling can truncate the JSON stream mid-response (e.g.
+        // `expected `,` or `}` at line 12`). The provider must treat the
+        // parse failure as transient and retry, succeeding on the full body.
+        let server = MockServer::start().await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_inner = attempts.clone();
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(move |_: &wiremock::Request| {
+                let n = attempts_inner.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == 1 {
+                    // Valid JSON prefix, cut off before the closing braces.
+                    ResponseTemplate::new(200)
+                        .set_body_string("{\"choices\":[{\"message\":{\"content\":\"hello\"")
+                } else {
+                    ResponseTemplate::new(200).set_body_string(chat_success_body())
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new_with_keys(vec![SecretString::from("k0")], "gpt-4o-mini")
+            .expect("provider builds")
+            .with_base_url(server.uri());
+
+        let response = provider
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .expect("succeeds after retrying the truncated response");
+        assert_eq!(response.text, "hello");
+        assert!(
+            attempts.load(Ordering::SeqCst) >= 2,
+            "expected at least one retry on truncated JSON"
         );
     }
 
