@@ -49,3 +49,36 @@ impl From<serde_json::Error> for LlmError {
         Self::Serde(value.to_string())
     }
 }
+
+impl LlmError {
+    /// True for errors where retrying the same request has a real chance of
+    /// succeeding — i.e. the upstream was temporarily unavailable, rate-limited,
+    /// or returned a gateway error page (e.g. an HTML 502 served with a 200
+    /// status by a misbehaving OpenAI-compatible proxy). Transport-level
+    /// failures, 429, and 5xx are included; permanent 4xx (401/403/404)
+    /// and malformed-payload errors are not.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            // Transport errors (timeout, connection reset, DNS) are transient.
+            Self::Http(_) => true,
+            // 429 rate-limit and 5xx are explicitly retryable. We also treat a
+            // `Provider` error whose body looks like an HTML/gateway page as
+            // retryable even when it arrived with a 2xx status (gateways that
+            // wrap throttling in a 200 HTML response).
+            Self::Provider { status, body } => {
+                if *status == 429 || (*status >= 500 && *status < 600) {
+                    return true;
+                }
+                let trimmed = body.trim_start();
+                trimmed.to_ascii_lowercase().starts_with("<!doctype")
+                    || trimmed.starts_with("<html")
+                    || trimmed.to_ascii_lowercase().contains("502")
+                    || trimmed.to_ascii_lowercase().contains("bad gateway")
+                    || trimmed.to_ascii_lowercase().contains("rate limit")
+                    || trimmed.to_ascii_lowercase().contains("too many requests")
+            }
+            _ => false,
+        }
+    }
+}

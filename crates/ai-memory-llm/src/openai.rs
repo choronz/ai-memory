@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
 use crate::error::{LlmError, LlmResult};
@@ -102,10 +103,19 @@ pub struct OpenAiProvider {
     /// key until `instant`". `None` means the key is currently usable.
     /// Indexed in lock-step with `api_keys`.
     blacklist: Arc<Mutex<Vec<Option<Instant>>>>,
+    /// Caps in-flight requests to the upstream so a burst of consolidation /
+    /// embedding calls cannot trip gateway throttling ("too many calls").
+    /// `None` means unbounded (historical behaviour).
+    concurrency: Option<Arc<Semaphore>>,
     base_url: String,
     model: String,
     dialect: RequestDialect,
 }
+
+/// Default cap on concurrent in-flight requests when an operator enables the
+/// concurrency limiter. High enough to parallelise consolidation/embedding
+/// batches, low enough to stay under typical gateway rate ceilings.
+pub(crate) const DEFAULT_MAX_CONCURRENCY: usize = 3;
 
 impl OpenAiProvider {
     /// Construct a provider given a single API key + model id. Defaults to
@@ -138,6 +148,7 @@ impl OpenAiProvider {
             api_keys,
             next_key: AtomicUsize::new(0),
             blacklist: Arc::new(Mutex::new(blacklist)),
+            concurrency: None,
             base_url: DEFAULT_BASE_URL.to_string(),
             model: model.into(),
             dialect: RequestDialect::Official,
@@ -149,6 +160,20 @@ impl OpenAiProvider {
     #[must_use]
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
+        self
+    }
+
+    /// Cap concurrent in-flight requests to `max`. A limiter prevents a burst
+    /// of consolidation / embedding calls from tripping gateway throttling
+    /// ("too many calls"). Pass `0` to disable (unbounded, historical
+    /// behaviour). The limit is shared across all requests on this provider.
+    #[must_use]
+    pub fn with_concurrency(mut self, max: usize) -> Self {
+        self.concurrency = if max == 0 {
+            None
+        } else {
+            Some(Arc::new(Semaphore::new(max)))
+        };
         self
     }
 
@@ -370,6 +395,11 @@ impl OpenAiProvider {
                 });
             };
 
+            // Cap concurrent in-flight requests so a burst cannot trip
+            // gateway throttling ("too many calls"). The permit is dropped
+            // at the end of the attempt's scope.
+            let _permit = self.acquire_permit().await;
+
             let send_result = self
                 .client
                 .post(&url)
@@ -414,7 +444,8 @@ impl OpenAiProvider {
                     self.blacklist_key(key_idx);
                 }
                 key_idx = self.next_usable_key(key_idx.wrapping_add(1) % len, start);
-                let delay = Self::retry_delay(attempt, start);
+                let delay = Self::retry_after_from_response(&resp)
+                    .unwrap_or_else(|| Self::retry_delay(attempt, start));
                 debug!(
                     attempt,
                     key_index = key_idx,
@@ -427,26 +458,53 @@ impl OpenAiProvider {
             }
 
             if !status.is_success() {
+                let status_code = status.as_u16();
                 let body = provider_error_body(resp).await;
                 warn!(
-                    status = status.as_u16(),
+                    status = status_code,
                     body_len = body.len(),
                     "openai-compatible endpoint returned a non-2xx status"
                 );
                 return Err(LlmError::Provider {
-                    status: status.as_u16(),
+                    status: status_code,
                     body,
                 });
             }
-            return response_json_or_provider_error::<OpenAiResponse>(resp).await;
+            // A 2xx response that isn't JSON (e.g. an HTML 502 gateway
+            // error page served as 200 by a throttling proxy) is a transient
+            // failure worth retrying, not a hard parse error.
+            match response_json_or_provider_error::<OpenAiResponse>(resp).await {
+                Ok(ok) => return Ok(ok),
+                Err(err) if err.is_retryable() && attempt < max_attempts.saturating_sub(1) => {
+                    attempt += 1;
+                    key_idx = self.next_usable_key(key_idx.wrapping_add(1) % len, start);
+                    let delay = Self::retry_delay(attempt, start);
+                    warn!(
+                        attempt,
+                        key_index = key_idx,
+                        ?delay,
+                        error = %err,
+                        "openai gateway returned a non-JSON 2xx body; retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            }
         }
     }
 
-    /// Single-attempt POST with no rotation or backoff. Used by structured
-    /// output, whose callers layer their own fallback and must observe an
-    /// upstream 429/5xx exactly once (re-hammering through key rotation would
-    /// double cost and defeat the compat-strict "propagate, don't retry"
-    /// contract). Uses the first configured key.
+    /// Single-attempt POST with no key rotation. Used by structured output,
+    /// whose callers layer their own fallback and must observe an upstream
+    /// 429/5xx exactly once (re-hammering through key rotation would double
+    /// cost and defeat the compat-strict "propagate, don't retry" contract).
+    /// Uses the first configured key.
+    ///
+    /// This is *not* strictly zero-retry: a gateway error page served with a
+    /// 2xx status (e.g. an HTML 502 from a throttling proxy) spends no
+    /// tokens and is worth one bounded retry honouring `Retry-After`. Any
+    /// other failure propagates exactly once, as the structured-output
+    /// contract requires.
     async fn post_no_retry<B: Serialize>(&self, body: &B) -> LlmResult<OpenAiResponse> {
         let url = normalize_openai_base(&self.base_url, "chat/completions");
         debug!(url, "POST openai (structured, no retry)");
@@ -458,6 +516,7 @@ impl OpenAiProvider {
                 status: 500,
                 body: "no api keys configured".into(),
             })?;
+        let _permit = self.acquire_permit().await;
         let resp = self
             .client
             .post(&url)
@@ -468,18 +527,77 @@ impl OpenAiProvider {
             .await?;
         let status = resp.status();
         if !status.is_success() {
+            let status_code = status.as_u16();
             let body = provider_error_body(resp).await;
             warn!(
-                status = status.as_u16(),
+                status = status_code,
                 body_len = body.len(),
                 "openai-compatible endpoint returned a non-2xx status (structured, no retry)"
             );
             return Err(LlmError::Provider {
-                status: status.as_u16(),
+                status: status_code,
                 body,
             });
         }
-        response_json_or_provider_error::<OpenAiResponse>(resp).await
+        let parsed = response_json_or_provider_error::<OpenAiResponse>(resp).await;
+        // One bounded retry for gateway error pages served as 2xx (no tokens
+        // were spent, so retrying is free and high-value under throttling).
+        if let Err(err) = &parsed
+            && err.is_retryable()
+        {
+            let delay = Self::retry_delay(1, 0);
+            debug!(?delay, "structured: retrying once after gateway error page");
+            tokio::time::sleep(delay).await;
+            let resp = self
+                .client
+                .post(&url)
+                .bearer_auth(api_key.expose_secret())
+                .header("content-type", "application/json")
+                .json(body)
+                .send()
+                .await?;
+            if resp.status().is_success() {
+                return response_json_or_provider_error::<OpenAiResponse>(resp).await;
+            }
+            let retry_status = resp.status().as_u16();
+            let body = provider_error_body(resp).await;
+            return Err(LlmError::Provider {
+                status: retry_status,
+                body,
+            });
+        }
+        parsed
+    }
+
+    /// Acquire a concurrency permit if a limiter is configured. Returns
+    /// `None` (and therefore no guarding drop) when unbounded. The permit is
+    /// held for the lifetime of the returned `Option<OwnedSemaphorePermit>`.
+    async fn acquire_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        match &self.concurrency {
+            Some(sem) => {
+                // If the semaphore is closed we can't limit; proceed unbounded
+                // rather than failing the whole request.
+                sem.clone().acquire_owned().await.ok()
+            }
+            None => None,
+        }
+    }
+
+    /// Honour a `Retry-After` header (seconds, or an HTTP-date) when the
+    /// upstream sent one; otherwise `None` to fall back to exponential backoff.
+    fn retry_after_from_response(resp: &reqwest::Response) -> Option<Duration> {
+        let value = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)?
+            .to_str()
+            .ok()?;
+        let secs = value.trim().parse::<u64>().ok();
+        if let Some(secs) = secs {
+            // Cap to avoid absurd server-requested waits.
+            return Some(Duration::from_secs(secs.min(60)));
+        }
+        // HTTP-date form is rare for this endpoint; ignore if unparseable.
+        None
     }
 
     /// Exponential backoff (capped) with a small per-request jitter derived
@@ -1402,5 +1520,143 @@ mod tests {
             }
             other => panic!("expected Provider error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn is_retryable_classifies_gateway_errors() {
+        // 429 / 5xx are retryable.
+        assert!(
+            LlmError::Provider {
+                status: 429,
+                body: "rate limited".into(),
+            }
+            .is_retryable()
+        );
+        assert!(
+            LlmError::Provider {
+                status: 503,
+                body: "unavailable".into(),
+            }
+            .is_retryable()
+        );
+        // A 200 carrying an HTML gateway error page is retryable (the
+        // throttling case this change addresses).
+        assert!(
+            LlmError::Provider {
+                status: 200,
+                body: "<html><body>502 Bad Gateway</body></html>".into(),
+            }
+            .is_retryable()
+        );
+        // Permanent 4xx is not.
+        assert!(
+            !LlmError::Provider {
+                status: 401,
+                body: "unauthorized".into(),
+            }
+            .is_retryable()
+        );
+        // A well-formed 2xx JSON error is not retryable.
+        assert!(
+            !LlmError::Provider {
+                status: 200,
+                body: "{\"error\":\"bad schema\"}".into(),
+            }
+            .is_retryable()
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_retries_gateway_html_200_then_succeeds() {
+        // Server throttling can return an HTML 502 page with a 200 status on
+        // the first attempt; the provider must retry (no tokens spent) and
+        // succeed on the next response.
+        let server = MockServer::start().await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_inner = attempts.clone();
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(move |_: &wiremock::Request| {
+                let n = attempts_inner.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == 1 {
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/html")
+                        .set_body_string("<html>502 Bad Gateway</html>")
+                } else {
+                    ResponseTemplate::new(200).set_body_string(chat_success_body())
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new_with_keys(vec![SecretString::from("k0")], "gpt-4o-mini")
+            .expect("provider builds")
+            .with_base_url(server.uri());
+
+        let response = provider
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .expect("succeeds after retrying the gateway-200 error");
+        assert_eq!(response.text, "hello");
+        assert!(
+            attempts.load(Ordering::SeqCst) >= 2,
+            "expected at least one retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrency_limiter_bounds_in_flight_requests() {
+        // With a cap of 2, at most 2 requests may be in flight at once even
+        // when many are issued concurrently. This prevents "too many calls"
+        // gateway throttling under burst load.
+        let server = MockServer::start().await;
+        let max_concurrent = Arc::new(AtomicUsize::new(0));
+        let current = Arc::new(AtomicUsize::new(0));
+        let max_inner = max_concurrent.clone();
+        let current_inner = current.clone();
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(move |_: &wiremock::Request| {
+                current_inner.fetch_add(1, Ordering::SeqCst);
+                let seen = current_inner.load(Ordering::SeqCst);
+                loop {
+                    let m = max_inner.load(Ordering::SeqCst);
+                    if seen <= m
+                        || max_inner
+                            .compare_exchange(m, seen, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                    {
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                current_inner.fetch_sub(1, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_string(chat_success_body())
+            })
+            .mount(&server)
+            .await;
+
+        let provider = Arc::new(
+            OpenAiProvider::new_with_keys(vec![SecretString::from("k0")], "gpt-4o-mini")
+                .expect("provider builds")
+                .with_base_url(server.uri())
+                .with_concurrency(2),
+        );
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let p = provider.clone();
+            handles.push(tokio::spawn(async move {
+                let _ = p.complete(ChatRequest::user_prompt("hi")).await;
+            }));
+        }
+        for h in handles {
+            let _ = h.await;
+        }
+        assert!(
+            max_concurrent.load(Ordering::SeqCst) <= 2,
+            "in-flight exceeded cap: {}",
+            max_concurrent.load(Ordering::SeqCst)
+        );
     }
 }

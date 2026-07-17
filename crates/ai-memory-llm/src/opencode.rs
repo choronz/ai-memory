@@ -38,6 +38,13 @@ impl OpenCodeProvider {
         let inner = OpenAiCompatProvider::new(OPENCODE_ZEN_BASE_URL, api_keys, model.into())?;
         Ok(Self { inner })
     }
+
+    /// Cap concurrent in-flight requests on the inner provider.
+    #[must_use]
+    pub fn with_concurrency(mut self, max: usize) -> Self {
+        self.inner = self.inner.with_concurrency(max);
+        self
+    }
 }
 
 #[async_trait]

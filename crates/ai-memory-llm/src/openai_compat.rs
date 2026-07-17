@@ -103,6 +103,14 @@ impl OpenAiCompatProvider {
         self.strict = strict;
         self
     }
+
+    /// Cap concurrent in-flight requests on the inner provider. See
+    /// [`OpenAiProvider::with_concurrency`].
+    #[must_use]
+    pub fn with_concurrency(mut self, max: usize) -> Self {
+        self.inner = self.inner.with_concurrency(max);
+        self
+    }
 }
 
 #[async_trait]

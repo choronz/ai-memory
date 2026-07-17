@@ -14,6 +14,26 @@ use crate::OpenAiCompatProvider;
 use crate::OpenAiOAuthProvider;
 use crate::OpenAiProvider;
 use crate::OpenCodeProvider;
+
+/// Resolve the per-provider concurrency cap (max in-flight requests) for the
+/// OpenAI-family providers. Precedence: explicit `config` override (TOML
+/// `llm_max_concurrency`) > `AI_MEMORY_LLM_MAX_CONCURRENCY` env > provider
+/// default (3). A value of `0` disables the limiter. The cap prevents a
+/// burst of consolidation / embedding calls from tripping gateway throttling
+/// ("too many calls").
+fn resolve_max_concurrency(config: Option<usize>) -> usize {
+    if let Some(n) = config {
+        return n;
+    }
+    match std::env::var("AI_MEMORY_LLM_MAX_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        Some(0) => 0,
+        Some(n) => n,
+        None => crate::openai::DEFAULT_MAX_CONCURRENCY,
+    }
+}
 use crate::auth::{AuthRequirement, ProviderAuth};
 use crate::embedding::{Embedder, OpenAiEmbedder, VoyageEmbedder};
 use crate::error::{LlmError, LlmResult};
@@ -104,6 +124,9 @@ pub struct ProviderConfig {
     /// across keys on 429/5xx with a per-key cooldown. Empty for single-key
     /// or key-less providers.
     pub api_keys: Vec<SecretString>,
+    /// Optional cap on concurrent in-flight requests (0 disables the limiter).
+    /// `None` falls back to the provider default / `AI_MEMORY_LLM_MAX_CONCURRENCY`.
+    pub max_concurrency: Option<usize>,
 }
 
 /// Embedding providers available to ai-memory.
@@ -224,7 +247,10 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             } else {
                 keys
             };
-            Ok(Arc::new(OpenAiProvider::new_with_keys(keys, config.model)?))
+            Ok(Arc::new(
+                OpenAiProvider::new_with_keys(keys, config.model)?
+                    .with_concurrency(resolve_max_concurrency(config.max_concurrency)),
+            ))
         }
         ProviderChoice::Gemini => {
             let keys = config.auth.api_keys();
@@ -241,7 +267,8 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
                 .ok_or_else(|| LlmError::NotConfigured("LLM_BASE_URL".into()))?;
             Ok(Arc::new(
                 OpenAiCompatProvider::new(base, config.auth.api_keys(), config.model)?
-                    .with_strict(config.compat_strict),
+                    .with_strict(config.compat_strict)
+                    .with_concurrency(resolve_max_concurrency(config.max_concurrency)),
             ))
         }
         ProviderChoice::OpenAiOAuth => {
@@ -267,7 +294,10 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             } else {
                 keys
             };
-            Ok(Arc::new(OpenCodeProvider::new(keys, config.model)?))
+            Ok(Arc::new(
+                OpenCodeProvider::new(keys, config.model)?
+                    .with_concurrency(resolve_max_concurrency(config.max_concurrency)),
+            ))
         }
     }
 }
@@ -325,6 +355,7 @@ mod tests {
             base_url: None,
             compat_strict: false,
             api_keys: Vec::new(),
+            max_concurrency: None,
         };
 
         let err = match build_provider(cfg) {

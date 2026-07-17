@@ -127,11 +127,18 @@ pub struct Config {
     /// `openai-compat` provider instead of asking for prose JSON and
     /// extracting the first balanced object. Off by default — the tolerant
     /// parser stays the default for older local engines that ignore
-    /// `response_format`. Modern engines (recent Ollama, vLLM, LM Studio,
+    /// `response_format`. Modern engines (recent OLLama, vLLM, LM Studio,
     /// llama.cpp) honour structured output; this lets the operator opt in.
     /// If the strict raw call fails, the provider falls back to the tolerant
     /// parser. Set with `AI_MEMORY_LLM_COMPAT_STRICT=true`.
     pub llm_compat_strict: bool,
+    /// Optional cap on concurrent in-flight requests to the LLM gateway
+    /// (OpenAI-family providers: `openai`, `openai-compat`, `opencode`).
+    /// Bounds bursts of consolidation / embedding calls so they cannot trip
+    /// gateway throttling ("too many calls"). `None` uses the provider
+    /// default (4); set to `0` to disable the limiter. Configured via the
+    /// `llm_max_concurrency` TOML field or `AI_MEMORY_LLM_MAX_CONCURRENCY`.
+    pub llm_max_concurrency: Option<usize>,
     /// Opt-in: run LLM consolidation on SessionEnd (in addition to the
     /// always-written heuristic session page), when an LLM provider is
     /// configured. Off by default — SessionEnd stays cheap and
@@ -580,6 +587,7 @@ impl Default for Config {
             gemini_api_key: None,
             llm_base_url: None,
             llm_api_keys: None,
+            llm_max_concurrency: None,
             llm_api_key: None,
             llm_compat_strict: false,
             consolidate_on_session_end: false,
@@ -956,6 +964,7 @@ impl Config {
                 .or_else(|| self.runtime_env.llm_base_url.clone()),
             compat_strict: self.llm_compat_strict,
             api_keys: Vec::new(),
+            max_concurrency: self.llm_max_concurrency,
         }))
     }
 
@@ -2009,6 +2018,35 @@ mod tests {
             auth.optional_api_key().unwrap().expose_secret(),
             "sk-toml-key",
             "root llm_api_key must reach openai-compat auth"
+        );
+    }
+
+    #[test]
+    fn toml_llm_max_concurrency_reaches_provider_config() {
+        // `llm_max_concurrency` in config.toml must thread into
+        // `ProviderConfig::max_concurrency` so the gateway concurrency cap
+        // can be set without an env var.
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            "llm_provider = \"openai-compat\"\n\
+             llm_model = \"hy3-free\"\n\
+             llm_base_url = \"https://example.test/v1\"\n\
+             llm_max_concurrency = 3\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&cfg_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(
+            cfg.llm_max_concurrency,
+            Some(3),
+            "toml llm_max_concurrency must load"
+        );
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        assert_eq!(
+            provider.max_concurrency,
+            Some(3),
+            "llm_max_concurrency must reach ProviderConfig"
         );
     }
 

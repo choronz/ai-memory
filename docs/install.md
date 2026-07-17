@@ -1015,6 +1015,30 @@ try strict compat mode:
 Strict mode is opt-in. ai-memory sends the schema-constrained request first and
 falls back to the tolerant parser only when that raw strict call fails.
 
+### Capping concurrent requests (gateway throttling)
+
+When the upstream OpenAI-compatible gateway rate-limits bursts ("too many
+calls"), reduce the number of in-flight requests ai-memory opens at once. Set
+it in `config.toml`:
+
+```toml
+llm_max_concurrency = 3
+```
+
+…or via env var:
+
+```bash
+-e AI_MEMORY_LLM_MAX_CONCURRENCY=3
+```
+
+TOML takes precedence over the env var. Defaults to `3` for `openai`,
+`openai-compat`, and `opencode`. Set to `0` to disable the limiter
+(historical unbounded behaviour). A misbehaving gateway that returns an HTML
+`502 Bad Gateway` page with a `200` status is retried automatically as a
+transient error (the structured-output path retries once, honouring a
+`Retry-After` header when present), so it no longer surfaces as a cryptic
+`unexpected response shape` error.
+
 ---
 
 ## Subcommand reference
