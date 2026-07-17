@@ -15,7 +15,8 @@ use crate::commands::path_util::home_dir;
 use crate::commands::{data_purge, install_hooks, install_mcp, openclaw_plugin};
 use crate::config::Config;
 use ai_memory_core::routing_skills::{
-    AGENTS_SKILL_DIR, CLAUDE_SKILL_DIR, DEVIN_SKILL_DIR, MANAGED_MARKER, MANAGED_SKILLS, SKILLS_DIR,
+    AGENTS_SKILL_DIR, CLAUDE_SKILL_DIR, DEVIN_SKILL_DIR, GROK_SKILL_DIR, MANAGED_MARKER,
+    MANAGED_SKILLS, SKILLS_DIR,
 };
 use ai_memory_core::{MARKER_END, MARKER_START, find_marker_line};
 use anyhow::{Context, Result};
@@ -263,6 +264,7 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
         for client in [
             ClaudeCode,
             Codex,
+            Grok,
             OpenCode,
             Cursor,
             ClaudeDesktop,
@@ -283,12 +285,12 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
             }
             let content = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
-            let (_new, removed) = if matches!(client, Codex) {
+            let (_new, removed) = if matches!(client, Codex | Grok) {
                 strip_mcp_toml(&content, name, url)?
             } else {
                 strip_mcp_json(&content, client, name, url)?
             };
-            let op = if matches!(client, Codex) {
+            let op = if matches!(client, Codex | Grok) {
                 RewriteOp::McpToml
             } else {
                 RewriteOp::McpJson(client)
@@ -324,7 +326,13 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
         let cwd = std::env::current_dir().context("getting CWD for skill removal")?;
         let home = home_dir();
         let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
-        for root in skill_roots(&cwd, home.as_deref(), appdata.as_deref()) {
+        let grok_home = install_mcp::grok_home().ok();
+        for root in skill_roots(
+            &cwd,
+            home.as_deref(),
+            appdata.as_deref(),
+            grok_home.as_deref(),
+        ) {
             for skill in MANAGED_SKILLS {
                 push_generated_delete(
                     &mut plan,
@@ -338,15 +346,25 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
     Ok(plan)
 }
 
-fn skill_roots(cwd: &Path, home: Option<&Path>, appdata: Option<&Path>) -> Vec<PathBuf> {
-    let mut roots = Vec::with_capacity(7);
+fn skill_roots(
+    cwd: &Path,
+    home: Option<&Path>,
+    appdata: Option<&Path>,
+    grok_home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::with_capacity(9);
     push_unique_skill_root(&mut roots, cwd.join(CLAUDE_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(AGENTS_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(DEVIN_SKILL_DIR).join(SKILLS_DIR));
+    push_unique_skill_root(&mut roots, cwd.join(GROK_SKILL_DIR).join(SKILLS_DIR));
     if let Some(home) = home {
         push_unique_skill_root(&mut roots, home.join(CLAUDE_SKILL_DIR).join(SKILLS_DIR));
         push_unique_skill_root(&mut roots, home.join(AGENTS_SKILL_DIR).join(SKILLS_DIR));
         push_unique_skill_root(&mut roots, home.join(DEVIN_SKILL_DIR).join(SKILLS_DIR));
+        let grok_root = grok_home
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| home.join(GROK_SKILL_DIR));
+        push_unique_skill_root(&mut roots, grok_root.join(SKILLS_DIR));
     }
     // Windows global Devin installs live under %APPDATA%\devin\skills, not
     // $HOME/.devin/skills — sweep it too or uninstall orphans those skills.
@@ -895,7 +913,7 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         McpClient::OpenCode => Some(&["mcp"]),
         McpClient::Openclaw | McpClient::Zero => Some(&["mcp", "servers"]),
         McpClient::VsCodeCopilot => Some(&["servers"]),
-        McpClient::Codex | McpClient::Pi => None,
+        McpClient::Codex | McpClient::Grok | McpClient::Pi => None,
     }
 }
 
@@ -1037,14 +1055,41 @@ mod tests {
         let home = Path::new("/home/alice");
         let appdata = Path::new("C:/Users/Alice/AppData/Roaming");
 
-        let roots = skill_roots(cwd, Some(home), Some(appdata));
+        let roots = skill_roots(cwd, Some(home), Some(appdata), None);
         assert!(
             roots.contains(&appdata.join("devin").join(SKILLS_DIR)),
             "{roots:?}"
         );
 
-        let without = skill_roots(cwd, Some(home), None);
-        assert_eq!(without.len(), 6, "no phantom root when APPDATA is unset");
+        let without = skill_roots(cwd, Some(home), None, None);
+        assert_eq!(
+            without.len(),
+            8,
+            "no phantom root when APPDATA is unset (claude/agents/devin/grok × project+global)"
+        );
+        assert!(
+            without.contains(&cwd.join(GROK_SKILL_DIR).join(SKILLS_DIR)),
+            "{without:?}"
+        );
+        assert!(
+            without.contains(&home.join(GROK_SKILL_DIR).join(SKILLS_DIR)),
+            "{without:?}"
+        );
+    }
+
+    #[test]
+    fn skill_roots_use_injected_grok_home_override() {
+        let roots = skill_roots(
+            Path::new("/repo"),
+            Some(Path::new("/home/alice")),
+            None,
+            Some(Path::new("/custom/grok")),
+        );
+        assert!(
+            roots.contains(&PathBuf::from("/custom/grok/skills")),
+            "{roots:?}"
+        );
+        assert!(!roots.contains(&PathBuf::from("/home/alice/.grok/skills")));
     }
 
     #[test]

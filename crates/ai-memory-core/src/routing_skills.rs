@@ -12,6 +12,8 @@ pub const CLAUDE_SKILL_DIR: &str = ".claude";
 pub const AGENTS_SKILL_DIR: &str = ".agents";
 /// Devin-compatible Agent Skill directory below a project or home root.
 pub const DEVIN_SKILL_DIR: &str = ".devin";
+/// Grok Build CLI Agent Skill directory below a project or home root.
+pub const GROK_SKILL_DIR: &str = ".grok";
 /// Leaf directory that contains individual Agent Skill directories.
 pub const SKILLS_DIR: &str = "skills";
 

@@ -100,7 +100,7 @@ and writes a timestamped backup before changing an existing instruction file.
 `install-instructions --print` previews the instruction snippet only; use
 `install-skills --print` to preview skill payloads. Skill flags mirror
 `install-skills` with an `--skills-` prefix:
-`--skills-scope project|global`, `--skills-agent claude-code|agents|devin|both`,
+`--skills-scope project|global`, `--skills-agent claude-code|agents|devin|grok|both`,
 `--skills-target-dir <dir>`, and `--skills-force`.
 
 Auto-detect extends `CLAUDE.md` when it exists, `AGENTS.md` when it
@@ -108,7 +108,8 @@ exists, both when both exist, or creates `CLAUDE.md` when neither exists. Use
 `--target AGENTS.md` for non-Claude-only projects. The skill target follows the
 instruction target unless you override it: `CLAUDE.md` implies
 `.claude/skills`, `AGENTS.md` implies `.agents/skills`, and both files imply
-both skill roots.
+both skill roots. For Grok Build CLI, select `--skills-agent grok` so skills
+install under its `.grok/skills` root.
 
 To refresh only the managed Agent Skills:
 
@@ -116,19 +117,23 @@ To refresh only the managed Agent Skills:
 ai-memory install-skills
 ai-memory install-skills --scope global --agent agents
 ai-memory install-skills --scope global --agent devin
+ai-memory install-skills --scope global --agent grok
 ai-memory install-skills --agent both --print
 ai-memory install-skills --target-dir .custom/skills --force
 ```
 
 For Devin, project-local skills are installed under `.devin/skills`. Global
 Devin installs use `%APPDATA%\devin\skills` on Windows and `~/.devin/skills`
-on non-Windows systems.
+on non-Windows systems. For Grok Build CLI, project-local skills go under
+`.grok/skills` and global under `$GROK_HOME/skills` (default
+`~/.grok/skills`).
 
 Project-local skill roots are `.claude/skills` for Claude-compatible installs,
-`.agents/skills` for cross-client installs, and `.devin/skills` for Devin
-installs. Global Claude/Agents roots are `~/.claude/skills` and
+`.agents/skills` for cross-client installs, `.devin/skills` for Devin, and
+`.grok/skills` for Grok. Global Claude/Agents roots are `~/.claude/skills` and
 `~/.agents/skills`; global Devin roots are platform-specific as described
-above. `--target-dir` points at an explicit skill root and bypasses scope/agent
+above; global Grok is `$GROK_HOME/skills` (default `~/.grok/skills`).
+`--target-dir` points at an explicit skill root and bypasses scope/agent
 inference. `--print` previews target paths and `SKILL.md` contents. `--force`
 allows replacement of unmanaged same-name skills; without it, user-authored
 skills are preserved. Uninstall removes ai-memory-managed skills from the
@@ -290,7 +295,7 @@ docker exec ai-memory git -C /data/wiki log --oneline
 
 Durable project rules belong in the agent's rules file, not only in the
 wiki. For Claude Code that is `CLAUDE.md`; for Codex, Devin CLI, OpenCode,
-Cursor, Kimi Code, and Gemini CLI it is usually `AGENTS.md`.
+Cursor, Gemini CLI, Grok Build CLI, and Kimi Code it is usually `AGENTS.md`.
 
 The consolidator classifies compiled observations as `decision`,
 `fact`, `rule`, or `gotcha`. Rule-tagged pages are routed to

@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::cli::{AgentChoice, SetupAgentArgs};
+use crate::commands::install_mcp;
 use crate::commands::render_shared::{
     ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CLAUDE_CODE_EVENTS, CODEX_PROFILE,
     CURSOR_PROFILE, GEMINI_PROFILE, build_claude_code_payload, build_devin_payload,
@@ -266,17 +267,27 @@ fn emit_grok(emit_root: &Path, args: &SetupAgentArgs) -> Result<()> {
     let payload = build_grok_payload(emit_root, &args.server_url, args.auth_token.as_deref());
     let serialized =
         serde_json::to_string_pretty(&payload).context("serializing Grok hook config")?;
-    println!("# Grok Build CLI — write to ~/.grok/hooks/ai-memory.json");
+    let grok_home = install_mcp::grok_home()?;
+    let hooks_path = grok_home.join("hooks/ai-memory.json");
+    println!("# Grok Build CLI — write to {}", hooks_path.display());
     println!("# Hook scripts (must be reachable from the host that runs Grok):");
     println!("#   {}", emit_root.display());
     println!("# AI-memory server: {}", args.server_url);
     if args.auth_token.is_some() {
         println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
-        println!("#       Treat ~/.grok/hooks/ai-memory.json as sensitive (chmod 600).");
+        println!(
+            "#       Treat {} as sensitive (chmod 600).",
+            hooks_path.display()
+        );
     }
     println!("# NOTE: Grok ignores SessionStart stdout, so this config captures");
     println!("#       lifecycle events but does not inject handoffs automatically.");
     println!("#       Recover handoffs via the MCP memory_handoff_accept tool.");
+    println!("# Tip: also run `ai-memory install-mcp --client grok --auth-token <…>`");
+    println!(
+        "#      to register the MCP endpoint in {}.",
+        grok_home.join("config.toml").display()
+    );
     println!();
     println!("{serialized}");
     Ok(())
