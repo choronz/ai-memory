@@ -5,7 +5,4 @@ project = "ai-memory"
 
 default_global = "workspace"
 
-[briefing]
-inject_on_session_start = "false"
-
 max_chars = 6000

@@ -141,6 +141,11 @@ pub async fn run(config: &Config, args: BootstrapArgs) -> Result<()> {
     });
     let outcome: BootstrapOutcome = post_json(&ep, "/admin/bootstrap", &body).await?;
 
+    // Pin the resolved scope so future hook captures land in the same
+    // project this bootstrap seeded (prevents a stray default-scope orphan
+    // on the next session start). Never clobbers an existing marker.
+    write_marker_if_absent(&repo_path, &args.workspace)?;
+
     print_human_report(&outcome, &args.workspace, &project);
     let report = serde_json::to_string_pretty(&outcome)?;
     println!("\n--- machine-readable ---\n{report}");
@@ -161,6 +166,32 @@ fn ensure_sources_for_dry_run(sources: &[BootstrapSource]) -> Result<()> {
          --exclude-* flag combined to drop everything. Remove at least one --exclude-* flag \
          or point --repo-path at a directory with a README, docs/, or commits.",
     );
+    Ok(())
+}
+
+/// Write a `.ai-memory.toml` marker in `repo_root` pinning the workspace
+/// this bootstrap targeted, unless one already exists (never clobbers a
+/// user's intentional pin). The marker makes the next session-start
+/// resolve to the same scope bootstrap seeded, avoiding a default-scope
+/// orphan project. Only `workspace` is pinned (not `project`) so the
+/// repo-root project-name heuristic still applies if the folder is
+/// renamed. `default_global = "workspace"` keeps global-scope hits in
+/// play, and `max_chars = 6000` bounds the auto-injected brief.
+fn write_marker_if_absent(repo_root: &std::path::Path, workspace: &str) -> Result<()> {
+    let marker = repo_root.join(".ai-memory.toml");
+    if marker.exists() {
+        info!(path = %marker.display(), "bootstrap: leaving existing .ai-memory.toml untouched");
+        return Ok(());
+    }
+    let body = format!(
+        "workspace = \"{workspace}\"\n\n\
+         default_global = \"workspace\"\n\n\
+         [briefing]\n\
+         max_chars = 6000\n"
+    );
+    std::fs::write(&marker, body)
+        .with_context(|| format!("writing bootstrap scope marker {}", marker.display()))?;
+    info!(path = %marker.display(), workspace, "bootstrap: wrote .ai-memory.toml pinning workspace");
     Ok(())
 }
 
@@ -295,7 +326,7 @@ fn print_human_report(outcome: &BootstrapOutcome, workspace: &str, project: &str
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_sources_for_dry_run, local_dry_run};
+    use super::{ensure_sources_for_dry_run, local_dry_run, write_marker_if_absent};
     use ai_memory_consolidate::{BootstrapSource, SourceKind};
 
     fn source(kind: SourceKind, label: &str, body_len: usize) -> BootstrapSource {
@@ -406,5 +437,52 @@ mod tests {
         assert_eq!(outcome.sources_collected, 10);
         assert_eq!(outcome.sources_sent, 1);
         assert_eq!(outcome.sources_dropped, 9);
+    }
+
+    #[test]
+    fn write_marker_pins_resolved_workspace() {
+        let dir = std::env::temp_dir().join(format!(
+            "ai-memory-bootstrap-marker-{}-{}",
+            std::process::id(),
+            "pins"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Guard against an accidental pre-existing marker in the temp dir.
+        assert!(!dir.join(".ai-memory.toml").exists());
+        write_marker_if_absent(&dir, "tools").unwrap();
+        let body = std::fs::read_to_string(dir.join(".ai-memory.toml")).unwrap();
+        assert!(
+            body.contains("workspace = \"tools\""),
+            "marker must pin workspace: {body}"
+        );
+        assert!(body.contains("default_global = \"workspace\""));
+        assert!(body.contains("max_chars = 6000"));
+        // `project` is intentionally NOT pinned.
+        assert!(
+            !body.contains("project ="),
+            "marker must not pin project: {body}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_marker_does_not_clobber_existing() {
+        let dir = std::env::temp_dir().join(format!(
+            "ai-memory-bootstrap-marker-{}-{}",
+            std::process::id(),
+            "clobber"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join(".ai-memory.toml");
+        std::fs::write(&marker, "workspace = \"preexisting\"\n").unwrap();
+        write_marker_if_absent(&dir, "tools").unwrap();
+        let body = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(
+            body, "workspace = \"preexisting\"\n",
+            "existing marker must be untouched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
