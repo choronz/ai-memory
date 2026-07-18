@@ -71,6 +71,15 @@ pub struct PurgeSessionSummary {
     /// Whether the session's summary page existed and was targeted for
     /// on-disk removal. The admin handler uses this to clean up the file.
     pub had_summary_page: bool,
+    /// Whether the session was the project's last surviving data, leaving the
+    /// `projects` row with zero sessions / observations / handoffs / pages. The
+    /// store deletes the now-orphaned `projects` row (and the admin handler
+    /// removes the project's on-disk directory).
+    pub project_deleted: bool,
+    /// Whether, after the (possibly orphaned) project was reaped, the workspace
+    /// held no further projects and its `workspaces` row was deleted too. The
+    /// admin handler removes the workspace's on-disk directory.
+    pub workspace_deleted: bool,
 }
 
 /// One embedding upsert requested by a backfill or embed command.
@@ -1514,7 +1523,12 @@ pub fn purge_project(
 ///   first, delete the `pages` row here (cascading its embeddings), and
 ///   return `had_summary_page` so the caller can remove the file.
 ///
-/// The workspace and project rows are intentionally left intact.
+/// The workspace and project rows are left intact *unless* the purge leaves
+/// the project with no sessions, observations, handoffs, or pages — in which
+/// case the now-orphaned `projects` row is deleted. If that in turn empties
+/// the workspace (no remaining projects), the `workspaces` row is deleted too.
+/// Both reap steps happen inside the same transaction as the session delete so
+/// the scope never lingers as an empty stub in the project listing.
 ///
 /// # Errors
 /// [`StoreError::NotFound`] when the session id does not exist; the standard
@@ -1613,6 +1627,56 @@ pub fn purge_session(
         Timestamp::now().as_microsecond(),
     )?;
 
+    // Reap an orphaned project: if the session purge left the project with no
+    // sessions, observations, handoffs, or pages, the `projects` row is now a
+    // stub that would otherwise linger in the project listing. Delete it in the
+    // same transaction. `pages` is the only FK that isn't ON DELETE CASCADE from
+    // the project, but we already removed the session's page above; the other
+    // counts guard against reaping a project that still holds live data.
+    let project_remaining = count(
+        "SELECT COUNT(*) FROM (
+            SELECT 1 FROM sessions WHERE project_id = ?1
+            UNION ALL SELECT 1 FROM observations WHERE project_id = ?1
+            UNION ALL SELECT 1 FROM handoffs WHERE project_id = ?1
+            UNION ALL SELECT 1 FROM pages WHERE project_id = ?1
+        )",
+        &proj_bytes[..],
+    )?;
+    let project_deleted = if project_remaining == 0 {
+        tx.execute(
+            "DELETE FROM projects WHERE id = ?1 AND workspace_id = ?2",
+            params![&proj_bytes[..], &ws_bytes[..]],
+        )?;
+        true
+    } else {
+        false
+    };
+
+    // Reap an orphaned workspace: only when the project was reaped and no other
+    // projects remain in the workspace. The workspace row is left intact if it
+    // still has any projects — other scopes may live there.
+    let workspace_deleted = if project_deleted {
+        let ws_projects: u64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE workspace_id = ?1",
+                params![&ws_bytes[..]],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        if ws_projects == 0 {
+            tx.execute(
+                "DELETE FROM workspaces WHERE id = ?1",
+                params![&ws_bytes[..]],
+            )?;
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
     tx.commit()?;
     Ok(PurgeSessionSummary {
         session_id: session_id.to_string(),
@@ -1622,6 +1686,8 @@ pub fn purge_session(
         pages_deleted,
         embeddings_deleted,
         had_summary_page,
+        project_deleted,
+        workspace_deleted,
     })
 }
 
@@ -4209,6 +4275,21 @@ mod tests {
             .unwrap();
         assert_eq!(obs_before, 4);
 
+        // Seed a second, unrelated session in the SAME project before purging the
+        // first. The project must survive the purge because it still holds data.
+        let sid2 = SessionId::new();
+        begin_session(
+            &mut conn,
+            &ai_memory_core::NewSession {
+                id: sid2,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+            },
+        )
+        .unwrap();
+
         let report = purge_session(&mut conn, &sid, "default/scratch", None)
             .expect("purge_session must succeed");
         assert_eq!(report.observations_deleted, 4);
@@ -4254,7 +4335,12 @@ mod tests {
             .unwrap();
         assert_eq!(pages, 0, "summary page deleted");
 
-        // Project survives (only the session was purged).
+        // The project holds a second session, so it must survive the purge of
+        // the first session (no orphan reaping).
+        assert!(
+            !report.project_deleted,
+            "project survives while it holds another session"
+        );
         let proj_exists: bool = conn
             .query_row(
                 "SELECT 1 FROM projects WHERE id = ?1",
@@ -4265,10 +4351,143 @@ mod tests {
             .unwrap()
             .is_some();
         assert!(proj_exists, "project survives the session purge");
+        assert!(!report.workspace_deleted, "workspace survives");
 
         // Audited.
         let (count, _) = audit_row_for(&conn, "purge_session");
         assert_eq!(count, 1, "exactly one purge_session audit row");
+    }
+
+    /// When the purged session is the project's only data, the now-orphaned
+    /// `projects` row (and, if it was the workspace's only project, the
+    /// `workspaces` row) is reaped in the same transaction.
+    #[test]
+    fn purge_session_reaps_orphaned_project_and_workspace() {
+        use ai_memory_core::{AgentKind, NewObservation, ObservationKind, SessionId};
+
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+
+        let sid = SessionId::new();
+        begin_session(
+            &mut conn,
+            &ai_memory_core::NewSession {
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+            },
+        )
+        .unwrap();
+        insert_observation(
+            &mut conn,
+            &NewObservation {
+                session_id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "only obs".into(),
+                body: "body".into(),
+                importance: 5,
+            },
+        )
+        .unwrap();
+        end_session(&mut conn, &sid, None).unwrap();
+
+        let report = purge_session(&mut conn, &sid, "default/scratch", None)
+            .expect("purge_session must succeed");
+        assert!(report.project_deleted, "orphaned project reaped");
+        assert!(report.workspace_deleted, "orphaned workspace reaped");
+
+        let proj_exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM projects WHERE id = ?1",
+                [proj.as_bytes()],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .unwrap()
+            .is_some();
+        assert!(!proj_exists, "project row deleted");
+
+        let ws_exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM workspaces WHERE id = ?1",
+                [ws.as_bytes()],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .unwrap()
+            .is_some();
+        assert!(!ws_exists, "workspace row deleted");
+    }
+
+    /// An orphaned project is reaped, but a workspace still holding another
+    /// project is left intact.
+    #[test]
+    fn purge_session_reaps_project_but_keeps_workspace() {
+        use ai_memory_core::{AgentKind, NewObservation, ObservationKind, SessionId};
+
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+
+        // Second project stays in the same workspace.
+        let proj2 = ai_memory_core::ProjectId::new();
+        conn.execute(
+            "INSERT INTO projects (id, workspace_id, name, repo_path, created_at) \
+             VALUES (?1, ?2, 'kept', NULL, 0)",
+            params![proj2.as_bytes(), ws.as_bytes()],
+        )
+        .unwrap();
+
+        let sid = SessionId::new();
+        begin_session(
+            &mut conn,
+            &ai_memory_core::NewSession {
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+            },
+        )
+        .unwrap();
+        insert_observation(
+            &mut conn,
+            &NewObservation {
+                session_id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "only obs".into(),
+                body: "body".into(),
+                importance: 5,
+            },
+        )
+        .unwrap();
+        end_session(&mut conn, &sid, None).unwrap();
+
+        let report = purge_session(&mut conn, &sid, "default/scratch", None)
+            .expect("purge_session must succeed");
+        assert!(report.project_deleted, "orphaned project reaped");
+        assert!(
+            !report.workspace_deleted,
+            "workspace kept (still has a project)"
+        );
+
+        let ws_exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM workspaces WHERE id = ?1",
+                [ws.as_bytes()],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .unwrap()
+            .is_some();
+        assert!(ws_exists, "workspace row kept");
     }
 
     /// A `purge_session` whose session is already gone must return `NotFound`

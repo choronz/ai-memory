@@ -3070,6 +3070,17 @@ pub struct PurgeSessionReport {
     /// Summary page file path that could not be removed (non-fatal).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_failed: Option<String>,
+    /// Whether the purge left the project empty and reaped its `projects` row.
+    pub project_deleted: bool,
+    /// Whether the project reap left the workspace empty and reaped its
+    /// `workspaces` row.
+    pub workspace_deleted: bool,
+    /// On-disk project/workspace directories removed (best-effort).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dirs_deleted: Option<Vec<String>>,
+    /// On-disk directories that could not be removed (non-fatal).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dirs_failed: Option<Vec<String>>,
     /// Pre-purge checkpoint, if the tree had uncommitted changes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pre_checkpoint: Option<String>,
@@ -3204,6 +3215,43 @@ async fn handle_purge_session(
     state.active_project.clear_project(proj_id);
     invalidate_scope_cache(&state, ScopeInvalidation::Project(proj_id)).await;
 
+    // When the session purge orphaned the project (or the whole workspace),
+    // remove the now-empty on-disk directory trees. Best-effort: the DB rows
+    // are already gone, so a disk failure is reported but non-fatal.
+    let mut dirs_deleted: Vec<String> = Vec::new();
+    let mut dirs_failed: Vec<String> = Vec::new();
+    if summary.project_deleted {
+        let proj_root_str = state
+            .wiki
+            .project_root(ws_id, proj_id)
+            .display()
+            .to_string();
+        match state.wiki.remove_project_dir(ws_id, proj_id).await {
+            Ok(()) => dirs_deleted.push(proj_root_str),
+            Err(e) => {
+                warn!(path = %proj_root_str, error = %e, "purge-session: failed to remove orphaned project dir");
+                dirs_failed.push(proj_root_str);
+            }
+        }
+    }
+    if summary.workspace_deleted {
+        let ws_root_str = state
+            .wiki
+            .root()
+            .join(ws_id.to_string())
+            .display()
+            .to_string();
+        match state.wiki.remove_workspace_dir(ws_id).await {
+            Ok(()) => dirs_deleted.push(ws_root_str),
+            Err(e) => {
+                warn!(path = %ws_root_str, error = %e, "purge-session: failed to remove orphaned workspace dir");
+                dirs_failed.push(ws_root_str);
+            }
+        }
+        state.active_project.clear_workspace(ws_id);
+        invalidate_scope_cache(&state, ScopeInvalidation::Workspace(ws_id)).await;
+    }
+
     let checkpoint = checkpoint_or_warn(&state.wiki, format!("purge-session {session_id}"));
 
     let report = PurgeSessionReport {
@@ -3215,6 +3263,18 @@ async fn handle_purge_session(
         embeddings_deleted: summary.embeddings_deleted,
         file_deleted,
         file_failed,
+        project_deleted: summary.project_deleted,
+        workspace_deleted: summary.workspace_deleted,
+        dirs_deleted: if dirs_deleted.is_empty() {
+            None
+        } else {
+            Some(dirs_deleted)
+        },
+        dirs_failed: if dirs_failed.is_empty() {
+            None
+        } else {
+            Some(dirs_failed)
+        },
         pre_checkpoint,
         checkpoint,
     };

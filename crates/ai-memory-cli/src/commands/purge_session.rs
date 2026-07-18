@@ -52,16 +52,40 @@ pub async fn run(config: &Config, args: PurgeSessionArgs) -> Result<()> {
     let pages = report["pages_deleted"].as_u64().unwrap_or(0);
     let embeddings = report["embeddings_deleted"].as_u64().unwrap_or(0);
     let file_deleted = report["file_deleted"].as_bool().unwrap_or(false);
+    let project_deleted = report["project_deleted"].as_bool().unwrap_or(false);
+    let workspace_deleted = report["workspace_deleted"].as_bool().unwrap_or(false);
     println!(
         "Purged session {session_id} ({label}): {observations} observations, \
          {handoffs} handoffs, {pages} pages, {embeddings} embeddings \
          (summary file removed: {file_deleted})."
     );
+    if project_deleted {
+        println!(
+            "Reaped empty project {label} (no remaining sessions, observations, \
+             handoffs, or pages)."
+        );
+    }
+    if workspace_deleted {
+        println!(
+            "Reaped empty workspace {ws} (no remaining projects).",
+            ws = label.split('/').next().unwrap_or("")
+        );
+    }
     if let Some(failed) = report["file_failed"].as_str() {
         println!(
             "Warning: summary page file could not be removed from disk: {failed} \
              (DB rows are gone)."
         );
+    }
+    if let Some(dirs) = report["dirs_failed"].as_array() {
+        for d in dirs {
+            if let Some(path) = d.as_str() {
+                println!(
+                    "Warning: on-disk directory could not be removed: {path} \
+                     (DB rows are gone)."
+                );
+            }
+        }
     }
     Ok(())
 }
