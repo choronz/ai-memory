@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::error::{LlmError, LlmResult};
 use crate::key_pool::KeyPool;
@@ -500,7 +500,15 @@ impl OpenAiProvider {
             // error page served as 200 by a throttling proxy) is a transient
             // failure worth retrying, not a hard parse error.
             match response_json_or_provider_error::<OpenAiResponse>(resp).await {
-                Ok(ok) => return Ok(ok),
+                Ok(ok) => {
+                    info!(
+                        key_index = key_idx,
+                        attempt,
+                        status = status.as_u16(),
+                        "openai request succeeded on key after retry"
+                    );
+                    return Ok(ok);
+                }
                 Err(err) if err.is_retryable() && attempt < max_attempts.saturating_sub(1) => {
                     attempt += 1;
                     // Server-side transient (gateway error page / truncated
@@ -1695,6 +1703,153 @@ mod tests {
             max_concurrent.load(Ordering::SeqCst) <= 2,
             "in-flight exceeded cap: {}",
             max_concurrent.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_502_with_malformed_json_body_is_provider_error() {
+        // A live proxy can return HTTP 502 with a body that *looks* like JSON
+        // (e.g. `{"error":"..."}` truncated mid-stream). The heuristic that
+        // trusts a `{`-prefixed body must never mask the real status: the
+        // provider must surface `Provider { status: 502 }`, not a cryptic
+        // `serde` parse error.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(502)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(
+                        "{\"error\":\"serde: expected `,` or `}` at line 18 column 281",
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new_with_keys(vec![SecretString::from("k0")], "gpt-4o-mini")
+            .expect("provider builds")
+            .with_base_url(server.uri());
+
+        let err = provider
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .expect_err("502 must propagate as a provider error");
+        assert!(
+            matches!(err, LlmError::Provider { status: 502, .. }),
+            "expected Provider {{ status: 502 }}, got {err:?}"
+        );
+        assert!(err.is_retryable(), "a 502 must be retryable");
+    }
+
+    #[tokio::test]
+    async fn success_with_json_error_envelope_is_provider_error() {
+        // A misbehaving gateway can answer HTTP 200 with a JSON error envelope
+        // whose own message quotes a downstream parse failure, e.g.
+        // `{"error":"serde: expected ... at line 30 column 135"}`. This must
+        // surface as a `Provider` error carrying the status, never a bare
+        // `serde` parse error that hides the real cause.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(
+                        "{\"error\":\"serde: expected `,` or `}` at line 30 column 135\"}",
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new_with_keys(vec![SecretString::from("k0")], "gpt-4o-mini")
+            .expect("provider builds")
+            .with_base_url(server.uri());
+
+        let err = provider
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .expect_err("a JSON error envelope must propagate as a provider error");
+        assert!(
+            matches!(err, LlmError::Provider { status: 200, .. }),
+            "expected Provider {{ status: 200 }}, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("serde:"),
+            "error message should carry the upstream error, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn success_with_control_char_error_envelope_is_provider_error() {
+        // A failing gateway can return a JSON error envelope whose string value
+        // itself contains a raw control character (the response was truncated
+        // mid-string), e.g.
+        // `{"error":"serde: control character (\u{0}-\u{1F}) found ... at line 31"}`.
+        // The whole body is no longer valid JSON, so a strict parse fails; we
+        // must still recover the message prefix and surface a Provider error.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_bytes(
+                        b"{\"error\":\"serde: control character (\\u0000-\\u001F) found while parsing a string at line 31 column 0\"}",
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new_with_keys(vec![SecretString::from("k0")], "gpt-4o-mini")
+            .expect("provider builds")
+            .with_base_url(server.uri());
+
+        let err = provider
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .expect_err("a corrupted JSON error envelope must propagate as a provider error");
+        assert!(
+            matches!(err, LlmError::Provider { .. }),
+            "expected Provider, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("control character"),
+            "error message should carry the upstream error, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn success_with_truncated_error_string_is_provider_error() {
+        // Same shape, but the body is cut off before the closing quote. Lenient
+        // recovery must still yield a usable message.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(502)
+                    .insert_header("content-type", "application/json")
+                    .set_body_bytes(
+                        b"{\"error\":\"serde: expected `,` or `}` at line 30 column 135",
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new_with_keys(vec![SecretString::from("k0")], "gpt-4o-mini")
+            .expect("provider builds")
+            .with_base_url(server.uri());
+
+        let err = provider
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .expect_err("a truncated JSON error envelope must propagate as a provider error");
+        assert!(
+            matches!(err, LlmError::Provider { status: 502, .. }),
+            "expected Provider {{ status: 502 }}, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("serde:"),
+            "error message should carry the upstream error, got {err}"
         );
     }
 }
