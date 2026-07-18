@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `ai-memory move-project` now accepts a `--workspace <new>` (alias for
+  `--to-workspace`) to move the current CWD project into another workspace, and
+  auto-derives the source workspace from the repo's `.ai-memory.toml` marker
+  (falling back to `default`) when `--from-workspace` is omitted — so
+  `ai-memory move-project --workspace new_ws --confirm` works without repeating
+  the scope flags.
 - OpenAI-family LLM providers (`openai`, `openai-compat`, `opencode`) now
   rotate across multiple API keys on 429/5xx with the same per-key 1-hour
   cooldown blacklist the Gemini provider already used, when a comma-separated
@@ -32,6 +38,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   via MCP `memory_handoff_accept`.
 
 ### Changed
+- `purge-session` now reaps an orphaned scope: when the purged session was the
+  project's only remaining data (no sessions / observations / handoffs / pages),
+  the now-empty `projects` row is deleted too, and if that empties the workspace
+  the `workspaces` row is deleted as well — so a purged session no longer leaves
+  an empty project stub lingering in the project/sessions listing. The reaped
+  on-disk project/workspace directories are removed (best-effort). A project or
+  workspace that still holds any other data is left intact, matching
+  `purge-project` / `delete-workspace` semantics.
 - `install-hooks --agent devin` now infers the server URL and bearer token from
   `~/.devin/config.json` when flags and environment settings are absent, keeping
   hooks aligned with an existing Devin MCP registration.

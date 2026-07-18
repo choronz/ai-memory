@@ -3628,9 +3628,14 @@ async fn handle_rename_project(
 /// JSON request body for `POST /admin/move-project`.
 #[derive(Deserialize)]
 struct MoveProjectRequest {
-    /// Source workspace. Must already exist; we 404 if absent.
+    /// Source workspace. Must already exist; we 404 if absent. When omitted,
+    /// the source is resolved by a cross-workspace lookup on `project` (the
+    /// same global fallback `purge-project` uses), so an operator can move a
+    /// uniquely-named project without spelling out the workspace it lives in.
+    #[serde(default)]
     from_workspace: String,
-    /// Project name to move. Must already exist in `from_workspace`; 404 if absent.
+    /// Project name to move. Must already exist in `from_workspace` (or, when
+    /// `from_workspace` is omitted, uniquely across all workspaces); 404 otherwise.
     project: String,
     /// Destination workspace. Auto-created if absent.
     to_workspace: String,
@@ -3748,6 +3753,7 @@ async fn true_move_project(
     req: &MoveProjectRequest,
     src_ws: WorkspaceId,
     src_proj: ProjectId,
+    src_workspace_name: &str,
     pre_checkpoint: Option<String>,
     actor: ai_memory_core::ActorContext,
 ) -> Result<MoveProjectReport, MoveErr> {
@@ -3780,7 +3786,7 @@ async fn true_move_project(
     }
 
     let move_ctx = AdmissionContext {
-        workspace: req.from_workspace.clone(),
+        workspace: src_workspace_name.to_string(),
         project: req.project.clone(),
         destination_workspace: Some(req.to_workspace.clone()),
         destination_project: Some(req.project.clone()),
@@ -3833,12 +3839,12 @@ async fn true_move_project(
         &state.wiki,
         format!(
             "move-project {}/{} -> {}/{}",
-            req.from_workspace, req.project, req.to_workspace, req.project
+            src_workspace_name, req.project, req.to_workspace, req.project
         ),
     );
 
     let report = MoveProjectReport {
-        from: format!("{}/{}", req.from_workspace, req.project),
+        from: format!("{}/{}", src_workspace_name, req.project),
         to: format!("{}/{}", req.to_workspace, req.project),
         merged_into_existing: false,
         moved_via: "true-move",
@@ -3987,9 +3993,30 @@ async fn move_project_core(
         ));
     }
 
-    // Resolve the SOURCE without auto-creating — 404 on a typo.
-    let (src_ws, src_proj) =
-        lookup_ws_proj_no_create(state, &req.from_workspace, &req.project).await?;
+    // Resolve the SOURCE without auto-creating. When `from_workspace` is
+    // omitted we fall back to a cross-workspace lookup on the project name
+    // (the same global fallback `purge-project` uses), so an operator can
+    // move a uniquely-named project without spelling out its workspace.
+    let (src_ws, src_proj, src_workspace_name) = if req.from_workspace.is_empty() {
+        let scope = lookup_existing_scope_with_global_fallback(
+            &state.reader,
+            &req.from_workspace,
+            &req.project,
+        )
+        .await
+        .map_err(scope_err)?;
+        let name = state
+            .reader
+            .workspace_name_by_id(scope.workspace_id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| req.from_workspace.clone());
+        (scope.workspace_id, scope.project_id, name)
+    } else {
+        let (ws, proj) = lookup_ws_proj_no_create(state, &req.from_workspace, &req.project).await?;
+        (ws, proj, req.from_workspace.clone())
+    };
 
     // Live-session guard: refuse to move the project the hook router is
     // currently writing to. A live session's next observation/log would carry
@@ -4003,7 +4030,7 @@ async fn move_project_core(
                 "error": format!(
                     "{}/{} is the active session's project; a live move risks stale-cache writes. \
                      Re-run with force=true to proceed.",
-                    req.from_workspace, req.project
+                    src_workspace_name, req.project
                 )
             })),
         ));
@@ -4024,7 +4051,7 @@ async fn move_project_core(
         &state.wiki,
         format!(
             "pre-move-project {}/{} -> {}/{}",
-            req.from_workspace, req.project, req.to_workspace, req.project
+            src_workspace_name, req.project, req.to_workspace, req.project
         ),
     )?;
 
@@ -4037,7 +4064,16 @@ async fn move_project_core(
     // case, where two project_ids can't be re-stamped into one
     // (UNIQUE(workspace_id, name) collision).
     if !merged_into_existing {
-        return true_move_project(state, req, src_ws, src_proj, pre_checkpoint, actor).await;
+        return true_move_project(
+            state,
+            req,
+            src_ws,
+            src_proj,
+            &src_workspace_name,
+            pre_checkpoint,
+            actor,
+        )
+        .await;
     }
 
     // MERGE: the destination already holds a same-named project. Get-or-create
@@ -4050,6 +4086,7 @@ async fn move_project_core(
         req,
         src_ws,
         src_proj,
+        &src_workspace_name,
         dst_ws,
         dst_proj,
         pre_checkpoint,
@@ -4087,11 +4124,13 @@ struct PreparedSourcePage {
 /// its path collides with a different page at the destination. Both
 /// the `Block` pre-check and the copy loop drive off the returned
 /// vector, so each page is read at most once.
+#[allow(clippy::too_many_arguments)]
 async fn prepare_source_pages(
     state: &AdminState,
     req: &MoveProjectRequest,
     src_ws: WorkspaceId,
     src_proj: ProjectId,
+    src_workspace_name: &str,
     dst_ws: WorkspaceId,
     dst_proj: ProjectId,
     summaries: &[ai_memory_store::PageSummary],
@@ -4114,7 +4153,7 @@ async fn prepare_source_pages(
         };
         let tier: Tier = s.tier.parse().unwrap_or(Tier::Semantic);
         let pinned = matches!(
-            state.reader.page_meta(&req.from_workspace, &req.project, &s.path).await,
+            state.reader.page_meta(src_workspace_name, &req.project, &s.path).await,
             Ok(Some(ref m)) if m.pinned
         );
         let md = state.wiki.read_page(src_ws, src_proj, &path).ok();
@@ -4163,6 +4202,7 @@ async fn copy_purge_merge(
     req: &MoveProjectRequest,
     src_ws: WorkspaceId,
     src_proj: ProjectId,
+    src_workspace_name: &str,
     dst_ws: WorkspaceId,
     dst_proj: ProjectId,
     pre_checkpoint: Option<String>,
@@ -4171,7 +4211,7 @@ async fn copy_purge_merge(
     // Enumerate the source's latest pages (authoritative on is_latest).
     let summaries = match state
         .reader
-        .list_pages(&req.from_workspace, &req.project)
+        .list_pages(src_workspace_name, &req.project)
         .await
     {
         Ok(s) => s,
@@ -4181,8 +4221,17 @@ async fn copy_purge_merge(
     // Single pass over the source: load each page's metadata + body
     // AND classify the destination conflict, so the block pre-check
     // and the copy loop don't re-query the same rows.
-    let prepared =
-        prepare_source_pages(state, req, src_ws, src_proj, dst_ws, dst_proj, &summaries).await;
+    let prepared = prepare_source_pages(
+        state,
+        req,
+        src_ws,
+        src_proj,
+        src_workspace_name,
+        dst_ws,
+        dst_proj,
+        &summaries,
+    )
+    .await;
 
     // Under the default `block` policy, abort the WHOLE move now —
     // before anything is copied — so the source stays intact and the
@@ -4277,7 +4326,7 @@ async fn copy_purge_merge(
                         dst_ws,
                         dst_proj,
                         &p.path_str,
-                        &req.from_workspace,
+                        src_workspace_name,
                         &used_dest_paths,
                     )
                     .await;
@@ -4304,7 +4353,7 @@ async fn copy_purge_merge(
                 dst_ws,
                 dst_proj,
                 &p.path_str,
-                &req.from_workspace,
+                src_workspace_name,
                 &used_dest_paths,
             )
             .await;
@@ -4376,11 +4425,11 @@ async fn copy_purge_merge(
             &state.wiki,
             format!(
                 "move-project-partial {}/{} -> {}/{}",
-                req.from_workspace, req.project, req.to_workspace, req.project
+                src_workspace_name, req.project, req.to_workspace, req.project
             ),
         );
         let report = MoveProjectReport {
-            from: format!("{}/{}", req.from_workspace, req.project),
+            from: format!("{}/{}", src_workspace_name, req.project),
             to: format!("{}/{}", req.to_workspace, req.project),
             // copy_purge_merge is only reached from the merge branch
             // of handle_move_project; the destination project pre-existed.
@@ -4409,9 +4458,9 @@ async fn copy_purge_merge(
     // source is intact (mirrors `handle_purge_project`'s ordering). The
     // previous version called `Wiki::purge_project` AFTER `writer.purge_project`,
     // which ran admit AFTER the rows were gone — reject came too late.
-    let label = format!("{}/{}", req.from_workspace, req.project);
+    let label = format!("{}/{}", src_workspace_name, req.project);
     let purge_ctx = AdmissionContext {
-        workspace: req.from_workspace.clone(),
+        workspace: src_workspace_name.to_string(),
         project: req.project.clone(),
         op: AdmissionOp::PurgeProject,
         actor,
@@ -4480,7 +4529,7 @@ async fn copy_purge_merge(
         &state.wiki,
         format!(
             "move-project {}/{} -> {}/{}",
-            req.from_workspace, req.project, req.to_workspace, req.project
+            src_workspace_name, req.project, req.to_workspace, req.project
         ),
     );
 

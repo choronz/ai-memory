@@ -452,16 +452,23 @@ pub struct DeleteWorkspaceArgs {
 /// Arguments for `move-project`.
 #[derive(Debug, Args)]
 pub struct MoveProjectArgs {
-    /// Source workspace. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub from_workspace: String,
+    /// Source workspace. When omitted, the server resolves the source by a
+    /// cross-workspace lookup on `--project` (the same global fallback
+    /// `purge-project` uses), so a uniquely-named project can be moved without
+    /// spelling out the workspace it lives in.
+    #[arg(long)]
+    pub from_workspace: Option<String>,
     /// Project name to move. When omitted, auto-derived from the basename
     /// of the current git repo root (or CWD if no git repo).
     #[arg(long)]
     pub project: Option<String>,
     /// Destination workspace. Auto-created if it doesn't exist.
     #[arg(long)]
-    pub to_workspace: String,
+    pub to_workspace: Option<String>,
+    /// Convenience alias for `--to-workspace`: change the current project's
+    /// workspace to `new_workspace`.
+    #[arg(long, visible_alias = "workspace", conflicts_with = "to_workspace")]
+    pub new_workspace: Option<String>,
     /// REQUIRED — the move re-stamps (true-move) or copies+purges (merge) the
     /// source, both irreversible. Without this flag the CLI errors out.
     #[arg(long)]

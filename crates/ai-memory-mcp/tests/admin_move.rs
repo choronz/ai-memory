@@ -339,6 +339,72 @@ async fn move_project_404_on_unknown_source() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+/// Omitting `from_workspace` resolves the source by a cross-workspace lookup
+/// on the project name (the same global fallback `purge-project` uses), so a
+/// uniquely-named project can be moved without spelling out the workspace it
+/// lives in. Regression guard for the `proxy`-workspace confusion where the
+/// caller's CWD marker did not match the project's actual workspace.
+#[tokio::test]
+async fn move_project_resolves_source_without_from_workspace() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    // Seed the project in a workspace the caller would NOT guess from CWD.
+    seed_page(
+        &store,
+        &state.wiki,
+        "actual",
+        "proj",
+        "notes/a.md",
+        "body a",
+    )
+    .await;
+
+    let resp = post(
+        state,
+        "/admin/move-project",
+        json!({ "project": "proj", "to_workspace": "dst", "confirm": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = body_json(resp).await;
+    assert_eq!(body["moved_via"], "true-move");
+    assert_eq!(body["from"], "actual/proj");
+    assert_eq!(body["to"], "dst/proj");
+
+    // Source gone from `actual`, present under `dst`.
+    let actual_ws = store
+        .reader
+        .find_workspace("actual".to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        store
+            .reader
+            .find_project(actual_ws, "proj".to_string())
+            .await
+            .unwrap()
+            .is_none(),
+        "source project must be gone from its original workspace"
+    );
+    let dst_ws = store
+        .reader
+        .find_workspace("dst".to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        store
+            .reader
+            .find_project(dst_ws, "proj".to_string())
+            .await
+            .unwrap()
+            .is_some(),
+        "project must now resolve under the destination workspace"
+    );
+}
+
 /// Moving into a workspace that already has a same-named project MERGES:
 /// the destination ends up with both the pre-existing and the moved pages.
 #[tokio::test]
