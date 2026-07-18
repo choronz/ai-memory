@@ -1148,6 +1148,12 @@ enable `embedding_backfill_interval_secs` after configuring an embedder,
 each scheduled tick backfills every existing workspace/project and may
 increase provider usage accordingly.
 
+Forget sweep and rule-based lint persist their last successful completion. On
+restart, a job that is not due waits only its remaining interval; a never-run
+or overdue job runs once after a bounded startup delay. Failed runs are not
+recorded as successful and retry after that bounded delay. Embedding backfill
+remains opt-in and keeps its interval-only behavior (no startup catch-up).
+
 ---
 
 ## Bootstrap mid-project {#bootstrap-mid-project}

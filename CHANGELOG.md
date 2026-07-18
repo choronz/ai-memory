@@ -24,6 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   via MCP `memory_handoff_accept`.
 
 ### Changed
+- Scheduled forget sweep and rule-based lint now persist their last successful
+  completion across restarts. Overdue or never-run jobs perform one bounded
+  startup catch-up, while not-due jobs wait only their remaining interval;
+  failures retry without advancing cadence. Embedding backfill remains opt-in
+  and does not gain startup catch-up behavior ([#192]).
 - `init`-generated token peppers no longer make operational `/admin/*` routes
   root-only before the first user is created. Admin mode now switches
   immediately and fail-closed from a store-backed user-row check; expired users

@@ -16,6 +16,7 @@ mod auto_improve;
 pub mod decay;
 mod error;
 mod fts_query;
+mod maintenance;
 mod migrations;
 mod ops;
 mod reader;
@@ -34,6 +35,7 @@ pub use auto_improve::{
 };
 pub use decay::{DecayParams, retention_score};
 pub use error::{StoreError, StoreResult};
+pub use maintenance::MaintenanceJob;
 pub use ops::{DeleteWorkspaceSummary, EmbeddingWrite, MoveSummary, PurgeSummary, ReorgSummary};
 pub use reader::{
     ActivityWindow, AutoImproveCandidateSession, BriefPageBody, BriefingPage, BriefingSnapshot,
@@ -210,6 +212,45 @@ mod tests {
             hash.try_into().unwrap(),
             updated,
         )
+    }
+
+    #[tokio::test]
+    async fn maintenance_scheduler_state_round_trips_per_job() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let store = Store::open(tmp.path()).unwrap();
+            assert_eq!(
+                store
+                    .reader
+                    .maintenance_job_last_success(MaintenanceJob::ForgetSweep)
+                    .await
+                    .unwrap(),
+                None
+            );
+
+            store
+                .writer
+                .record_maintenance_job_success(MaintenanceJob::ForgetSweep)
+                .await
+                .unwrap();
+        }
+        let store = Store::open(tmp.path()).unwrap();
+        assert!(
+            store
+                .reader
+                .maintenance_job_last_success(MaintenanceJob::ForgetSweep)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            store
+                .reader
+                .maintenance_job_last_success(MaintenanceJob::RuleLint)
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     fn telemetry_count(rows: &[AutoImproveTelemetryCount], key: &str) -> usize {

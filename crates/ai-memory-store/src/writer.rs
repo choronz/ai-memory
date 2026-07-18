@@ -254,6 +254,10 @@ pub(crate) enum WriteCmd {
         ended_at: i64,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
+    RecordMaintenanceJobSuccess {
+        job: crate::maintenance::MaintenanceJob,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     Shutdown,
 }
 
@@ -1013,6 +1017,17 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Persist a global maintenance job's successful completion time.
+    pub async fn record_maintenance_job_success(
+        &self,
+        job: crate::maintenance::MaintenanceJob,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecordMaintenanceJobSuccess { job, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     async fn send(&self, cmd: WriteCmd) -> StoreResult<()> {
         self.inner
             .tx
@@ -1363,6 +1378,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     ended_at,
                 );
                 send_or_warn(reply, result, "claim_auto_improve_scheduler_session");
+            }
+            WriteCmd::RecordMaintenanceJobSuccess { job, reply } => {
+                let result = crate::maintenance::record_success(&conn, job);
+                send_or_warn(reply, result, "record_maintenance_job_success");
             }
         }
     }

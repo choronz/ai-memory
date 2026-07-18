@@ -535,9 +535,13 @@ impl Default for AutoImproveSettings {
 pub struct MaintenanceSettings {
     /// Master switch for scheduled jobs.
     pub enabled: bool,
-    /// Interval for the retention forget sweep. `0` disables this job.
+    /// Interval for the retention forget sweep. `0` disables this job. Successful
+    /// runs persist cadence across restarts; overdue work starts after a bounded
+    /// startup delay.
     pub forget_sweep_interval_secs: u64,
-    /// Interval for rule-based wiki lint. `0` disables this job.
+    /// Interval for rule-based wiki lint. `0` disables this job. Successful runs
+    /// persist cadence across restarts; overdue work starts after a bounded
+    /// startup delay.
     pub lint_interval_secs: u64,
     /// Interval for embedding backfill. `0` disables this job.
     /// Defaults to off because it may call a paid provider.

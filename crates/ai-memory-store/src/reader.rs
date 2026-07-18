@@ -32,6 +32,7 @@ use crate::auto_improve::{
 };
 use crate::error::{StoreError, StoreResult};
 use crate::fts_query::prepare_fts5_query;
+use crate::maintenance::MaintenanceJob;
 use crate::users::TOKEN_HASH_LEN;
 
 /// One hit returned by [`ReaderPool::search_pages`].
@@ -4336,6 +4337,15 @@ impl ReaderPool {
     /// Propagates any SQL or pool error so callers can fail closed.
     pub async fn users_exist(&self) -> StoreResult<bool> {
         self.with_conn(crate::users::users_exist).await
+    }
+
+    /// Return the last successful global maintenance completion for `job`.
+    pub async fn maintenance_job_last_success(
+        &self,
+        job: MaintenanceJob,
+    ) -> StoreResult<Option<i64>> {
+        self.with_conn(move |conn| crate::maintenance::last_success(conn, job))
+            .await
     }
 }
 
