@@ -105,6 +105,7 @@ async fn main() -> Result<()> {
         Command::Reorg(args) => commands::reorg::run(&config, args).await,
         Command::PurgeProject(args) => commands::purge_project::run(&config, args).await,
         Command::PurgeSession(args) => commands::purge_session::run(&config, args).await,
+        Command::PurgeSessions(args) => commands::purge_sessions::run(&config, args).await,
         Command::RenameProject(args) => commands::rename_project::run(&config, args).await,
         Command::RenameWorkspace(args) => commands::rename_workspace::run(&config, args).await,
         Command::DeleteWorkspace(args) => commands::delete_workspace::run(&config, args).await,

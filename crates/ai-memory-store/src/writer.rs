@@ -23,8 +23,8 @@ use crate::auto_improve::{
 };
 use crate::error::{StoreError, StoreResult};
 use crate::ops::{
-    self, DeleteWorkspaceSummary, EmbeddingWrite, MoveSummary, PurgeSessionSummary, PurgeSummary,
-    ReorgSummary,
+    self, DeleteWorkspaceSummary, EmbeddingWrite, MoveSummary, PurgeSessionSummary,
+    PurgeSessionsSummary, PurgeSummary, ReorgSummary,
 };
 use crate::users::{self, TOKEN_HASH_LEN};
 
@@ -175,6 +175,18 @@ pub(crate) enum WriteCmd {
         /// single-user / unauthenticated).
         author_id: Option<ai_memory_core::UserId>,
         reply: oneshot::Sender<StoreResult<PurgeSessionSummary>>,
+    },
+    /// Delete all sessions in a project and their owned data (observations,
+    /// summary pages, handoffs). Returns a summary with deletion counts.
+    PurgeSessions {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        /// Human-readable `workspace/project` label forwarded into the summary.
+        label: String,
+        /// Authenticated operator recorded in the `audit_log` row (NULL when
+        /// single-user / unauthenticated).
+        author_id: Option<ai_memory_core::UserId>,
+        reply: oneshot::Sender<StoreResult<PurgeSessionsSummary>>,
     },
     /// Delete a workspace row (its `workspace_id` FKs cascade projects/pages/
     /// sessions/…). Refused when non-empty unless `force`.
@@ -702,6 +714,31 @@ impl WriterHandle {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::PurgeSession {
             session_id,
+            label: label.into(),
+            author_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Delete all sessions in a project and their owned data (observations,
+    /// summary pages, handoffs). See [`crate::ops::purge_sessions`] for details.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when the project does not exist;
+    /// [`StoreError::WriterClosed`] if the actor has shut down.
+    pub async fn purge_sessions(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        label: impl Into<String>,
+        author_id: Option<ai_memory_core::UserId>,
+    ) -> StoreResult<PurgeSessionsSummary> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::PurgeSessions {
+            workspace_id,
+            project_id,
             label: label.into(),
             author_id,
             reply: tx,
@@ -1284,6 +1321,17 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             } => {
                 let result = ops::purge_session(&mut conn, &session_id, &label, author_id);
                 send_or_warn(reply, result, "purge_session");
+            }
+            WriteCmd::PurgeSessions {
+                workspace_id,
+                project_id,
+                label,
+                author_id,
+                reply,
+            } => {
+                let result =
+                    ops::purge_sessions(&mut conn, &workspace_id, &project_id, &label, author_id);
+                send_or_warn(reply, result, "purge_sessions");
             }
             WriteCmd::DeleteWorkspace {
                 workspace_id,

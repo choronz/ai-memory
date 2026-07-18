@@ -134,6 +134,10 @@ pub enum Command {
     /// authored). This is irreversible — requires `--confirm`. The session
     /// id pins its own workspace/project scope, so no scope args are needed.
     PurgeSession(PurgeSessionArgs),
+    /// Permanently delete ALL sessions in a project and their data
+    /// (observations, summary pages, handoffs). This is irreversible —
+    /// requires `--confirm`. Named pages are left intact.
+    PurgeSessions(PurgeSessionsArgs),
     /// Rename a project within its workspace. No files move on disk —
     /// the wiki is flat and pages are differentiated by project_id only.
     /// Useful after renaming the project's directory on disk so the hook
@@ -400,6 +404,22 @@ pub struct PurgeSessionArgs {
     /// scope, so no workspace/project args are required.
     #[arg(long)]
     pub id: String,
+}
+
+/// Arguments for `purge-sessions`.
+#[derive(Debug, Args)]
+pub struct PurgeSessionsArgs {
+    /// Workspace name. Defaults to `default`.
+    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
+    pub workspace: String,
+    /// Project name. When omitted, auto-derived from the basename of
+    /// the current git repo root (or CWD if no git repo).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// REQUIRED for the purge to run. Without this flag the CLI errors
+    /// out — purging is destructive and irreversible.
+    #[arg(long)]
+    pub confirm: bool,
 }
 
 /// Arguments for `rename-project`.

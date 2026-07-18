@@ -1744,6 +1744,163 @@ pub fn delete_workspace(
     })
 }
 
+/// Summary returned by [`purge_sessions`] and exposed via
+/// [`crate::writer::WriterHandle::purge_sessions`].
+#[derive(Debug, Default, Clone)]
+pub struct PurgeSessionsSummary {
+    /// Human-readable `workspace/project` label.
+    pub label: String,
+    /// Number of `sessions` rows deleted.
+    pub sessions_deleted: u64,
+    /// Number of `observations` rows deleted.
+    pub observations_deleted: u64,
+    /// Number of `handoffs` rows deleted.
+    pub handoffs_deleted: u64,
+    /// Number of `pages` rows deleted (session summary pages only).
+    pub pages_deleted: u64,
+    /// Number of `page_embeddings` rows deleted (cascades through pages).
+    pub embeddings_deleted: u64,
+    /// Session ids that were purged (for file cleanup).
+    pub session_ids: Vec<SessionId>,
+    /// Whether the purge left the project empty and reaped its `projects` row.
+    pub project_deleted: bool,
+    /// Whether the project reap left the workspace empty and reaped its row.
+    pub workspace_deleted: bool,
+}
+
+/// Delete ALL sessions in a project and their owned data (observations,
+/// summary pages, handoffs). Named pages are left intact.
+///
+/// Executes in one transaction for atomicity. Session summary pages are
+/// deleted along with their embeddings; other pages (named wiki files)
+/// survive unchanged.
+///
+/// # Errors
+/// Returns [`StoreError::NotFound`] when the project does not exist.
+pub fn purge_sessions(
+    conn: &mut Connection,
+    workspace_id: &WorkspaceId,
+    project_id: &ProjectId,
+    workspace_project_label: &str,
+    author_id: Option<ai_memory_core::UserId>,
+) -> StoreResult<PurgeSessionsSummary> {
+    let tx = conn.transaction()?;
+    let pid = project_id.as_bytes();
+
+    // Collect all session ids in this project for file cleanup.
+    let session_ids: Vec<SessionId> = tx
+        .prepare("SELECT id FROM sessions WHERE project_id = ?1")?
+        .query_map(rusqlite::params![&pid[..]], |row| {
+            Ok(SessionId::from_slice(&row.get::<_, Vec<u8>>(0)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let sessions_deleted = session_ids.len() as u64;
+
+    let count = |sql: &str| -> StoreResult<u64> {
+        let n: Option<i64> = tx
+            .query_row(sql, rusqlite::params![&pid[..]], |row| row.get(0))
+            .optional()?;
+        Ok(u64::try_from(n.unwrap_or(0)).unwrap_or(0))
+    };
+
+    // Capture counts before deleting.
+    let observations_deleted = count("SELECT COUNT(*) FROM observations WHERE project_id = ?1")?;
+    let handoffs_deleted = count("SELECT COUNT(*) FROM handoffs WHERE project_id = ?1")?;
+
+    // Summary pages for these sessions.
+    let pages_deleted =
+        count("SELECT COUNT(*) FROM pages WHERE project_id = ?1 AND path LIKE 'sessions/%'")?;
+    let embeddings_deleted = count(
+        "SELECT COUNT(*) FROM page_embeddings WHERE page_id IN \
+         (SELECT id FROM pages WHERE project_id = ?1 AND path LIKE 'sessions/%')",
+    )?;
+
+    // Delete all handoffs authored by sessions in this project.
+    tx.execute(
+        "DELETE FROM handoffs WHERE project_id = ?1",
+        rusqlite::params![&pid[..]],
+    )?;
+
+    // Delete summary pages (they cascade embeddings). Use LIKE to only hit session pages.
+    tx.execute(
+        "DELETE FROM pages WHERE project_id = ?1 AND path LIKE 'sessions/%'",
+        rusqlite::params![&pid[..]],
+    )?;
+
+    // Delete all sessions (observations cascade).
+    tx.execute(
+        "DELETE FROM sessions WHERE project_id = ?1",
+        rusqlite::params![&pid[..]],
+    )?;
+
+    audit(
+        &tx,
+        "purge_sessions",
+        Some(workspace_id.as_bytes()),
+        Some(project_id.as_bytes()),
+        None,
+        author_id.as_ref().map(ai_memory_core::UserId::as_bytes),
+        Timestamp::now().as_microsecond(),
+    )?;
+
+    // Reap an orphaned project if it now has no sessions, observations, handoffs, or pages.
+    let project_remaining = count(
+        "SELECT COUNT(*) FROM (
+            SELECT 1 FROM sessions WHERE project_id = ?1
+            UNION ALL SELECT 1 FROM observations WHERE project_id = ?1
+            UNION ALL SELECT 1 FROM handoffs WHERE project_id = ?1
+            UNION ALL SELECT 1 FROM pages WHERE project_id = ?1
+        )",
+    )?;
+    let ws_bytes = workspace_id.as_bytes();
+    let project_deleted = if project_remaining == 0 {
+        tx.execute("DELETE FROM projects WHERE id = ?1", params![&pid[..]])?;
+        true
+    } else {
+        false
+    };
+
+    // Reap an orphaned workspace if the project was reaped and no other projects remain.
+    let workspace_deleted = if project_deleted {
+        let ws_projects: u64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE workspace_id = ?1",
+                params![&ws_bytes[..]],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        if ws_projects == 0 {
+            tx.execute(
+                "DELETE FROM workspaces WHERE id = ?1",
+                params![&ws_bytes[..]],
+            )?;
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    tx.commit()?;
+    Ok(PurgeSessionsSummary {
+        label: workspace_project_label.to_string(),
+        sessions_deleted,
+        observations_deleted,
+        handoffs_deleted,
+        pages_deleted,
+        embeddings_deleted,
+        session_ids,
+        project_deleted,
+        workspace_deleted,
+    })
+}
+
 /// Rename a workspace: a `workspaces.name` UPDATE only — the on-disk dir is
 /// keyed by UUID, so nothing moves. Mirrors [`rename_project`].
 ///

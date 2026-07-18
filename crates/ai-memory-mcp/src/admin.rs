@@ -18,6 +18,7 @@
 //! - `GET  /admin/checkpoints`    — list recent wiki git checkpoints.
 //! - `POST /admin/restore-page`   — restore one page from a checkpoint.
 //! - `POST /admin/purge-project`  — delete a project and all its data.
+//! - `POST /admin/purge-sessions` — delete all sessions in a project.
 //! - `POST /admin/rename-project` — rename a project (column-only; no files move).
 //! - `POST /admin/rename-workspace` — rename a workspace and refresh scope manifests.
 //! - `POST /admin/delete-workspace` — delete a workspace and all of its projects.
@@ -545,6 +546,7 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/admin/restore-page", post(handle_restore_page))
         .route("/admin/purge-project", post(handle_purge_project))
         .route("/admin/purge-session", post(handle_purge_session))
+        .route("/admin/purge-sessions", post(handle_purge_sessions))
         .route("/admin/rename-project", post(handle_rename_project))
         .route("/admin/move-project", post(handle_move_project))
         .route("/admin/delete-workspace", post(handle_delete_workspace))
@@ -3275,6 +3277,214 @@ async fn handle_purge_session(
         } else {
             Some(dirs_failed)
         },
+        pre_checkpoint,
+        checkpoint,
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+    )
+}
+
+/// JSON request body for `POST /admin/purge-sessions`.
+#[derive(Deserialize)]
+struct PurgeSessionsRequest {
+    /// Workspace name. Defaults to `default`.
+    workspace: String,
+    /// Project name.
+    project: String,
+    /// REQUIRED for the purge to run. Without this flag the call returns 400.
+    confirm: bool,
+}
+
+/// Wire-format summary returned by `POST /admin/purge-sessions`.
+#[derive(Debug, Serialize)]
+pub struct PurgeSessionsReport {
+    /// Human-readable `workspace/project` label.
+    pub label: String,
+    /// Number of `sessions` rows deleted.
+    pub sessions_deleted: u64,
+    /// Number of `observations` rows deleted.
+    pub observations_deleted: u64,
+    /// Number of `handoffs` rows deleted.
+    pub handoffs_deleted: u64,
+    /// Number of `pages` rows deleted (session summary pages only).
+    pub pages_deleted: u64,
+    /// Number of `page_embeddings` rows deleted.
+    pub embeddings_deleted: u64,
+    /// Session summary page file paths that were removed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub files_deleted: Vec<String>,
+    /// Session summary page file paths that could not be removed (non-fatal).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub files_failed: Vec<String>,
+    /// Whether the project was reaped (no remaining data).
+    pub project_deleted: bool,
+    /// Whether the workspace was reaped (no remaining projects).
+    pub workspace_deleted: bool,
+    /// Pre-purge checkpoint, if the tree had uncommitted changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_checkpoint: Option<String>,
+    /// Post-purge checkpoint, if the purge changed the tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+}
+
+async fn handle_purge_sessions(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
+    Json(req): Json<PurgeSessionsRequest>,
+) -> impl IntoResponse {
+    let author_id = author_ext.map(|axum::Extension(u)| u);
+
+    if !req.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "destructive operation requires confirm=true"
+            })),
+        );
+    }
+
+    // Look up workspace and project IDs without auto-creating.
+    let (ws_id, proj_id) = match lookup_existing_scope_with_global_fallback(
+        &state.reader,
+        &req.workspace,
+        &req.project,
+    )
+    .await
+    {
+        Ok(scope) => scope.as_tuple(),
+        Err(e) => return scope_err(e),
+    };
+
+    // Derive the real workspace name for the label and admission context.
+    let resolved_workspace = state
+        .reader
+        .workspace_name_by_id(ws_id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| req.workspace.clone());
+    let label = format!("{}/{}", resolved_workspace, req.project);
+
+    // Admission must run before any destructive work.
+    let actor = actor_ext
+        .map(|axum::Extension(a)| a)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    let purge_ctx = AdmissionContext {
+        workspace: resolved_workspace.clone(),
+        project: req.project.clone(),
+        op: AdmissionOp::PurgeProject,
+        actor,
+        ..Default::default()
+    };
+    let resolved_purge_ctx = match state
+        .wiki
+        .admit_purge_project(ws_id, proj_id, Some(purge_ctx))
+        .await
+    {
+        Ok(ctx) => ctx,
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    let pre_checkpoint = match checkpoint_or_500(&state.wiki, format!("pre-purge-sessions {label}"))
+    {
+        Ok(oid) => oid,
+        Err(e) => return e,
+    };
+
+    let summary = match state
+        .writer
+        .purge_sessions(ws_id, proj_id, &label, author_id)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    // Remove session summary page files from disk.
+    let mut files_deleted: Vec<String> = Vec::new();
+    let mut files_failed: Vec<String> = Vec::new();
+    for session_id in &summary.session_ids {
+        let session_path = ai_memory_core::PagePath::new(format!("sessions/{session_id}.md"))
+            .expect("sessions/<uuid>.md is a valid page path");
+        match state
+            .wiki
+            .delete_page(
+                ws_id,
+                proj_id,
+                &session_path,
+                resolved_purge_ctx.clone(),
+                author_id,
+            )
+            .await
+        {
+            Ok(()) => files_deleted.push(session_path.as_str().to_string()),
+            Err(e) => {
+                warn!(
+                    path = %session_path.as_str(),
+                    error = %e,
+                    "purge-sessions: failed to remove session summary page file"
+                );
+                files_failed.push(session_path.as_str().to_string());
+            }
+        }
+    }
+
+    state.active_project.clear_project(proj_id);
+    invalidate_scope_cache(&state, ScopeInvalidation::Project(proj_id)).await;
+
+    // Remove orphaned on-disk directories if we reaped the project/workspace.
+    let mut dirs_deleted: Vec<String> = Vec::new();
+    let mut dirs_failed: Vec<String> = Vec::new();
+    if summary.project_deleted {
+        let proj_root_str = state
+            .wiki
+            .project_root(ws_id, proj_id)
+            .display()
+            .to_string();
+        match state.wiki.remove_project_dir(ws_id, proj_id).await {
+            Ok(()) => dirs_deleted.push(proj_root_str),
+            Err(e) => {
+                warn!(path = %proj_root_str, error = %e, "purge-sessions: failed to remove orphaned project dir");
+                dirs_failed.push(proj_root_str);
+            }
+        }
+    }
+    if summary.workspace_deleted {
+        let ws_root_str = state
+            .wiki
+            .root()
+            .join(ws_id.to_string())
+            .display()
+            .to_string();
+        match state.wiki.remove_workspace_dir(ws_id).await {
+            Ok(()) => dirs_deleted.push(ws_root_str),
+            Err(e) => {
+                warn!(path = %ws_root_str, error = %e, "purge-sessions: failed to remove orphaned workspace dir");
+                dirs_failed.push(ws_root_str);
+            }
+        }
+        state.active_project.clear_workspace(ws_id);
+        invalidate_scope_cache(&state, ScopeInvalidation::Workspace(ws_id)).await;
+    }
+
+    let checkpoint = checkpoint_or_warn(&state.wiki, format!("purge-sessions {label}"));
+
+    let report = PurgeSessionsReport {
+        label: summary.label,
+        sessions_deleted: summary.sessions_deleted,
+        observations_deleted: summary.observations_deleted,
+        handoffs_deleted: summary.handoffs_deleted,
+        pages_deleted: summary.pages_deleted,
+        embeddings_deleted: summary.embeddings_deleted,
+        files_deleted,
+        files_failed,
+        project_deleted: summary.project_deleted,
+        workspace_deleted: summary.workspace_deleted,
         pre_checkpoint,
         checkpoint,
     };
