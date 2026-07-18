@@ -35,6 +35,7 @@ pub mod factory;
 pub mod gemini;
 pub mod google;
 pub mod health;
+pub mod key_pool;
 pub mod oidc;
 pub mod openai;
 pub mod openai_compat;

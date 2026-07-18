@@ -17,9 +17,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::debug;
 
 use crate::error::{LlmError, LlmResult};
+use crate::key_pool::KeyPool;
 use crate::openai::normalize_openai_base;
 use crate::response::{provider_error_body, response_json_limited, response_text_limited};
 use crate::text::{truncate_for_embedding, truncate_with_ellipsis};
@@ -62,7 +64,12 @@ pub trait Embedder: Send + Sync {
 /// OpenAI Embeddings API (`text-embedding-3-small` by default, 1536 dim).
 pub struct OpenAiEmbedder {
     client: reqwest::Client,
-    api_key: SecretString,
+    api_keys: Vec<SecretString>,
+    /// Shared cursor so concurrent requests spread their starting key
+    /// instead of stampeding a single key (cross-request round-robin).
+    next_key: AtomicUsize,
+    /// Per-key 429 blacklist with round-robin rotation.
+    key_pool: KeyPool,
     base_url: String,
     model: String,
     dim: u32,
@@ -75,6 +82,19 @@ impl OpenAiEmbedder {
     /// Propagates any `reqwest::Error` thrown while building the HTTP
     /// client.
     pub fn new(api_key: SecretString, model: impl Into<String>, dim: u32) -> LlmResult<Self> {
+        Self::new_with_keys(vec![api_key], model, dim)
+    }
+
+    /// Construct an embedder with multiple API keys for rotation.
+    ///
+    /// # Errors
+    /// Propagates any `reqwest::Error` thrown while building the HTTP
+    /// client.
+    pub fn new_with_keys(
+        api_keys: Vec<SecretString>,
+        model: impl Into<String>,
+        dim: u32,
+    ) -> LlmResult<Self> {
         // 120s tolerates a cold-load of the embedding model on Ollama
         // (small model, but still up to ~30s on first request after
         // unload). Subsequent requests with OLLAMA_KEEP_ALIVE warm are
@@ -83,9 +103,12 @@ impl OpenAiEmbedder {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
             .build()?;
+        let key_pool = KeyPool::new(api_keys.len());
         Ok(Self {
             client,
-            api_key,
+            api_keys,
+            next_key: AtomicUsize::new(0),
+            key_pool,
             base_url: "https://api.openai.com".into(),
             model: model.into(),
             dim,
@@ -97,6 +120,15 @@ impl OpenAiEmbedder {
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
         self
+    }
+
+    /// Override the per-key 429 blacklist cooldown (seconds).
+    #[must_use]
+    pub fn with_cooldown_secs(self, secs: u64) -> Self {
+        Self {
+            key_pool: KeyPool::with_cooldown(self.api_keys.len(), Duration::from_secs(secs)),
+            ..self
+        }
     }
 }
 
@@ -211,19 +243,88 @@ impl Embedder for OpenAiEmbedder {
             input: &input,
             model: &self.model,
         };
+        let len = self.api_keys.len();
+        let max_attempts = (len + 1) as u32;
         let mut attempt = 0u32;
+        let start = if len == 0 {
+            0
+        } else {
+            self.next_key.fetch_add(1, Ordering::Relaxed) % len
+        };
+        let mut key_idx = self.key_pool.next_usable(start).unwrap_or(start);
+
         loop {
-            let resp = self
+            let api_key = self.api_keys.get(key_idx).cloned();
+            let Some(api_key) = api_key else {
+                return Err(LlmError::Provider {
+                    status: 500,
+                    body: "no api keys configured".into(),
+                });
+            };
+
+            let send_result = self
                 .client
                 .post(&url)
-                .bearer_auth(self.api_key.expose_secret())
+                .bearer_auth(api_key.expose_secret())
                 .json(&req)
                 .send()
-                .await?;
+                .await;
+
+            let resp = match send_result {
+                Ok(r) => r,
+                Err(e) => {
+                    // Transport-level failure: fail over to the next key.
+                    if attempt < max_attempts.saturating_sub(1) {
+                        attempt += 1;
+                        let next = key_idx.wrapping_add(1) % len;
+                        key_idx = match self.key_pool.next_usable(next) {
+                            Some(idx) => idx,
+                            None => {
+                                let wait = self
+                                    .key_pool
+                                    .earliest_expiry()
+                                    .min(KeyPool::retry_delay(attempt, start));
+                                tokio::time::sleep(wait).await;
+                                self.key_pool.next_usable(start).unwrap_or(start)
+                            }
+                        };
+                        debug!(
+                            attempt,
+                            key_index = key_idx,
+                            ?e,
+                            "openai embedding transport error, failing over"
+                        );
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        continue;
+                    }
+                    return Err(LlmError::from(e));
+                }
+            };
+
             let status = resp.status();
-            if status.as_u16() == 429 && attempt < 5 {
+            let is_retryable =
+                status.as_u16() == 429 || (status.as_u16() >= 500 && status.as_u16() < 600);
+            if is_retryable && attempt < max_attempts.saturating_sub(1) {
                 attempt += 1;
-                let delay = Duration::from_secs(2u64.saturating_pow(attempt));
+                if status.as_u16() == 429 {
+                    self.key_pool.blacklist(key_idx, "openai-embed");
+                    let next = key_idx.wrapping_add(1) % len;
+                    key_idx = match self.key_pool.next_usable(next) {
+                        Some(idx) => idx,
+                        None => {
+                            let wait = self
+                                .key_pool
+                                .earliest_expiry()
+                                .min(KeyPool::retry_delay(attempt, start));
+                            tokio::time::sleep(wait).await;
+                            self.key_pool.next_usable(start).unwrap_or(start)
+                        }
+                    };
+                } else {
+                    // 5xx is transient — reuse the same key.
+                }
+                let delay = KeyPool::retry_after_from_response(&resp)
+                    .unwrap_or_else(|| KeyPool::retry_delay(attempt, start));
                 debug!(attempt, ?delay, "openai embeddings rate-limited; retrying");
                 tokio::time::sleep(delay).await;
                 continue;

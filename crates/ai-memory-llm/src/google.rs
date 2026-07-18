@@ -12,6 +12,7 @@ use tracing::debug;
 
 use crate::embedding::{Embedder, normalise};
 use crate::error::{LlmError, LlmResult};
+use crate::key_pool::KeyPool;
 use crate::response::{provider_error_body, response_json_limited};
 
 /// Default Gemini API host.
@@ -27,6 +28,8 @@ pub struct GoogleEmbedder {
     /// Shared cursor so concurrent requests spread their starting key
     /// instead of stampeding a single key (cross-request round-robin).
     next_key: AtomicUsize,
+    /// Per-key 429 blacklist with round-robin rotation.
+    key_pool: KeyPool,
     base_url: String,
     /// Wire model id, e.g. `models/gemini-embedding-001`.
     model: String,
@@ -58,10 +61,12 @@ impl GoogleEmbedder {
             .build()?;
         let model = normalize_model_id(model.into());
         let embedding_v2 = model.contains("embedding-2");
+        let key_pool = KeyPool::new(api_keys.len());
         Ok(Self {
             client,
             api_keys,
             next_key: AtomicUsize::new(0),
+            key_pool,
             base_url: DEFAULT_BASE_URL.into(),
             model,
             dim,
@@ -74,6 +79,15 @@ impl GoogleEmbedder {
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
         self
+    }
+
+    /// Override the per-key 429 blacklist cooldown (seconds).
+    #[must_use]
+    pub fn with_cooldown_secs(self, secs: u64) -> Self {
+        Self {
+            key_pool: KeyPool::with_cooldown(self.api_keys.len(), Duration::from_secs(secs)),
+            ..self
+        }
     }
 
     async fn embed_with_task(
@@ -102,7 +116,7 @@ impl GoogleEmbedder {
 
         debug!(url, model = %self.model, ?task_type, "POST google/embedContent");
         let len = self.api_keys.len();
-        let max_attempts = std::cmp::max(5, len) as u32;
+        let max_attempts = (len + 1) as u32;
         let mut attempt = 0u32;
         // Spread the starting key across concurrent requests so the shared
         // embedder does not stampede a single key (cross-request round-robin).
@@ -111,7 +125,7 @@ impl GoogleEmbedder {
         } else {
             self.next_key.fetch_add(1, Ordering::Relaxed) % len
         };
-        let mut key_idx = start;
+        let mut key_idx = self.key_pool.next_usable(start).unwrap_or(start);
 
         loop {
             let api_key = self.api_keys.get(key_idx).cloned();
@@ -134,11 +148,21 @@ impl GoogleEmbedder {
                 Ok(r) => r,
                 Err(e) => {
                     // Transport-level failure (timeout, connection reset, DNS):
-                    // fail over to the next key instead of giving up. No
-                    // rate-limit backoff here — we just switch keys.
+                    // fail over to the next key instead of giving up.
                     if attempt < max_attempts.saturating_sub(1) {
                         attempt += 1;
-                        key_idx = (key_idx + 1) % len;
+                        let next = key_idx.wrapping_add(1) % len;
+                        key_idx = match self.key_pool.next_usable(next) {
+                            Some(idx) => idx,
+                            None => {
+                                let wait = self
+                                    .key_pool
+                                    .earliest_expiry()
+                                    .min(KeyPool::retry_delay(attempt, start));
+                                tokio::time::sleep(wait).await;
+                                self.key_pool.next_usable(start).unwrap_or(start)
+                            }
+                        };
                         debug!(
                             attempt,
                             key_index = key_idx,
@@ -157,14 +181,34 @@ impl GoogleEmbedder {
                 status.as_u16() == 429 || (status.as_u16() >= 500 && status.as_u16() < 600);
             if is_retryable && attempt < max_attempts.saturating_sub(1) {
                 attempt += 1;
-                key_idx = (key_idx + 1) % len;
-                let delay = Self::retry_delay(attempt, start);
+                if status.as_u16() == 429 {
+                    // A 429 means the key hit its per-key rate limit; park
+                    // it and rotate to the next key.
+                    self.key_pool.blacklist(key_idx, "google");
+                    let next = key_idx.wrapping_add(1) % len;
+                    key_idx = match self.key_pool.next_usable(next) {
+                        Some(idx) => idx,
+                        None => {
+                            let wait = self
+                                .key_pool
+                                .earliest_expiry()
+                                .min(KeyPool::retry_delay(attempt, start));
+                            tokio::time::sleep(wait).await;
+                            self.key_pool.next_usable(start).unwrap_or(start)
+                        }
+                    };
+                } else {
+                    // 5xx is transient — reuse the same key on retry.
+                    // key_idx stays the same.
+                }
+                let delay = KeyPool::retry_after_from_response(&resp)
+                    .unwrap_or_else(|| KeyPool::retry_delay(attempt, start));
                 debug!(
                     attempt,
                     key_index = key_idx,
                     ?delay,
                     status = status.as_u16(),
-                    "google embedContent key failed, rotating to next key"
+                    "google embedContent key failed, retrying"
                 );
                 tokio::time::sleep(delay).await;
                 continue;
@@ -187,15 +231,6 @@ impl GoogleEmbedder {
             }
             return Ok(normalise(values));
         }
-    }
-
-    /// Exponential backoff (capped) with a small per-request jitter derived
-    /// from the starting key index, so that concurrent requests desynchronise
-    /// their retries (thundering-herd avoidance) without an RNG dependency.
-    fn retry_delay(attempt: u32, start_key: usize) -> Duration {
-        let base = 2u64.saturating_pow(attempt.min(4));
-        let jitter_ms = (((start_key as u64).wrapping_add(attempt as u64)) * 7919) % 250 + 1;
-        Duration::from_millis(base * 1000 + jitter_ms)
     }
 }
 
@@ -588,7 +623,7 @@ mod tests {
         assert_eq!(embedding, vec![1.0, 0.0, 0.0]);
         assert_eq!(
             *seen.lock().unwrap(),
-            vec!["k0".to_string(), "k1".to_string()]
+            vec!["k0".to_string(), "k0".to_string()]
         );
     }
 
@@ -621,8 +656,8 @@ mod tests {
             .await
             .expect_err("all keys 429 must surface an error");
         assert!(matches!(err, LlmError::Provider { status: 429, .. }));
-        // max_attempts = max(5, len) = 5 for 2 keys.
-        assert_eq!(count.load(Ordering::SeqCst), 5);
+        // max_attempts = len + 1 = 3 for 2 keys.
+        assert_eq!(count.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]

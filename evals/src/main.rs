@@ -374,6 +374,7 @@ impl From<ResolvedConfig> for ProviderConfig {
             api_keys: Vec::new(),
             // Concurrency is not modeled by the eval comparisons; default to 2.
             max_concurrency: Some(2),
+            key_cooldown_secs: None,
         }
     }
 }

@@ -139,6 +139,12 @@ pub struct Config {
     /// default (4); set to `0` to disable the limiter. Configured via the
     /// `llm_max_concurrency` TOML field or `AI_MEMORY_LLM_MAX_CONCURRENCY`.
     pub llm_max_concurrency: Option<usize>,
+    /// Per-key 429 blacklist cooldown in seconds. When a key receives a
+    /// 429 rate-limit response, it is parked for this duration before the
+    /// rotation pool retries it. `None` uses the provider default (3600
+    /// seconds = 1 hour). Configurable via the `llm_key_cooldown_secs`
+    /// TOML field or `AI_MEMORY_LLM_KEY_COOLDOWN_SECS`.
+    pub llm_key_cooldown_secs: Option<u64>,
     /// Run LLM consolidation on SessionEnd (in addition to the always-written
     /// heuristic session page), when an LLM provider is configured. On by
     /// default — SessionEnd compiles observations into wiki pages; set
@@ -588,6 +594,7 @@ impl Default for Config {
             llm_base_url: None,
             llm_api_keys: None,
             llm_max_concurrency: None,
+            llm_key_cooldown_secs: None,
             llm_api_key: None,
             llm_compat_strict: false,
             consolidate_on_session_end: true,
@@ -965,6 +972,7 @@ impl Config {
             compat_strict: self.llm_compat_strict,
             api_keys: Vec::new(),
             max_concurrency: self.llm_max_concurrency,
+            key_cooldown_secs: self.llm_key_cooldown_secs,
         }))
     }
 
@@ -1035,6 +1043,7 @@ impl Config {
             api_key,
             base_url: self.embedding_base_url.clone(),
             api_keys,
+            key_cooldown_secs: self.llm_key_cooldown_secs,
         }))
     }
 

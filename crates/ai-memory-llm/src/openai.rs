@@ -1,9 +1,9 @@
 //! OpenAI Chat Completions client (with `response_format` JSON schema for
 //! structured output).
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
@@ -12,6 +12,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
 use crate::error::{LlmError, LlmResult};
+use crate::key_pool::KeyPool;
 use crate::provider::LlmProvider;
 use crate::response::{provider_error_body, response_json_or_provider_error};
 use crate::types::{ChatRequest, ChatResponse, Role, Usage};
@@ -60,13 +61,6 @@ fn last_segment_is_version(url: &str) -> bool {
     })
 }
 
-/// How long a key is excluded from selection after it returns a 429
-/// (rate-limit) response. OpenAI's quota is per-key, so a key that 429s
-/// will keep 429ing for a while; parking it lets the round-robin cursor
-/// move on to a fresh key instead of re-hammering it. Mirrors the Gemini
-/// provider's cooldown.
-const KEY_BLACKLIST_DURATION: Duration = Duration::from_secs(60 * 60);
-
 /// Request dialect — picks which OpenAI quirks the provider applies.
 ///
 /// `Official` targets `api.openai.com` and honours the model-family
@@ -99,10 +93,8 @@ pub struct OpenAiProvider {
     /// Shared cursor so concurrent requests spread their starting key
     /// instead of stampeding a single key (cross-request round-robin).
     next_key: AtomicUsize,
-    /// Per-key 429 blacklist: `Some(instant)` means "do not use this
-    /// key until `instant`". `None` means the key is currently usable.
-    /// Indexed in lock-step with `api_keys`.
-    blacklist: Arc<Mutex<Vec<Option<Instant>>>>,
+    /// Per-key 429 blacklist with round-robin rotation.
+    key_pool: KeyPool,
     /// Caps in-flight requests to the upstream so a burst of consolidation /
     /// embedding calls cannot trip gateway throttling ("too many calls").
     /// `None` means unbounded (historical behaviour).
@@ -142,12 +134,12 @@ impl OpenAiProvider {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
             .build()?;
-        let blacklist = vec![None; api_keys.len()];
+        let key_pool = KeyPool::new(api_keys.len());
         Ok(Self {
             client,
             api_keys,
             next_key: AtomicUsize::new(0),
-            blacklist: Arc::new(Mutex::new(blacklist)),
+            key_pool,
             concurrency: None,
             base_url: DEFAULT_BASE_URL.to_string(),
             model: model.into(),
@@ -161,6 +153,15 @@ impl OpenAiProvider {
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
         self
+    }
+
+    /// Override the per-key 429 blacklist cooldown (seconds).
+    #[must_use]
+    pub fn with_cooldown_secs(self, secs: u64) -> Self {
+        Self {
+            key_pool: KeyPool::with_cooldown(self.api_keys.len(), Duration::from_secs(secs)),
+            ..self
+        }
     }
 
     /// Cap concurrent in-flight requests to `max`. A limiter prevents a burst
@@ -373,7 +374,7 @@ impl OpenAiProvider {
         debug!(url, "POST openai");
 
         let len = self.api_keys.len();
-        let max_attempts = std::cmp::max(5, len) as u32;
+        let max_attempts = (len + 1) as u32;
         let mut attempt = 0u32;
         // Spread the starting key across concurrent requests so the shared
         // provider does not stampede a single key (cross-request round-robin).
@@ -384,7 +385,7 @@ impl OpenAiProvider {
         };
         // First attempt uses the round-robin starting key; subsequent
         // failures rotate past any blacklisted keys.
-        let mut key_idx = self.next_usable_key(start, start);
+        let mut key_idx = self.key_pool.next_usable(start).unwrap_or(start);
 
         loop {
             let api_key = self.api_keys.get(key_idx).cloned();
@@ -417,7 +418,18 @@ impl OpenAiProvider {
                     // rate-limit backoff here — we just switch keys.
                     if attempt < max_attempts.saturating_sub(1) {
                         attempt += 1;
-                        key_idx = self.next_usable_key(key_idx.wrapping_add(1) % len, start);
+                        let next = key_idx.wrapping_add(1) % len;
+                        key_idx = match self.key_pool.next_usable(next) {
+                            Some(idx) => idx,
+                            None => {
+                                let wait = self
+                                    .key_pool
+                                    .earliest_expiry()
+                                    .min(KeyPool::retry_delay(attempt, start));
+                                tokio::time::sleep(wait).await;
+                                self.key_pool.next_usable(start).unwrap_or(start)
+                            }
+                        };
                         debug!(
                             attempt,
                             key_index = key_idx,
@@ -438,17 +450,28 @@ impl OpenAiProvider {
                 attempt += 1;
                 if status.as_u16() == 429 {
                     // A 429 means *this key* hit its per-key rate limit; park
-                    // it for KEY_BLACKLIST_DURATION and rotate to the next key.
-                    self.blacklist_key(key_idx);
-                    key_idx = self.next_usable_key(key_idx.wrapping_add(1) % len, start);
+                    // it and rotate to the next key.
+                    self.key_pool.blacklist(key_idx, "openai");
+                    let next = key_idx.wrapping_add(1) % len;
+                    key_idx = match self.key_pool.next_usable(next) {
+                        Some(idx) => idx,
+                        None => {
+                            let wait = self
+                                .key_pool
+                                .earliest_expiry()
+                                .min(KeyPool::retry_delay(attempt, start));
+                            tokio::time::sleep(wait).await;
+                            self.key_pool.next_usable(start).unwrap_or(start)
+                        }
+                    };
                 } else {
                     // 5xx (and other transient server errors) are not the key's
                     // fault — reuse the same key on retry instead of burning
                     // through the rotation pool on a server-side outage.
-                    key_idx = self.next_usable_key(key_idx, start);
+                    // key_idx stays the same.
                 }
-                let delay = Self::retry_after_from_response(&resp)
-                    .unwrap_or_else(|| Self::retry_delay(attempt, start));
+                let delay = KeyPool::retry_after_from_response(&resp)
+                    .unwrap_or_else(|| KeyPool::retry_delay(attempt, start));
                 debug!(
                     attempt,
                     key_index = key_idx,
@@ -482,8 +505,7 @@ impl OpenAiProvider {
                     attempt += 1;
                     // Server-side transient (gateway error page / truncated
                     // JSON): reuse the same key rather than rotating.
-                    key_idx = self.next_usable_key(key_idx, start);
-                    let delay = Self::retry_delay(attempt, start);
+                    let delay = KeyPool::retry_delay(attempt, start);
                     warn!(
                         attempt,
                         key_index = key_idx,
@@ -550,7 +572,7 @@ impl OpenAiProvider {
         if let Err(err) = &parsed
             && err.is_retryable()
         {
-            let delay = Self::retry_delay(1, 0);
+            let delay = KeyPool::retry_delay(1, 0);
             debug!(?delay, "structured: retrying once after gateway error page");
             tokio::time::sleep(delay).await;
             let resp = self
@@ -586,77 +608,6 @@ impl OpenAiProvider {
             }
             None => None,
         }
-    }
-
-    /// Honour a `Retry-After` header (seconds, or an HTTP-date) when the
-    /// upstream sent one; otherwise `None` to fall back to exponential backoff.
-    fn retry_after_from_response(resp: &reqwest::Response) -> Option<Duration> {
-        let value = resp
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)?
-            .to_str()
-            .ok()?;
-        let secs = value.trim().parse::<u64>().ok();
-        if let Some(secs) = secs {
-            // Cap to avoid absurd server-requested waits.
-            return Some(Duration::from_secs(secs.min(60)));
-        }
-        // HTTP-date form is rare for this endpoint; ignore if unparseable.
-        None
-    }
-
-    /// Exponential backoff (capped) with a small per-request jitter derived
-    /// from the starting key index, so that concurrent requests desynchronise
-    /// their retries (thundering-herd avoidance) without an RNG dependency.
-    fn retry_delay(attempt: u32, start_key: usize) -> Duration {
-        let base = 2u64.saturating_pow(attempt.min(4));
-        let jitter_ms = (((start_key as u64).wrapping_add(attempt as u64)) * 7919) % 250 + 1;
-        Duration::from_millis(base * 1000 + jitter_ms)
-    }
-
-    /// Mark a key as temporarily unusable after it returned a 429. The
-    /// key is skipped by [`next_usable_key`] until the duration elapses.
-    fn blacklist_key(&self, key_idx: usize) {
-        let Ok(mut blacklist) = self.blacklist.lock() else {
-            return;
-        };
-        let Some(slot) = blacklist.get_mut(key_idx) else {
-            return;
-        };
-        *slot = Some(Instant::now() + KEY_BLACKLIST_DURATION);
-        warn!(
-            key_index = key_idx,
-            seconds = KEY_BLACKLIST_DURATION.as_secs(),
-            "openai key rate-limited (429); blacklisting for the cooldown window"
-        );
-    }
-
-    /// Return the next key at or after `from` that is not currently
-    /// blacklisted, wrapping around. If every key is blacklisted (e.g.
-    /// a total outage), falls back to `start` — the round-robin starting
-    /// index for this call — so the request still attempts instead of
-    /// spinning forever, and a still-cooling-down key isn't re-hit just
-    /// because it happens to be the rotated `from`.
-    fn next_usable_key(&self, from: usize, start: usize) -> usize {
-        let len = self.api_keys.len();
-        if len == 0 {
-            return 0;
-        }
-        let now = Instant::now();
-        let blacklist = self.blacklist.lock().ok();
-        let expired_or_clear = |i: usize| -> bool {
-            match blacklist.as_ref().and_then(|b| b.get(i)) {
-                Some(Some(until)) => now >= *until,
-                _ => true,
-            }
-        };
-        for step in 0..len {
-            let candidate = (from + step) % len;
-            if expired_or_clear(candidate) {
-                return candidate;
-            }
-        }
-        start
     }
 }
 

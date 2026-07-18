@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 
 use crate::AnthropicProvider;
 use crate::CopilotProvider;
@@ -127,6 +127,11 @@ pub struct ProviderConfig {
     /// Optional cap on concurrent in-flight requests (0 disables the limiter).
     /// `None` falls back to the provider default / `AI_MEMORY_LLM_MAX_CONCURRENCY`.
     pub max_concurrency: Option<usize>,
+    /// Optional per-key 429 blacklist cooldown in seconds. `None` uses the
+    /// provider default (1 hour). Configurable via
+    /// `AI_MEMORY_LLM_KEY_COOLDOWN_SECS` or the `llm_key_cooldown_secs`
+    /// TOML field.
+    pub key_cooldown_secs: Option<u64>,
 }
 
 /// Embedding providers available to ai-memory.
@@ -169,6 +174,11 @@ pub struct EmbedderConfig {
     pub base_url: Option<String>,
     /// Optional additional API keys for rotation (Google/Gemini).
     pub api_keys: Vec<SecretString>,
+    /// Optional per-key 429 blacklist cooldown in seconds. `None` uses the
+    /// provider default (1 hour). Configurable via
+    /// `AI_MEMORY_LLM_KEY_COOLDOWN_SECS` or the `llm_key_cooldown_secs`
+    /// TOML field.
+    pub key_cooldown_secs: Option<u64>,
 }
 
 /// Construct an `Arc<dyn Embedder>` from the config.
@@ -178,9 +188,22 @@ pub struct EmbedderConfig {
 pub fn build_embedder(config: EmbedderConfig) -> LlmResult<Arc<dyn Embedder>> {
     let arc: Arc<dyn Embedder> = match config.provider {
         EmbedderChoice::OpenAi => {
-            let mut e = OpenAiEmbedder::new(config.api_key, config.model, config.dim)?;
+            let mut keys = config.api_keys;
+            if keys.is_empty() {
+                keys.push(config.api_key);
+            } else {
+                // Ensure the primary key is included
+                let primary = config.api_key.expose_secret();
+                if !keys.iter().any(|k| k.expose_secret() == primary) {
+                    keys.insert(0, config.api_key);
+                }
+            }
+            let mut e = OpenAiEmbedder::new_with_keys(keys, config.model, config.dim)?;
             if let Some(url) = config.base_url {
                 e = e.with_base_url(url);
+            }
+            if let Some(secs) = config.key_cooldown_secs {
+                e = e.with_cooldown_secs(secs);
             }
             Arc::new(e)
         }
@@ -205,6 +228,9 @@ pub fn build_embedder(config: EmbedderConfig) -> LlmResult<Arc<dyn Embedder>> {
             let mut e = GoogleEmbedder::new_with_keys(keys, config.model, config.dim)?;
             if let Some(url) = config.base_url {
                 e = e.with_base_url(url);
+            }
+            if let Some(secs) = config.key_cooldown_secs {
+                e = e.with_cooldown_secs(secs);
             }
             Arc::new(e)
         }
@@ -247,10 +273,12 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             } else {
                 keys
             };
-            Ok(Arc::new(
-                OpenAiProvider::new_with_keys(keys, config.model)?
-                    .with_concurrency(resolve_max_concurrency(config.max_concurrency)),
-            ))
+            let mut provider = OpenAiProvider::new_with_keys(keys, config.model)?;
+            provider = provider.with_concurrency(resolve_max_concurrency(config.max_concurrency));
+            if let Some(secs) = config.key_cooldown_secs {
+                provider = provider.with_cooldown_secs(secs);
+            }
+            Ok(Arc::new(provider))
         }
         ProviderChoice::Gemini => {
             let keys = config.auth.api_keys();
@@ -259,7 +287,11 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             } else {
                 keys
             };
-            Ok(Arc::new(GeminiProvider::new_with_keys(keys, config.model)?))
+            let mut provider = GeminiProvider::new_with_keys(keys, config.model)?;
+            if let Some(secs) = config.key_cooldown_secs {
+                provider = provider.with_cooldown_secs(secs);
+            }
+            Ok(Arc::new(provider))
         }
         ProviderChoice::OpenAiCompat => {
             let base = config
@@ -356,6 +388,7 @@ mod tests {
             compat_strict: false,
             api_keys: Vec::new(),
             max_concurrency: None,
+            key_cooldown_secs: None,
         };
 
         let err = match build_provider(cfg) {

@@ -26,6 +26,7 @@ pub async fn run(config: &Config, args: LlmTestArgs) -> Result<()> {
         compat_strict: config.llm_compat_strict,
         api_keys: Vec::new(),
         max_concurrency: config.llm_max_concurrency,
+        key_cooldown_secs: config.llm_key_cooldown_secs,
     };
     let client = build_provider(provider_config).context("building LLM provider")?;
     info!(

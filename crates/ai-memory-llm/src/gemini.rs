@@ -9,20 +9,22 @@
 //! …). See [`prepare_schema_for_gemini`].
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::debug;
 
-/// How long a key is excluded from selection after it returns a 429
-/// (rate-limit) response. Gemini's free-tier quota is per-key, so a key
-/// that 429s will keep 429ing for a while; parking it lets the
-/// round-robin cursor move on to a fresh key instead of re-hammering it.
-const KEY_BLACKLIST_DURATION: Duration = Duration::from_secs(60 * 60);
+use crate::error::{LlmError, LlmResult};
+use crate::key_pool::KeyPool;
+use crate::provider::LlmProvider;
+use crate::response::{provider_error_body, response_json_limited};
+use crate::types::{ChatRequest, ChatResponse, Role, Usage};
+
+/// Default Gemini API base.
+pub const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 
 /// Gemini-backed provider.
 pub struct GeminiProvider {
@@ -31,21 +33,11 @@ pub struct GeminiProvider {
     /// Shared cursor so concurrent requests spread their starting key
     /// instead of stampeding a single key (cross-request round-robin).
     next_key: AtomicUsize,
-    /// Per-key 429 blacklist: `Some(instant)` means "do not use this
-    /// key until `instant`". `None` means the key is currently usable.
-    /// Indexed in lock-step with `api_keys`.
-    blacklist: Arc<Mutex<Vec<Option<Instant>>>>,
+    /// Per-key 429 blacklist with round-robin rotation.
+    key_pool: KeyPool,
     base_url: String,
     model: String,
 }
-
-use crate::error::{LlmError, LlmResult};
-use crate::provider::LlmProvider;
-use crate::response::{provider_error_body, response_json_limited};
-use crate::types::{ChatRequest, ChatResponse, Role, Usage};
-
-/// Default Gemini API base.
-pub const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 
 impl GeminiProvider {
     /// Construct a provider given a single API key and model id (e.g.
@@ -66,12 +58,12 @@ impl GeminiProvider {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
             .build()?;
-        let blacklist = vec![None; api_keys.len()];
+        let key_pool = KeyPool::new(api_keys.len());
         Ok(Self {
             client,
             api_keys,
             next_key: AtomicUsize::new(0),
-            blacklist: Arc::new(Mutex::new(blacklist)),
+            key_pool,
             base_url: DEFAULT_BASE_URL.to_string(),
             model: model.into(),
         })
@@ -82,6 +74,15 @@ impl GeminiProvider {
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
         self
+    }
+
+    /// Override the per-key 429 blacklist cooldown (seconds).
+    #[must_use]
+    pub fn with_cooldown_secs(self, secs: u64) -> Self {
+        Self {
+            key_pool: KeyPool::with_cooldown(self.api_keys.len(), Duration::from_secs(secs)),
+            ..self
+        }
     }
 }
 
@@ -254,7 +255,7 @@ impl GeminiProvider {
         debug!(url, "POST gemini");
 
         let len = self.api_keys.len();
-        let max_attempts = std::cmp::max(5, len) as u32;
+        let max_attempts = (len + 1) as u32;
         let mut attempt = 0u32;
         // Spread the starting key across concurrent requests so the shared
         // provider does not stampede a single key (cross-request round-robin).
@@ -265,7 +266,7 @@ impl GeminiProvider {
         };
         // First attempt uses the round-robin starting key; subsequent
         // failures rotate past any blacklisted keys.
-        let mut key_idx = self.next_usable_key(start, start);
+        let mut key_idx = self.key_pool.next_usable(start).unwrap_or(start);
 
         loop {
             let api_key = self.api_keys.get(key_idx).cloned();
@@ -293,7 +294,18 @@ impl GeminiProvider {
                     // rate-limit backoff here — we just switch keys.
                     if attempt < max_attempts.saturating_sub(1) {
                         attempt += 1;
-                        key_idx = self.next_usable_key(key_idx.wrapping_add(1) % len, start);
+                        let next = key_idx.wrapping_add(1) % len;
+                        key_idx = match self.key_pool.next_usable(next) {
+                            Some(idx) => idx,
+                            None => {
+                                let wait = self
+                                    .key_pool
+                                    .earliest_expiry()
+                                    .min(KeyPool::retry_delay(attempt, start));
+                                tokio::time::sleep(wait).await;
+                                self.key_pool.next_usable(start).unwrap_or(start)
+                            }
+                        };
                         debug!(
                             attempt,
                             key_index = key_idx,
@@ -312,21 +324,34 @@ impl GeminiProvider {
                 status.as_u16() == 429 || (status.as_u16() >= 500 && status.as_u16() < 600);
             if is_retryable && attempt < max_attempts.saturating_sub(1) {
                 attempt += 1;
-                // A 429 means the key hit its per-key rate limit; park it
-                // for KEY_BLACKLIST_DURATION so we don't immediately retry
-                // it on the next rotation. 5xx is transient, so we leave
-                // the key eligible and just move on.
                 if status.as_u16() == 429 {
-                    self.blacklist_key(key_idx);
+                    // A 429 means the key hit its per-key rate limit; park
+                    // it and rotate to the next key.
+                    self.key_pool.blacklist(key_idx, "gemini");
+                    let next = key_idx.wrapping_add(1) % len;
+                    key_idx = match self.key_pool.next_usable(next) {
+                        Some(idx) => idx,
+                        None => {
+                            let wait = self
+                                .key_pool
+                                .earliest_expiry()
+                                .min(KeyPool::retry_delay(attempt, start));
+                            tokio::time::sleep(wait).await;
+                            self.key_pool.next_usable(start).unwrap_or(start)
+                        }
+                    };
+                } else {
+                    // 5xx is transient — reuse the same key on retry instead
+                    // of burning through the rotation pool on a server-side
+                    // outage. key_idx stays the same.
                 }
-                key_idx = self.next_usable_key(key_idx.wrapping_add(1) % len, start);
-                let delay = Self::retry_delay(attempt, start);
+                let delay = KeyPool::retry_delay(attempt, start);
                 debug!(
                     attempt,
                     key_index = key_idx,
                     ?delay,
                     status = status.as_u16(),
-                    "gemini key failed, rotating to next key"
+                    "gemini key failed, retrying"
                 );
                 tokio::time::sleep(delay).await;
                 continue;
@@ -341,60 +366,6 @@ impl GeminiProvider {
             }
             return response_json_limited::<R>(resp).await;
         }
-    }
-
-    /// Exponential backoff (capped) with a small per-request jitter derived
-    /// from the starting key index, so that concurrent requests desynchronise
-    /// their retries (thundering-herd avoidance) without an RNG dependency.
-    fn retry_delay(attempt: u32, start_key: usize) -> Duration {
-        let base = 2u64.saturating_pow(attempt.min(4));
-        let jitter_ms = (((start_key as u64).wrapping_add(attempt as u64)) * 7919) % 250 + 1;
-        Duration::from_millis(base * 1000 + jitter_ms)
-    }
-
-    /// Mark a key as temporarily unusable after it returned a 429. The
-    /// key is skipped by [`next_usable_key`] until the duration elapses.
-    fn blacklist_key(&self, key_idx: usize) {
-        let Ok(mut blacklist) = self.blacklist.lock() else {
-            return;
-        };
-        let Some(slot) = blacklist.get_mut(key_idx) else {
-            return;
-        };
-        *slot = Some(Instant::now() + KEY_BLACKLIST_DURATION);
-        warn!(
-            key_index = key_idx,
-            seconds = KEY_BLACKLIST_DURATION.as_secs(),
-            "gemini key rate-limited (429); blacklisting for the cooldown window"
-        );
-    }
-
-    /// Return the next key at or after `from` that is not currently
-    /// blacklisted, wrapping around. If every key is blacklisted (e.g.
-    /// a total outage), falls back to `start` — the round-robin starting
-    /// index for this call — so the request still attempts instead of
-    /// spinning forever, and a still-cooling-down key isn't re-hit just
-    /// because it happens to be the rotated `from`.
-    fn next_usable_key(&self, from: usize, start: usize) -> usize {
-        let len = self.api_keys.len();
-        if len == 0 {
-            return 0;
-        }
-        let now = Instant::now();
-        let blacklist = self.blacklist.lock().ok();
-        let expired_or_clear = |i: usize| -> bool {
-            match blacklist.as_ref().and_then(|b| b.get(i)) {
-                Some(Some(until)) => now >= *until,
-                _ => true,
-            }
-        };
-        for step in 0..len {
-            let candidate = (from + step) % len;
-            if expired_or_clear(candidate) {
-                return candidate;
-            }
-        }
-        start
     }
 }
 
@@ -990,7 +961,7 @@ mod tests {
         assert_eq!(response.text, "hello");
         assert_eq!(
             *seen.lock().unwrap(),
-            vec!["k0".to_string(), "k1".to_string()]
+            vec!["k0".to_string(), "k0".to_string()]
         );
     }
 
@@ -1023,8 +994,8 @@ mod tests {
             .await
             .expect_err("all keys 429 must surface an error");
         assert!(matches!(err, LlmError::Provider { status: 429, .. }));
-        // max_attempts = max(5, len) = 5 for 2 keys.
-        assert_eq!(count.load(Ordering::SeqCst), 5);
+        // max_attempts = len + 1 = 3 for 2 keys.
+        assert_eq!(count.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
@@ -1185,10 +1156,10 @@ mod tests {
             "surfaces the upstream 429"
         );
 
-        // max_attempts = max(5, len) = 5: each key tried once, then the
+        // max_attempts = len + 1 = 3: each key tried once, then the
         // all-blacklisted fallback reuses `start` for the remaining tries.
-        assert_eq!(count.load(Ordering::SeqCst), 5);
-        // No key is retried within the same call beyond the 5-attempt cap.
-        assert!(count.load(Ordering::SeqCst) <= 5);
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+        // No key is retried within the same call beyond the 3-attempt cap.
+        assert!(count.load(Ordering::SeqCst) <= 3);
     }
 }
