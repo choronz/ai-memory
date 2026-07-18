@@ -57,7 +57,8 @@ use ai_memory_store::{
     ApproveAutoImproveProposalResult, AutoImproveProposalOperation, AutoImproveProposalStatus,
     DecayParams, EmbeddingWrite, NewAutoImproveProposal, ReaderPool, RejectAutoImproveProposal,
     ScopeResolutionError, StageAutoImproveRun, StoreError, WriterHandle, create_explicit_scope,
-    f32_vec_to_bytes, lookup_existing_scope, lookup_existing_workspace,
+    f32_vec_to_bytes, lookup_existing_scope, lookup_existing_scope_with_global_fallback,
+    lookup_existing_workspace,
 };
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Markdown, Wiki, WikiError, WritePageRequest};
 use axum::Json;
@@ -2914,26 +2915,43 @@ async fn handle_purge_project(
         );
     }
 
-    // Look up workspace and project IDs without auto-creating.
-    let (ws_id, proj_id) =
-        match lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await {
-            Ok(ids) => ids,
-            Err(e) => return e,
-        };
+    // Look up workspace and project IDs without auto-creating. Fall back to a
+    // cross-workspace search when the explicit `(workspace, project)` pair is
+    // absent but the project name is unique across all workspaces.
+    let (ws_id, proj_id) = match lookup_existing_scope_with_global_fallback(
+        &state.reader,
+        &req.workspace,
+        &req.project,
+    )
+    .await
+    {
+        Ok(scope) => scope.as_tuple(),
+        Err(e) => return scope_err(e),
+    };
 
-    let label = format!("{}/{}", req.workspace, req.project);
+    // The resolved scope may live in a different workspace than the one the
+    // caller named (the global fallback case), so derive the real workspace
+    // name for the label and admission context instead of trusting the request.
+    let resolved_workspace = state
+        .reader
+        .workspace_name_by_id(ws_id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| req.workspace.clone());
+    let label = format!("{}/{}", resolved_workspace, req.project);
 
     // Admission must run before any destructive work. A reject-policy webhook
     // is allowed to abort the purge while DB rows and files are still intact.
-    // Seed names from the request so mirrors do not depend on DB lookup after
-    // the rows are purged below. Carry the authenticated actor so a scope-guard
-    // admission webhook can authorize the purge by user — an empty actor is
-    // rejected (`403 user '' not allowed to purge_project`).
+    // Seed names from the resolved scope so mirrors do not depend on DB lookup
+    // after the rows are purged below. Carry the authenticated actor so a
+    // scope-guard admission webhook can authorize the purge by user — an empty
+    // actor is rejected (`403 user '' not allowed to purge_project`).
     let actor = actor_ext
         .map(|axum::Extension(a)| a)
         .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
     let purge_ctx = AdmissionContext {
-        workspace: req.workspace.clone(),
+        workspace: resolved_workspace.clone(),
         project: req.project.clone(),
         op: AdmissionOp::PurgeProject,
         actor,

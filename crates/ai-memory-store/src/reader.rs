@@ -3820,6 +3820,50 @@ impl ReaderPool {
         .await
     }
 
+    /// Find every `(workspace_id, project_id, workspace_name)` match for a
+    /// project name across **all** workspaces, without creating anything.
+    ///
+    /// Used by destructive admin surfaces (e.g. `purge-project`) so an
+    /// operator can name a project by its unique name without also spelling
+    /// out the workspace it lives in. A non-ambiguous single hit lets the
+    /// caller resolve the scope; more than one hit means the name is not
+    /// unique and the caller must require an explicit `--workspace`.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn find_project_globally(
+        &self,
+        name: String,
+    ) -> StoreResult<Vec<(ProjectId, WorkspaceId, String)>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT p.id, p.workspace_id, w.name \
+                 FROM projects p \
+                 JOIN workspaces w ON w.id = p.workspace_id \
+                 WHERE p.name = ?1 COLLATE NOCASE",
+            )?;
+            let rows = stmt.query_map(params![name], |row| {
+                let project_bytes: Vec<u8> = row.get(0)?;
+                let ws_bytes: Vec<u8> = row.get(1)?;
+                let ws_name: String = row.get(2)?;
+                Ok((project_bytes, ws_bytes, ws_name))
+            })?;
+            let collected: rusqlite::Result<Vec<_>> = rows.collect();
+            let out = collected?
+                .into_iter()
+                .map(|(pb, wb, wn)| {
+                    Ok((
+                        ProjectId::from_slice(&pb).map_err(StoreError::from)?,
+                        WorkspaceId::from_slice(&wb).map_err(StoreError::from)?,
+                        wn,
+                    ))
+                })
+                .collect::<StoreResult<Vec<_>>>()?;
+            Ok(out)
+        })
+        .await
+    }
+
     /// Find the existing project whose `repo_path` is the longest
     /// prefix of `cwd`, if any. Used by the hook router before
     /// auto-creating a new project from `basename(cwd)` so an event

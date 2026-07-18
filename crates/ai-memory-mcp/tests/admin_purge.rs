@@ -519,3 +519,94 @@ async fn purge_project_idempotent_second_call_is_404() {
         "second purge must 404 because project is already gone"
     );
 }
+
+/// A globally-unique project living in a non-default workspace must purge
+/// even when the caller only names the project (and the `default` workspace,
+/// as the CLI does). The cross-workspace fallback resolves the unique name.
+#[tokio::test]
+async fn purge_project_resolves_unique_name_across_workspaces() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+
+    // Project lives in `tools`, not `default`; name is unique across workspaces.
+    let tools_ws = store.writer.get_or_create_workspace("tools").await.unwrap();
+    let unique = store
+        .writer
+        .get_or_create_project(tools_ws, "openinterpreter", None)
+        .await
+        .unwrap();
+    let wiki = state.wiki.clone();
+    wiki.write_page(WritePageRequest {
+        workspace_id: tools_ws,
+        project_id: unique,
+        path: PagePath::new("notes/x.md").unwrap(),
+        frontmatter: serde_json::json!({"title": "X"}),
+        body: "interpreter page".into(),
+        tier: Tier::Semantic,
+        pinned: false,
+        title: Some("X".into()),
+        admission_ctx: None,
+        author_id: None,
+        actor: ai_memory_core::ActorContext::anonymous(),
+    })
+    .await
+    .unwrap();
+
+    // Caller names `default` (the CLI default) + the unique project name.
+    let resp = post(
+        state,
+        "/admin/purge-project",
+        json!({ "workspace": "default", "project": "openinterpreter", "confirm": true }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "unique project across workspaces must purge without explicit workspace"
+    );
+
+    // The project is gone; its per-project dir is removed.
+    let counts = store.reader.status_counts().await.unwrap();
+    assert_eq!(counts.pages_latest, 0, "page must be purged: {counts:?}");
+    assert!(
+        !wiki.project_root(tools_ws, unique).exists(),
+        "project dir must be gone"
+    );
+}
+
+/// Same scenario but the name collides across two workspaces: the fallback
+/// must refuse to auto-pick and return a 404 that demands `--workspace`.
+#[tokio::test]
+async fn purge_project_ambiguous_name_requires_explicit_workspace() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+
+    for ws_name in ["alpha", "beta"] {
+        let ws = store.writer.get_or_create_workspace(ws_name).await.unwrap();
+        store
+            .writer
+            .get_or_create_project(ws, "shared", None)
+            .await
+            .unwrap();
+    }
+
+    let resp = post(
+        state,
+        "/admin/purge-project",
+        json!({ "workspace": "default", "project": "shared", "confirm": true }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "ambiguous name must require explicit --workspace"
+    );
+    let body = body_json(resp).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("multiple workspaces"),
+        "error must ask for --workspace: {body}"
+    );
+}

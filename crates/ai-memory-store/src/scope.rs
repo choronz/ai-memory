@@ -88,6 +88,14 @@ pub enum ScopeResolutionError {
         /// Project name supplied by the caller.
         project: String,
     },
+    /// A project name matched multiple workspaces, so an explicit
+    /// workspace is required to disambiguate a destructive operation.
+    ProjectNameAmbiguousAcrossWorkspaces {
+        /// Project name supplied by the caller.
+        project: String,
+        /// Names of the workspaces that each contain a project with that name.
+        workspaces: Vec<String>,
+    },
     /// A write-create policy was requested without a writer handle.
     WriterRequired,
     /// Underlying store failure.
@@ -116,6 +124,7 @@ impl ScopeResolutionError {
             ScopeResolutionError::WorkspaceNotFound { .. }
                 | ScopeResolutionError::ProjectNotFoundInWorkspace { .. }
                 | ScopeResolutionError::ProjectNotFoundInActiveOrDefault { .. }
+                | ScopeResolutionError::ProjectNameAmbiguousAcrossWorkspaces { .. }
         )
     }
 }
@@ -146,6 +155,16 @@ impl fmt::Display for ScopeResolutionError {
                 write!(
                     f,
                     "project '{project}' not found in the active or default workspace"
+                )
+            }
+            ScopeResolutionError::ProjectNameAmbiguousAcrossWorkspaces {
+                project,
+                workspaces,
+            } => {
+                write!(
+                    f,
+                    "project '{project}' exists in multiple workspaces ({workspaces:?}); \
+                     pass --workspace to disambiguate"
                 )
             }
             ScopeResolutionError::WriterRequired => {
@@ -195,6 +214,55 @@ pub async fn lookup_existing_scope(
         workspace_id,
         project_id,
     })
+}
+
+/// Look up a workspace/project pair without creating it, falling back to a
+/// cross-workspace search for the project name when the explicit pair is absent.
+///
+/// This preserves the fail-closed behaviour of [`lookup_existing_scope`] for
+/// typos, but lets an operator purge a project by its **unique** name without
+/// also spelling out the workspace it happens to live in. When the explicit
+/// `(workspace, project)` lookup fails, the project name is searched across all
+/// workspaces:
+///
+/// - exactly one match → resolve to that scope (the unique name wins);
+/// - more than one match → [`ScopeResolutionError::ProjectNameAmbiguousAcrossWorkspaces`]
+///   so the caller requires an explicit `--workspace` (never auto-picks one);
+/// - zero matches → the original not-found error is returned unchanged.
+///
+/// Intended for destructive admin surfaces (e.g. `purge-project`) where a
+/// globally-unique project name is unambiguous enough to act on, while
+/// ambiguous names still require an explicit scope.
+pub async fn lookup_existing_scope_with_global_fallback(
+    reader: &ReaderPool,
+    workspace: &str,
+    project: &str,
+) -> Result<ResolvedScope, ScopeResolutionError> {
+    match lookup_existing_scope(reader, workspace, project).await {
+        Ok(scope) => Ok(scope),
+        Err(ScopeResolutionError::WorkspaceNotFound { .. })
+        | Err(ScopeResolutionError::ProjectNotFoundInWorkspace { .. }) => {
+            let matches = reader.find_project_globally(project.to_owned()).await?;
+            match matches.len() {
+                1 => {
+                    let (project_id, workspace_id, _ws_name) = &matches[0];
+                    Ok(ResolvedScope {
+                        workspace_id: *workspace_id,
+                        project_id: *project_id,
+                    })
+                }
+                0 => Err(ScopeResolutionError::ProjectNotFoundInWorkspace {
+                    workspace: workspace.to_owned(),
+                    project: project.to_owned(),
+                }),
+                _ => Err(ScopeResolutionError::ProjectNameAmbiguousAcrossWorkspaces {
+                    project: project.to_owned(),
+                    workspaces: matches.into_iter().map(|(_, _, wn)| wn).collect(),
+                }),
+            }
+        }
+        Err(other) => Err(other),
+    }
 }
 
 /// Look up an explicit workspace by name without creating anything.
@@ -724,5 +792,106 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn global_fallback_resolves_unique_project_across_workspaces() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        // A project that lives only in a non-default workspace, named by a
+        // caller who did not spell out the workspace.
+        let tools_ws = store.writer.get_or_create_workspace("tools").await.unwrap();
+        let unique = store
+            .writer
+            .get_or_create_project(tools_ws, "openinterpreter", None)
+            .await
+            .unwrap();
+
+        // The explicit `(default, openinterpreter)` pair is absent, but the
+        // name is unique across all workspaces, so the fallback resolves it.
+        let resolved =
+            lookup_existing_scope_with_global_fallback(&store.reader, "default", "openinterpreter")
+                .await
+                .unwrap();
+        assert_eq!(resolved.as_tuple(), (tools_ws, unique));
+
+        // A missing workspace name behaves the same: the unique project wins.
+        let resolved_missing_ws = lookup_existing_scope_with_global_fallback(
+            &store.reader,
+            "no-such-workspace",
+            "openinterpreter",
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved_missing_ws.as_tuple(), (tools_ws, unique));
+    }
+
+    #[tokio::test]
+    async fn global_fallback_rejects_ambiguous_project_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws_a = store.writer.get_or_create_workspace("alpha").await.unwrap();
+        let ws_b = store.writer.get_or_create_workspace("beta").await.unwrap();
+        store
+            .writer
+            .get_or_create_project(ws_a, "shared", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .get_or_create_project(ws_b, "shared", None)
+            .await
+            .unwrap();
+
+        // The name is not unique, so the fallback refuses to auto-pick and
+        // demands an explicit workspace instead.
+        let err = lookup_existing_scope_with_global_fallback(
+            &store.reader,
+            "no-such-workspace",
+            "shared",
+        )
+        .await
+        .unwrap_err();
+        match err {
+            ScopeResolutionError::ProjectNameAmbiguousAcrossWorkspaces {
+                project,
+                mut workspaces,
+            } => {
+                assert_eq!(project, "shared");
+                workspaces.sort();
+                assert_eq!(workspaces, vec!["alpha".to_string(), "beta".to_string()]);
+            }
+            other => panic!("expected ambiguity error, got {other:?}"),
+        }
+        assert!(err_is_not_found_for_ambiguous());
+    }
+
+    fn err_is_not_found_for_ambiguous() -> bool {
+        ScopeResolutionError::ProjectNameAmbiguousAcrossWorkspaces {
+            project: "x".into(),
+            workspaces: vec![],
+        }
+        .is_not_found()
+    }
+
+    #[tokio::test]
+    async fn global_fallback_reports_not_found_for_unknown_project() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+
+        // Zero matches anywhere → the original not-found error, so genuine
+        // typos still fail closed instead of silently succeeding.
+        let err = lookup_existing_scope_with_global_fallback(&store.reader, "default", "ghost")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ScopeResolutionError::ProjectNotFoundInWorkspace { .. }
+        ));
     }
 }
