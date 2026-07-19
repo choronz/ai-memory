@@ -1,9 +1,7 @@
 # Multi-user attribution
 
-> **Status:** v0.8 (rolling out across Phase 1 milestones P1.1–P1.8).
-> This page documents what's already merged today; per-page
-> attribution + frontmatter `last_modified_by` (P1.6) and `/api/v1`
-> author surfacing (P1.7) ship in subsequent milestones.
+> **Status:** Introduced in v0.8; this page documents the current shipped
+> contract.
 
 ai-memory is **single-tenant data** with **optional multi-user
 attribution**. Every authenticated request sees the same wiki pages —
@@ -149,7 +147,7 @@ The list never surfaces tokens — only their hashes are in the DB.
 `ai-memory user expire <username>` stamps `token_expired_at = now()`
 on the row. The user's bearer stops authenticating immediately, but
 the row stays put so historical `author_id` references in
-`audit_log` (and, after P1.6, in `pages`) keep resolving to their
+`audit_log` and `pages` keep resolving to their
 real names.
 
 ```console
@@ -194,9 +192,10 @@ If you're upgrading from a pre-v0.8 ai-memory:
   `multi-user not enabled` message. Existing installs never trip
   this because they never call `user add`.
 - `/admin/*` endpoints are open to the configured bearer token in
-  single-user mode, matching historical behavior. After you configure
-  `[auth].token_pepper`, every admin endpoint requires the root token;
-  DB-user tokens receive **403** and anonymous requests receive **401**.
+  single-user mode, matching historical behavior. Creating the first user row
+  immediately makes every admin endpoint root-only; DB-user tokens receive
+  **403** and anonymous requests receive **401**. Merely configuring
+  `[auth].token_pepper` does not activate that boundary.
 
 ### Migrating an existing single-user install
 
@@ -255,8 +254,8 @@ See `crates/ai-memory-store/src/users.rs` for the full rationale.
 | `/api/v1` page responses include `author: { username, name?, email? }` | ✓ P1.7 |
 | ETag invalidation on author change (so caches refresh attribution) | ✓ P1.7 |
 | `install-hooks --as-user <name>` metadata + flag validation | ✓ P1.8 |
-| Web UI shows author on page view + list views | ⏳ follow-up commit (data is already on `/api/v1`) |
-| `audit_log.author_id` populated on every write | ⏳ deferred (touches many ops; planned for next round) |
+| Web UI shows author on the page view | ✓ shipped |
+| Attributed mutation audit rows carry `audit_log.author_id` | ✓ shipped |
 
 Commit ids for each milestone are recorded in `CHANGELOG.md`.
 

@@ -10,7 +10,7 @@
 > re-explaining the architecture, the failed approaches, or the open
 > questions.
 
-[![status: v0.8 multi-user](https://img.shields.io/badge/status-v0.8--multiuser-green)](docs/ARCHITECTURE.md)
+[![Release](https://img.shields.io/github/v/release/akitaonrails/ai-memory)](https://github.com/akitaonrails/ai-memory/releases/latest)
 [![Rust](https://img.shields.io/badge/rust-1.95+-blue)](rust-toolchain.toml)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
@@ -231,8 +231,8 @@ packaged unit. Full user-service, system-service, auth, and provider setup is in
 
 ### Docker
 
-You need: Docker + an agent CLI (Claude Code, Codex, Devin CLI, OpenCode, OMP,
-Cursor, Antigravity CLI, Grok Build CLI, or anything else that speaks MCP).
+You need: Docker + an agent CLI from the [Support Matrix](#support-matrix), or
+anything else that speaks MCP.
 
 The published Docker image includes `linux/amd64` and `linux/arm64` variants,
 so Apple Silicon Macs and ARM64 Linux hosts can pull `akitaonrails/ai-memory`
@@ -349,10 +349,9 @@ one matching entry.
   projects) when you want new tool guidance. The refresh writes the slim
   markered snippet and managed Agent Skills from the same binary-owned assets.
 
-For Codex, Devin CLI, OpenCode, OMP, Cursor, Claude Desktop, Gemini CLI,
-Antigravity CLI, Grok Build CLI, Kimi Code, OpenClaw, VS Code Copilot,
-curl-based hook installs, source builds,
-CLI env vars, and the full subcommand reference, see [`docs/install.md`](docs/install.md).
+For every client in the [Support Matrix](#support-matrix), plus curl-based hook
+installs, source builds, CLI environment variables, and the full subcommand
+reference, see [`docs/install.md`](docs/install.md).
 
 ## Security
 
@@ -436,13 +435,13 @@ it doesn't earn its keep.
 shares a server, ai-memory can attribute each write to a named user.
 The bearer token continues to authenticate at the wire level; users
 created via `ai-memory user add` get their own tokens that resolve to
-their identity in audit logs (and, in subsequent milestones, page
-frontmatter + the web UI). Data stays single-tenant — there is no
-per-page RBAC — but once `[auth].token_pepper` enables multi-user
-mode, every `/admin/*` endpoint requires the root token, including
-status/search/read-page and user-management routes. Existing single-user installs
-are not affected unless you opt in by setting `[auth].token_pepper`
-(auto-generated for new installs by `ai-memory init`). See
+their identity in audit logs, page frontmatter, `/api/v1` responses, and the
+page view UI. Data stays single-tenant — there is no per-page RBAC. A
+`[auth].token_pepper` is required for DB-user authentication, but creating the
+first user row is what immediately switches every `/admin/*` endpoint to
+root-only, including status/search/read-page and user-management routes.
+`ai-memory init` generates a pepper for new installs without changing
+single-user behavior until a user is added. See
 [`docs/users.md`](docs/users.md) for the full walkthrough and the
 four-rung auth ladder.
 

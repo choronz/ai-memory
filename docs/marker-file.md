@@ -31,7 +31,7 @@ workspace-only markers can still resolve `project = basename(cwd)` for
 handoff lookups.
 
 The marker path is shared by the POSIX/PowerShell hook scripts and the
-generated OpenCode / OMP / OpenClaw TypeScript integrations. In all cases,
+generated OpenCode / OMP / Pi / OpenClaw TypeScript integrations. In all cases,
 hook capture and handoff lookup send the same `cwd`, `workspace`, `project`,
 `project_strategy`, `drop_subagent`, `default_global`, `briefing`, and
 `briefing_budget` query params to the server when a marker declares them;
@@ -308,7 +308,7 @@ repo root — so an agent that runs `mkdir sub && cd sub` and stays there no
 longer forks the rest of the session into a phantom project named `sub`.
 
 This is **install-time config**, written into the agent's hook command (and
-the generated OpenCode / OMP / OpenClaw plugins) — the same status as the
+the generated OpenCode / OMP / Pi / OpenClaw plugins) — the same status as the
 `AI_MEMORY_AUTH_TOKEN` / `AI_MEMORY_HOOK_URL` it sits beside, *not* a user-set
 runtime override (which was deliberately rejected in #16). The flag accepts
 `basename` (the default — bakes nothing, behavior unchanged) or `repo-root`.

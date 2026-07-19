@@ -311,8 +311,8 @@ Windows agent builds.
   Claude Code invokes hooks as a direct binary call (no shell) by default;
   `AI_MEMORY_HOOK_PLATFORM=windows-bash` restores the Git Bash `bash -c`
   path. WSL2 Claude Code uses normal WSL `.sh` paths.
-- Codex, Devin CLI, OpenCode, Cursor, Gemini CLI, Grok Build CLI, Kimi Code,
-  and OpenClaw may each choose different
+- Codex, Devin CLI, OpenCode, Cursor, Gemini CLI, Grok Build CLI, Zero,
+  Kimi Code, and OpenClaw may each choose different
   Windows config locations or shell execution behavior. ai-memory uses
   the current best-known defaults, but they need validation on real
   installations.

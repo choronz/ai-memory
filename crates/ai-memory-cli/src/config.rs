@@ -668,9 +668,9 @@ impl Config {
         let model = match non_empty(self.llm_model.as_deref()) {
             Some(s) => s.to_string(),
             None => match provider {
-                ProviderChoice::Anthropic => "claude-sonnet-4-6".to_string(),
+                ProviderChoice::Anthropic => "claude-haiku-4-5".to_string(),
                 ProviderChoice::AnthropicOAuth => "claude-sonnet-4-6".to_string(),
-                ProviderChoice::OpenAi => "gpt-4o-mini".to_string(),
+                ProviderChoice::OpenAi => "gpt-5.4-mini".to_string(),
                 ProviderChoice::Gemini => "gemini-2.5-flash".to_string(),
                 ProviderChoice::OpenAiOAuth => "gpt-5.5".to_string(),
                 ProviderChoice::Copilot => "gpt-5.5".to_string(),
@@ -1198,7 +1198,7 @@ mod tests {
 
         let provider = cfg.llm_provider_config().unwrap().unwrap();
         assert_eq!(provider.provider, ProviderChoice::OpenAi);
-        assert_eq!(provider.model, "gpt-4o-mini");
+        assert_eq!(provider.model, "gpt-5.4-mini");
         assert_eq!(
             provider.auth.requirement(),
             AuthRequirement::RequiredApiKey {
@@ -1216,6 +1216,22 @@ mod tests {
             "sk-test-key"
         );
         assert!(!provider.compat_strict);
+    }
+
+    #[test]
+    fn anthropic_provider_uses_documented_default_model() {
+        let cfg = Config {
+            llm_provider: Some("anthropic".into()),
+            runtime_env: RuntimeEnv {
+                anthropic_api_key: Some(SecretString::from("sk-ant-test-key")),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        assert_eq!(provider.provider, ProviderChoice::Anthropic);
+        assert_eq!(provider.model, "claude-haiku-4-5");
     }
 
     #[test]

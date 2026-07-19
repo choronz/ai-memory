@@ -19,10 +19,10 @@
 This page documents how to register ai-memory as an MCP server with
 agent CLIs beyond the README quick start.
 
-Claude Code, OpenAI Codex, Devin CLI, Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, Kimi Code, OpenClaw, OpenCode, and
-OMP have automatic capture integrations (host-native commands for supported
-local profiles, plus generated TypeScript plugin/extension files for OpenClaw /
-OpenCode / OMP) and are covered in the [main README](../README.md#quick-start).
+The hook-capable clients in the [README Support Matrix](../README.md#support-matrix)
+have automatic capture integrations (host-native commands for supported local
+profiles, plus generated TypeScript plugin/extension files for OpenClaw,
+OpenCode, OMP, and Pi).
 Claude Code may use its supported Windows exec form; other agents use native
 single command strings according to their hook schema. PowerShell/Git Bash
 script bundles are compatibility fallbacks and do not enforce capture-policy

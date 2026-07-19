@@ -70,10 +70,9 @@ pub enum Command {
     /// Hidden hook spool drainer used by native session-end hooks.
     #[command(hide = true, name = "hook-drain")]
     HookDrain(HookDrainArgs),
-    /// Print MCP server registration snippets for any supported client
-    /// (Claude Code, Codex, OpenCode, Cursor, Claude Desktop, Gemini
-    /// CLI, OpenClaw, OMP, Pi, Grok, Zero, Devin, Antigravity CLI, VS Code
-    /// Copilot). See docs/mcp-install.md for the full guide.
+    /// Print MCP server registration snippets for any supported client.
+    /// Current values are listed under `--client`; see docs/mcp-install.md
+    /// for the full guide.
     InstallMcp(InstallMcpArgs),
     /// Stage + commit the wiki tree under git.
     Commit(CommitArgs),
@@ -801,8 +800,8 @@ pub enum AgentChoice {
     /// them straight to `--agent`, which used to fail on this one.
     #[value(alias = "opencode")]
     OpenCode,
-    /// Real Pi coding agent. Recognized separately from OMP, but hook
-    /// install intentionally fails closed until the Pi bridge lands.
+    /// Real Pi coding agent. The generated TypeScript extension provides
+    /// lifecycle capture and bridges ai-memory's HTTP MCP tools into Pi.
     Pi,
     /// Oh My Pi (`omp`) — TypeScript extension
     /// under `~/.omp/agent/extensions/`. `--apply` writes the extension
@@ -927,7 +926,8 @@ pub enum McpClient {
     GeminiCli,
     /// OpenClaw personal AI gateway — `~/.openclaw/config.json`.
     Openclaw,
-    /// Real Pi coding agent. Pi core has no native MCP config yet.
+    /// Real Pi coding agent. Uses ai-memory's generated bridge extension
+    /// because Pi has no native MCP config.
     Pi,
     /// Oh My Pi (`omp`) — `~/.omp/agent/mcp.json`.
     #[value(alias = "oh-my-pi")]
@@ -1189,7 +1189,7 @@ pub struct LlmTestArgs {
     /// Provider to test.
     #[arg(long, value_enum)]
     pub provider: LlmProviderChoice,
-    /// Model identifier (e.g. `claude-sonnet-4-6`, `gpt-4o-mini`, `llama3.1:8b`).
+    /// Model identifier (e.g. `claude-haiku-4-5`, `gpt-5.4-mini`, `llama3.1:8b`).
     #[arg(long)]
     pub model: String,
     /// Prompt to send.
@@ -1269,20 +1269,16 @@ pub struct InstallHooksArgs {
     pub agent: AgentChoice,
     /// Filesystem root that contains the vendored hook scripts (defaults
     /// to the repo's `hooks/` if known, else `/usr/local/share/ai-memory/hooks`).
-    /// Ignored for generated TypeScript integrations (OpenCode, OMP, OpenClaw).
+    /// Ignored for generated TypeScript integrations (OpenCode, OMP, Pi,
+    /// OpenClaw).
     #[arg(long)]
     pub hooks_dir: Option<PathBuf>,
     /// Server URL the hooks will POST to. Defaults to the configured
     /// `server_url` / AI_MEMORY_SERVER_URL when set, else loopback. If neither
     /// is configured, apply-mode also reuses an existing ai-memory MCP entry
     /// for the same agent when one is present.
-    ///
-    /// `Option` (no `default_value_t`) is deliberate: it lets
-    /// `effective_hook_server_url` distinguish "not passed" from "passed
-    /// and happens to equal the compiled default" — a plain `String` with
-    /// a default can't tell those apart, which let `AI_MEMORY_SERVER_URL`
-    /// silently override an explicit `--server-url <default>` (found
-    /// 2026-07-12 during Devin real-acceptance A/B testing).
+    // Keep this optional so effective_hook_server_url can distinguish an
+    // omitted flag from an explicit URL that equals the compiled default.
     #[arg(long)]
     pub server_url: Option<String>,
     /// Bearer token to embed in the hook config's `env` block. When
@@ -1291,12 +1287,9 @@ pub struct InstallHooksArgs {
     /// is set there. Generate one with `ai-memory generate-auth-token`.
     #[arg(long, hide_env_values = true)]
     pub auth_token: Option<String>,
-    /// **Multi-user attribution (P1.8)**: stamp the installed hooks
-    /// with this username so the operator + the hook scripts both
-    /// know which registered user (from `ai-memory user add`) the
-    /// install is for. This flag is metadata — the actual token
-    /// stamped into the hook env block is whatever you pass via
-    /// `--auth-token`. Recommended workflow:
+    /// Stamp the installed hooks with a registered username for operator
+    /// visibility. This flag is metadata: the server resolves attribution
+    /// from the token passed via `--auth-token`. Recommended workflow:
     ///
     /// ```bash
     /// # 1. create the user (prints the token once)
@@ -1307,9 +1300,8 @@ pub struct InstallHooksArgs {
     ///     --as-user alice --auth-token <alice-token>
     /// ```
     ///
-    /// Without this flag, hooks are installed anonymously (same as
-    /// pre-v0.8 behaviour) — every write attributed to "anonymous"
-    /// or to `[auth].root_username` when the root token is reused.
+    /// Without this flag, the installer omits the username label;
+    /// attribution still resolves from the bearer token at request time.
     #[arg(long)]
     pub as_user: Option<String>,
     /// **Mutate** the selected agent's hook config in place instead of
@@ -1342,12 +1334,10 @@ pub struct InstallMcpArgs {
     /// Server URL the client should connect to — either the base URL
     /// (`https://host:49374`, the same value `install-hooks --server-url`
     /// takes) or the full MCP endpoint (`…/mcp`); a missing `/mcp` suffix
-    /// is appended automatically (#185). Defaults to the configured
+    /// is appended automatically. Defaults to the configured
     /// `server_url` / AI_MEMORY_SERVER_URL plus `/mcp` when set, else
     /// loopback.
-    ///
-    /// `Option` (no `default_value_t`) is deliberate: see the matching
-    /// comment on `InstallHooksArgs::server_url` — same bug, same fix.
+    // Keep this optional for the same explicit-URL precedence as hook install.
     #[arg(long)]
     pub server_url: Option<String>,
     /// Friendly name the client should show for this server entry.

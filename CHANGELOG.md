@@ -7,7 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Configuring the hosted `anthropic` or `openai` provider without an explicit
+  model now selects the documented recommended defaults, `claude-haiku-4-5`
+  and `gpt-5.4-mini`, instead of the older `claude-sonnet-4-6` and
+  `gpt-4o-mini` fallbacks. Explicit `AI_MEMORY_LLM_MODEL` values are unchanged.
+
 ### Fixed
+- User-facing help and current-reference documentation now match the shipped
+  agent integrations, multi-user activation boundary, MCP URL normalization,
+  Pi bridge, and `memory_consolidate` configuration requirements. Local
+  documentation links and anchors were also audited and repaired.
 - Reader APIs now derive absent page kinds consistently from canonical path
   families. Session, concept, procedure, note, and slot pages no longer surface
   as generic facts, while an explicit frontmatter `kind` still takes precedence

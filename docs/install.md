@@ -484,9 +484,9 @@ AI_MEMORY_NATIVE_TEST_IMAGE=quay.io/toolbx/arch-toolbox:latest scripts/test-nati
 
 ## Configuring other agent CLIs
 
-> `install-mcp --server-url` takes the MCP endpoint **including** `/mcp`
-> (e.g. `http://homelab:49374/mcp`) — the rendered client config expects the
-> full MCP URL. `install-hooks --server-url` takes the bare server **origin**
+> `install-mcp --server-url` accepts either the bare server origin or the full
+> MCP endpoint and appends a missing `/mcp` exactly once.
+> `install-hooks --server-url` takes the bare server **origin**
 > (e.g. `http://homelab:49374`) — hook scripts append `/hook`, `/handoff`,
 > etc. themselves.
 
@@ -498,9 +498,9 @@ Each agent CLI needs two things:
    Without this, the agent can still query memory but capture
    becomes manual.
 
-Claude Desktop is MCP-only today. Claude Code, Codex, Devin CLI, OpenCode,
-OMP, Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, Kimi Code, and OpenClaw have lifecycle capture paths through
-`install-hooks`.
+Claude Desktop and VS Code Copilot are MCP-only today. The hook-capable clients
+in the [README Support Matrix](../README.md#support-matrix), including Pi and
+Zero, have lifecycle capture paths through `install-hooks`.
 
 > **Hook install pattern.** Local supported profiles default to host-native
 > commands. Claude Code may use its supported Windows exec form (`command` =
@@ -510,7 +510,7 @@ OMP, Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, Kimi Code, and OpenCla
 > enforce capture-policy v1. Remote-only/Docker script installs still use the
 > two-step path: (1) `docker cp` bundled scripts to your home dir, (2)
 > `docker run --rm install-hooks` renders the config snippet.
-> OpenClaw, OpenCode, and OMP are different: they use generated
+> OpenClaw, OpenCode, OMP, and Pi are different: they use generated
 > TypeScript plugin/extension files, so no shell-script extraction is
 > needed for those clients.
 
@@ -1201,7 +1201,7 @@ remains opt-in and keeps its interval-only behavior (no startup catch-up).
 
 ---
 
-## Bootstrap mid-project {#bootstrap-mid-project}
+## Bootstrap mid-project
 
 When you adopt ai-memory in a project that's already been around for
 a while, the wiki starts empty. `ai-memory bootstrap` ingests the
@@ -1388,7 +1388,7 @@ write to `~/.local/share/ai-memory/hooks/`.
   (`bin/deploy`, cloudflared TLS, env-file management)
 - [`docs/usage.md`](usage.md) - handoffs, proactive querying, web UI, slim
   routing snippet + managed Agent Skills, migration from other memory tools, and raw-wiki inspection
-- [`docs/mcp-install.md`](mcp-install.md) - per-client MCP config
-  reference for Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, OpenClaw, OMP, VS Code Copilot
+- [`docs/mcp-install.md`](mcp-install.md) - per-client MCP config reference for
+  every client in the [README Support Matrix](../README.md#support-matrix)
 - [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) - what's actually
   running inside ai-memory

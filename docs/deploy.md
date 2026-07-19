@@ -43,7 +43,7 @@ cp docker/docker-compose.prod.yml.example docker/docker-compose.prod.yml
 $EDITOR docker/docker-compose.prod.yml   # set the image tag + adjust ports if needed
 
 cp docker/.env.production.example docker/.env.production
-$EDITOR docker/.env.production        # fill API keys; pick LLM provider + model
+$EDITOR docker/.env.production        # fill credentials; pick an LLM provider (model override optional)
 
 # 2. Create the deploy dir on the homelab. Source bin/deploy.env so
 #    SERVER/DEPLOY_DIR are exported in this shell.
@@ -99,9 +99,9 @@ curl -sI http://homelab:49374/handoff \
 
 **Then update every MCP client** to send the same token. `ai-memory
 install-mcp --client <name> --auth-token <token>` prints the exact
-snippet per client (Claude Code, Codex, OpenCode, Cursor, Claude
-Desktop, Gemini CLI, OpenClaw, OMP / Oh My Pi, Antigravity CLI). The agent CLI sends an
-`Authorization: Bearer <token>` header on every call; ai-memory's
+snippet for every client in the [README Support Matrix](../README.md#support-matrix);
+run `ai-memory install-mcp --help` for the current accepted values. The agent
+CLI sends an `Authorization: Bearer <token>` header on every call; ai-memory's
 middleware validates with a constant-time comparison.
 
 **Encrypted transport.** Plain HTTP on the LAN means anyone with a

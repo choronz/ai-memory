@@ -1454,8 +1454,9 @@ impl AiMemoryServer {
         (single-page) rewrites sessions/<id>.md from the observation \
         log. multi_page=true fans out into a batch of concept/decision/\
         gotcha pages plus the session page, all written in one atomic \
-        SQL transaction. Off by default; requires \
-        AI_MEMORY_LLM_PROVIDER + AI_MEMORY_LLM_MODEL set on the server. \
+        SQL transaction. Off by default; requires AI_MEMORY_LLM_PROVIDER \
+        plus that provider's credentials. AI_MEMORY_LLM_MODEL is optional \
+        for providers with a built-in default. \
         The consolidation target is resolved from where the session's \
         observations actually landed, so a session that adopted its scope \
         marker mid-run still consolidates into the right project. Admission \
@@ -1471,7 +1472,7 @@ impl AiMemoryServer {
     ) -> Result<CallToolResult, McpError> {
         let Some(consolidator) = self.consolidator.as_ref() else {
             return Err(McpError::internal_error(
-                "memory_consolidate not configured (set AI_MEMORY_LLM_PROVIDER + AI_MEMORY_LLM_MODEL)",
+                "memory_consolidate not configured (set AI_MEMORY_LLM_PROVIDER and the provider's required credentials; providers without a built-in model also require AI_MEMORY_LLM_MODEL)",
                 None,
             ));
         };
@@ -6380,6 +6381,14 @@ mod tests {
         assert!(
             msg.contains("not configured"),
             "error should mention configuration: {msg}",
+        );
+        assert!(
+            msg.contains("provider's required credentials"),
+            "error should direct users to provider credentials: {msg}",
+        );
+        assert!(
+            msg.contains("without a built-in model"),
+            "error should not imply every provider needs an explicit model: {msg}",
         );
     }
 
