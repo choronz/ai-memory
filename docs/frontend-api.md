@@ -170,7 +170,7 @@ links + back-links.
   "frontmatter": { "tags": ["adr"], "pinned": true },
   "body": "# Standardised on Postgres\n\n…",
   "links":     [ { "path": "concepts/db-rules.md", "title": "DB rules", "kind": "rule" } ],
-  "backlinks": [ { "path": "sessions/2026-05-27.md", "title": "Session 2026-05-27", "kind": "fact" } ]
+  "backlinks": [ { "path": "sessions/2026-05-27.md", "title": "Session 2026-05-27", "kind": "session" } ]
 }
 ```
 
@@ -238,6 +238,12 @@ GET /api/v1/workspaces/{workspace}/projects/{project}/recent?limit=20
 `is_latest = 1` pages ordered by `updated_at` DESC. `limit` clamped
 `1..=100`, default `10`.
 
+Every reader surface uses the same `kind` contract. An explicit frontmatter
+`kind` wins; otherwise the path families `_rules/`, `_slots/`, `sessions/`,
+`decisions/`, `gotchas/`, `concepts/`, `procedures/`, and `notes/` derive
+`rule`, `slot`, `session`, `decision`, `gotcha`, `concept`, `procedure`, and
+`note`, respectively. Other paths fall back to `fact`.
+
 **Response:** `{ "pages": [BriefingPage, …] }`
 
 ```json
@@ -246,7 +252,7 @@ GET /api/v1/workspaces/{workspace}/projects/{project}/recent?limit=20
     {
       "path": "sessions/2026-05-28.md",
       "title": "Session 2026-05-28",
-      "kind": "fact",
+      "kind": "session",
       "updated_at": "2026-05-28T14:02:11.123Z"
     }
   ]
@@ -278,9 +284,9 @@ pages. No LLM, deterministic.
   "last_observation_at": "2026-05-28T13:58:02.123Z",
   "pending_handoff_count": 0,
   "rules": [{ "path": "_rules/postgres.md", "title": "Postgres only", "kind": "rule",  "updated_at": "…" }],
-  "slots": [{ "path": "_slots/focus.md",    "title": "Current focus", "kind": "fact",  "updated_at": "…" }],
+  "slots": [{ "path": "_slots/focus.md",    "title": "Current focus", "kind": "slot",  "updated_at": "…" }],
   "recent_pages": [
-    { "path": "sessions/2026-05-28.md", "title": "Session 2026-05-28", "kind": "fact", "updated_at": "…" }
+    { "path": "sessions/2026-05-28.md", "title": "Session 2026-05-28", "kind": "session", "updated_at": "…" }
   ]
 }
 ```
@@ -324,7 +330,7 @@ across all projects in the workspace:
   "project": "ai-memory",
   "path": "concepts/old-thing.md",
   "title": "Old thing",
-  "kind": "fact"
+  "kind": "concept"
 }
 ```
 

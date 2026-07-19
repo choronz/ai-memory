@@ -35,6 +35,25 @@ use crate::fts_query::prepare_fts5_query;
 use crate::maintenance::MaintenanceJob;
 use crate::users::TOKEN_HASH_LEN;
 
+fn page_kind_expr(path_column: &str, frontmatter_column: &str) -> String {
+    format!(
+        "COALESCE( \
+            json_extract({frontmatter_column}, '$.kind'), \
+            CASE \
+                WHEN {path_column} LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
+                WHEN {path_column} LIKE '\\_slots/%' ESCAPE '\\' THEN 'slot' \
+                WHEN {path_column} LIKE 'sessions/%' THEN 'session' \
+                WHEN {path_column} LIKE 'decisions/%' THEN 'decision' \
+                WHEN {path_column} LIKE 'gotchas/%' THEN 'gotcha' \
+                WHEN {path_column} LIKE 'concepts/%' THEN 'concept' \
+                WHEN {path_column} LIKE 'procedures/%' THEN 'procedure' \
+                WHEN {path_column} LIKE 'notes/%' THEN 'note' \
+                ELSE 'fact' \
+            END \
+        )"
+    )
+}
+
 /// One hit returned by [`ReaderPool::search_pages`].
 #[derive(Debug, Clone, Serialize)]
 pub struct PageHit {
@@ -363,7 +382,8 @@ pub struct BriefingPage {
     pub path: String,
     /// Page title (first H1 / frontmatter title).
     pub title: String,
-    /// Semantic classification — `decision` / `gotcha` / `rule` / `fact`.
+    /// Semantic classification, derived from explicit frontmatter or the
+    /// page's canonical path family.
     pub kind: String,
     /// ISO-8601 timestamp of the last update.
     pub updated_at: String,
@@ -1962,6 +1982,7 @@ impl ReaderPool {
     pub async fn briefing(&self, recent_pages_limit: usize) -> StoreResult<BriefingSnapshot> {
         let recent_limit = recent_pages_limit.clamp(1, 100) as i64;
         self.with_conn(move |conn| {
+            let kind_expr = page_kind_expr("path", "frontmatter_json");
             let now_us = jiff::Timestamp::now().as_microsecond();
             let day_us: i64 = 86_400 * 1_000_000;
             let cutoff_7d = now_us - 7 * day_us;
@@ -1993,59 +2014,40 @@ impl ReaderPool {
             // Rules: any `is_latest = 1` page under `_rules/`.
             // Routed there automatically by the consolidator when
             // `kind = "rule"` — see consolidator.rs::slugify_for_rule.
-            let mut rules_stmt = conn.prepare_cached(
-                "SELECT path, title, \
-                        COALESCE( \
-                            json_extract(frontmatter_json, '$.kind'), \
-                            CASE \
-                                WHEN path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
-                                WHEN path LIKE 'decisions/%' THEN 'decision' \
-                                WHEN path LIKE 'gotchas/%' THEN 'gotcha' \
-                                ELSE 'fact' \
-                            END \
-                        ) AS kind, \
+            let mut rules_stmt = conn.prepare_cached(&format!(
+                "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
                   WHERE is_latest = 1 AND path GLOB '_rules/*' \
-                  ORDER BY updated_at DESC",
-            )?;
+                  ORDER BY updated_at DESC"
+            ))?;
             let rules: Vec<BriefingPage> = rules_stmt
                 .query_map([], briefing_page_from_row)?
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
 
-            let mut slots_stmt = conn.prepare_cached(
-                "SELECT path, title, \
-                        COALESCE(json_extract(frontmatter_json, '$.kind'), 'slot') AS kind, \
+            let mut slots_stmt = conn.prepare_cached(&format!(
+                "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
                   WHERE is_latest = 1 AND path GLOB '_slots/*' \
-                  ORDER BY path ASC",
-            )?;
+                  ORDER BY path ASC"
+            ))?;
             let slots: Vec<BriefingPage> = slots_stmt
                 .query_map([], briefing_page_from_row)?
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
 
-            let mut recent_stmt = conn.prepare_cached(
-                "SELECT path, title, \
-                        COALESCE( \
-                            json_extract(frontmatter_json, '$.kind'), \
-                            CASE \
-                                WHEN path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
-                                WHEN path LIKE 'decisions/%' THEN 'decision' \
-                                WHEN path LIKE 'gotchas/%' THEN 'gotcha' \
-                                ELSE 'fact' \
-                            END \
-                        ) AS kind, \
+            let mut recent_stmt = conn.prepare_cached(&format!(
+                "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
                  WHERE is_latest = 1 \
                  ORDER BY updated_at DESC \
-                 LIMIT ?1",
-            )?;
+                 LIMIT ?1"
+            ))?;
             let recent_pages: Vec<BriefingPage> = recent_stmt
                 .query_map(params![recent_limit], briefing_page_from_row)?
                 .collect::<Result<Vec<_>, _>>()?
@@ -2081,6 +2083,7 @@ impl ReaderPool {
     ) -> StoreResult<BriefingSnapshot> {
         let recent_limit = recent_pages_limit.clamp(1, 100) as i64;
         self.with_conn(move |conn| {
+            let kind_expr = page_kind_expr("path", "frontmatter_json");
             let now_us = jiff::Timestamp::now().as_microsecond();
             let day_us: i64 = 86_400 * 1_000_000;
             let cutoff_7d = now_us - 7 * day_us;
@@ -2135,59 +2138,40 @@ impl ReaderPool {
                 project_id,
             )?;
 
-            let mut rules_stmt = conn.prepare_cached(
-                "SELECT path, title, \
-                        COALESCE( \
-                            json_extract(frontmatter_json, '$.kind'), \
-                            CASE \
-                                WHEN path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
-                                WHEN path LIKE 'decisions/%' THEN 'decision' \
-                                WHEN path LIKE 'gotchas/%' THEN 'gotcha' \
-                                ELSE 'fact' \
-                            END \
-                        ) AS kind, \
+            let mut rules_stmt = conn.prepare_cached(&format!(
+                "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
                   WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 AND path GLOB '_rules/*' \
-                  ORDER BY updated_at DESC",
-            )?;
+                  ORDER BY updated_at DESC"
+            ))?;
             let rules: Vec<BriefingPage> = rules_stmt
                 .query_map(params![workspace_id.as_bytes(), project_id.as_bytes()], briefing_page_from_row)?
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
 
-            let mut slots_stmt = conn.prepare_cached(
-                "SELECT path, title, \
-                        COALESCE(json_extract(frontmatter_json, '$.kind'), 'slot') AS kind, \
+            let mut slots_stmt = conn.prepare_cached(&format!(
+                "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
                   WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 AND path GLOB '_slots/*' \
-                  ORDER BY path ASC",
-            )?;
+                  ORDER BY path ASC"
+            ))?;
             let slots: Vec<BriefingPage> = slots_stmt
                 .query_map(params![workspace_id.as_bytes(), project_id.as_bytes()], briefing_page_from_row)?
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
 
-            let mut recent_stmt = conn.prepare_cached(
-                "SELECT path, title, \
-                        COALESCE( \
-                            json_extract(frontmatter_json, '$.kind'), \
-                            CASE \
-                                WHEN path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
-                                WHEN path LIKE 'decisions/%' THEN 'decision' \
-                                WHEN path LIKE 'gotchas/%' THEN 'gotcha' \
-                                ELSE 'fact' \
-                            END \
-                        ) AS kind, \
+            let mut recent_stmt = conn.prepare_cached(&format!(
+                "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 \
                  ORDER BY updated_at DESC \
-                 LIMIT ?3",
-            )?;
+                 LIMIT ?3"
+            ))?;
             let recent_pages: Vec<BriefingPage> = recent_stmt
                 .query_map(params![workspace_id.as_bytes(), project_id.as_bytes(), recent_limit], briefing_page_from_row)?
                 .collect::<Result<Vec<_>, _>>()?
@@ -2235,6 +2219,7 @@ impl ReaderPool {
         let core_limit = core_pages_limit.clamp(1, 100) as i64;
         let recent_limit = recent_pages_limit.clamp(1, 100) as i64;
         self.with_conn(move |conn| {
+            let kind_expr = page_kind_expr("path", "frontmatter_json");
             let mut core_stmt = conn.prepare_cached(
                 "SELECT path, title, body, pinned, updated_at \
                  FROM pages \
@@ -2276,23 +2261,14 @@ impl ReaderPool {
                 })
                 .collect::<StoreResult<Vec<_>>>()?;
 
-            let mut recent_stmt = conn.prepare_cached(
-                "SELECT path, title, \
-                        COALESCE( \
-                            json_extract(frontmatter_json, '$.kind'), \
-                            CASE \
-                                WHEN path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
-                                WHEN path LIKE 'decisions/%' THEN 'decision' \
-                                WHEN path LIKE 'gotchas/%' THEN 'gotcha' \
-                                ELSE 'fact' \
-                            END \
-                        ) AS kind, \
+            let mut recent_stmt = conn.prepare_cached(&format!(
+                "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 \
                  ORDER BY updated_at DESC \
-                 LIMIT ?3",
-            )?;
+                 LIMIT ?3"
+            ))?;
             let recent: Vec<BriefingPage> = recent_stmt
                 .query_map(
                     params![workspace_id.as_bytes(), project_id.as_bytes(), recent_limit],
@@ -2399,6 +2375,7 @@ impl ReaderPool {
     ) -> StoreResult<BriefingSnapshot> {
         let recent_limit = recent_pages_limit.clamp(1, 100) as i64;
         self.with_conn(move |conn| {
+            let kind_expr = page_kind_expr("path", "frontmatter_json");
             let now_us = jiff::Timestamp::now().as_microsecond();
             let day_us: i64 = 86_400 * 1_000_000;
             let cutoff_7d = now_us - 7 * day_us;
@@ -2448,59 +2425,40 @@ impl ReaderPool {
                 workspace_id,
             )?;
 
-            let mut rules_stmt = conn.prepare_cached(
-                "SELECT path, title, \
-                        COALESCE( \
-                            json_extract(frontmatter_json, '$.kind'), \
-                            CASE \
-                                WHEN path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
-                                WHEN path LIKE 'decisions/%' THEN 'decision' \
-                                WHEN path LIKE 'gotchas/%' THEN 'gotcha' \
-                                ELSE 'fact' \
-                            END \
-                        ) AS kind, \
+            let mut rules_stmt = conn.prepare_cached(&format!(
+                "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
                   WHERE workspace_id = ?1 AND is_latest = 1 AND path GLOB '_rules/*' \
-                  ORDER BY updated_at DESC",
-            )?;
+                  ORDER BY updated_at DESC"
+            ))?;
             let rules: Vec<BriefingPage> = rules_stmt
                 .query_map(params![workspace_id.as_bytes()], briefing_page_from_row)?
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
 
-            let mut slots_stmt = conn.prepare_cached(
-                "SELECT path, title, \
-                        COALESCE(json_extract(frontmatter_json, '$.kind'), 'slot') AS kind, \
+            let mut slots_stmt = conn.prepare_cached(&format!(
+                "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
                   WHERE workspace_id = ?1 AND is_latest = 1 AND path GLOB '_slots/*' \
-                  ORDER BY path ASC",
-            )?;
+                  ORDER BY path ASC"
+            ))?;
             let slots: Vec<BriefingPage> = slots_stmt
                 .query_map(params![workspace_id.as_bytes()], briefing_page_from_row)?
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
 
-            let mut recent_stmt = conn.prepare_cached(
-                "SELECT path, title, \
-                        COALESCE( \
-                            json_extract(frontmatter_json, '$.kind'), \
-                            CASE \
-                                WHEN path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
-                                WHEN path LIKE 'decisions/%' THEN 'decision' \
-                                WHEN path LIKE 'gotchas/%' THEN 'gotcha' \
-                                ELSE 'fact' \
-                            END \
-                        ) AS kind, \
+            let mut recent_stmt = conn.prepare_cached(&format!(
+                "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
                  WHERE workspace_id = ?1 AND is_latest = 1 \
                  ORDER BY updated_at DESC \
-                 LIMIT ?2",
-            )?;
+                 LIMIT ?2"
+            ))?;
             let recent_pages: Vec<BriefingPage> = recent_stmt
                 .query_map(
                     params![workspace_id.as_bytes(), recent_limit],
@@ -2687,19 +2645,13 @@ impl ReaderPool {
             };
 
             // Shared SELECT prefix: identity + path-inferred `kind`.
-            let select = "SELECT w.name, p.name, pg.path, pg.title, \
-                          COALESCE( \
-                              json_extract(pg.frontmatter_json, '$.kind'), \
-                              CASE \
-                                  WHEN pg.path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
-                                  WHEN pg.path LIKE 'decisions/%' THEN 'decision' \
-                                  WHEN pg.path LIKE 'gotchas/%' THEN 'gotcha' \
-                                  ELSE 'fact' \
-                              END \
-                          ) \
+            let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
+            let select = format!(
+                "SELECT w.name, p.name, pg.path, pg.title, {kind_expr} \
                    FROM pages pg \
                    JOIN projects p ON p.id = pg.project_id \
-                   JOIN workspaces w ON w.id = pg.workspace_id ";
+                   JOIN workspaces w ON w.id = pg.workspace_id "
+            );
 
             // Params follow placeholder order: ws, cutoff, [proj], limit.
             let stale_sql = format!(
@@ -2778,30 +2730,22 @@ impl ReaderPool {
     /// Propagates any SQL or pool error.
     pub async fn page_meta_by_id(&self, page_id: PageId) -> StoreResult<Option<PageMeta>> {
         self.with_conn(move |conn| {
+            let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
+            let sql = format!(
+                "SELECT w.name, p.name, w.id, p.id, pg.path, pg.title, \
+                        {kind_expr}, \
+                        pg.tier, pg.pinned, pg.created_at, pg.updated_at, \
+                        sp.path AS supersedes_path, \
+                        au.username, au.name, au.email \
+                 FROM pages pg \
+                 JOIN projects p ON p.id = pg.project_id \
+                 JOIN workspaces w ON w.id = pg.workspace_id \
+                 LEFT JOIN pages sp ON sp.id = pg.supersedes \
+                 LEFT JOIN users au ON au.id = pg.author_id \
+                 WHERE pg.id = ?1 AND pg.is_latest = 1"
+            );
             let row_opt = conn
-                .query_row(
-                    "SELECT w.name, p.name, w.id, p.id, pg.path, pg.title, \
-                            COALESCE( \
-                                json_extract(pg.frontmatter_json, '$.kind'), \
-                                CASE \
-                                    WHEN pg.path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
-                                    WHEN pg.path LIKE 'decisions/%' THEN 'decision' \
-                                    WHEN pg.path LIKE 'gotchas/%' THEN 'gotcha' \
-                                    ELSE 'fact' \
-                                END \
-                            ), \
-                            pg.tier, pg.pinned, pg.created_at, pg.updated_at, \
-                            sp.path AS supersedes_path, \
-                            au.username, au.name, au.email \
-                     FROM pages pg \
-                     JOIN projects p ON p.id = pg.project_id \
-                     JOIN workspaces w ON w.id = pg.workspace_id \
-                     LEFT JOIN pages sp ON sp.id = pg.supersedes \
-                     LEFT JOIN users au ON au.id = pg.author_id \
-                     WHERE pg.id = ?1 AND pg.is_latest = 1",
-                    params![page_id.as_bytes()],
-                    page_meta_from_row,
-                )
+                .query_row(&sql, params![page_id.as_bytes()], page_meta_from_row)
                 .optional()?;
             row_opt.transpose()
         })
@@ -2819,31 +2763,23 @@ impl ReaderPool {
     pub async fn page_meta_by_path(&self, path: &str) -> StoreResult<Option<PageMeta>> {
         let path = path.to_owned();
         self.with_conn(move |conn| {
+            let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
+            let sql = format!(
+                "SELECT w.name, p.name, w.id, p.id, pg.path, pg.title, \
+                        {kind_expr}, \
+                        pg.tier, pg.pinned, pg.created_at, pg.updated_at, \
+                        sp.path AS supersedes_path, \
+                        au.username, au.name, au.email \
+                 FROM pages pg \
+                 JOIN projects p ON p.id = pg.project_id \
+                 JOIN workspaces w ON w.id = pg.workspace_id \
+                 LEFT JOIN pages sp ON sp.id = pg.supersedes \
+                 LEFT JOIN users au ON au.id = pg.author_id \
+                 WHERE pg.path = ?1 AND pg.is_latest = 1 \
+                 LIMIT 1"
+            );
             let row_opt = conn
-                .query_row(
-                    "SELECT w.name, p.name, w.id, p.id, pg.path, pg.title, \
-                            COALESCE( \
-                                json_extract(pg.frontmatter_json, '$.kind'), \
-                                CASE \
-                                    WHEN pg.path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
-                                    WHEN pg.path LIKE 'decisions/%' THEN 'decision' \
-                                    WHEN pg.path LIKE 'gotchas/%' THEN 'gotcha' \
-                                    ELSE 'fact' \
-                                END \
-                            ), \
-                            pg.tier, pg.pinned, pg.created_at, pg.updated_at, \
-                            sp.path AS supersedes_path, \
-                            au.username, au.name, au.email \
-                     FROM pages pg \
-                     JOIN projects p ON p.id = pg.project_id \
-                     JOIN workspaces w ON w.id = pg.workspace_id \
-                     LEFT JOIN pages sp ON sp.id = pg.supersedes \
-                     LEFT JOIN users au ON au.id = pg.author_id \
-                     WHERE pg.path = ?1 AND pg.is_latest = 1 \
-                     LIMIT 1",
-                    params![path],
-                    page_meta_from_row,
-                )
+                .query_row(&sql, params![path], page_meta_from_row)
                 .optional()?;
             row_opt.transpose()
         })
@@ -2882,40 +2818,27 @@ impl ReaderPool {
             // Outgoing: latest pages this page links to. Incoming: latest
             // pages that link here. Both reuse the path-inference `kind`
             // fallback so untagged pages still classify.
-            let outgoing = "SELECT DISTINCT pg.path, pg.title, \
-                            COALESCE( \
-                                json_extract(pg.frontmatter_json, '$.kind'), \
-                                CASE \
-                                    WHEN pg.path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
-                                    WHEN pg.path LIKE 'decisions/%' THEN 'decision' \
-                                    WHEN pg.path LIKE 'gotchas/%' THEN 'gotcha' \
-                                    ELSE 'fact' \
-                                END \
-                            ), \
+            let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
+            let outgoing = format!(
+                "SELECT DISTINCT pg.path, pg.title, {kind_expr}, \
                             ws.name, pr.name \
                      FROM links l \
                      JOIN pages pg ON pg.id = l.to_page_id \
                      JOIN projects pr ON pr.id = pg.project_id \
                      JOIN workspaces ws ON ws.id = pg.workspace_id \
                      WHERE l.from_page_id = ?1 AND pg.is_latest = 1 \
-                     ORDER BY ws.name, pr.name, pg.path";
-            let incoming = "SELECT DISTINCT pg.path, pg.title, \
-                            COALESCE( \
-                                json_extract(pg.frontmatter_json, '$.kind'), \
-                                CASE \
-                                    WHEN pg.path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
-                                    WHEN pg.path LIKE 'decisions/%' THEN 'decision' \
-                                    WHEN pg.path LIKE 'gotchas/%' THEN 'gotcha' \
-                                    ELSE 'fact' \
-                                END \
-                            ), \
+                     ORDER BY ws.name, pr.name, pg.path"
+            );
+            let incoming = format!(
+                "SELECT DISTINCT pg.path, pg.title, {kind_expr}, \
                             ws.name, pr.name \
                      FROM links l \
                      JOIN pages pg ON pg.id = l.from_page_id \
                      JOIN projects pr ON pr.id = pg.project_id \
                      JOIN workspaces ws ON ws.id = pg.workspace_id \
                      WHERE l.to_page_id = ?1 AND pg.is_latest = 1 \
-                     ORDER BY ws.name, pr.name, pg.path";
+                     ORDER BY ws.name, pr.name, pg.path"
+            );
 
             let collect = |sql: &str| -> StoreResult<Vec<RelatedPage>> {
                 let mut stmt = conn.prepare(sql)?;
@@ -2936,8 +2859,8 @@ impl ReaderPool {
             };
 
             Ok(PageLinks {
-                links: collect(outgoing)?,
-                backlinks: collect(incoming)?,
+                links: collect(&outgoing)?,
+                backlinks: collect(&incoming)?,
             })
         })
         .await
@@ -3284,24 +3207,16 @@ impl ReaderPool {
         let workspace = workspace.to_owned();
         let project = project.to_owned();
         self.with_conn(move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT pg.path, pg.title, \
-                        COALESCE( \
-                            json_extract(pg.frontmatter_json, '$.kind'), \
-                            CASE \
-                                WHEN pg.path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
-                                WHEN pg.path LIKE 'decisions/%' THEN 'decision' \
-                                WHEN pg.path LIKE 'gotchas/%' THEN 'gotcha' \
-                                ELSE 'fact' \
-                            END \
-                        ) AS kind, \
+            let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
+            let mut stmt = conn.prepare(&format!(
+                "SELECT pg.path, pg.title, {kind_expr} AS kind, \
                         pg.tier, pg.updated_at \
                  FROM pages pg \
                  JOIN projects p ON p.id = pg.project_id \
                  JOIN workspaces w ON w.id = pg.workspace_id \
                  WHERE w.name = ?1 AND p.name = ?2 AND pg.is_latest = 1 \
-                 ORDER BY pg.path ASC",
-            )?;
+                 ORDER BY pg.path ASC"
+            ))?;
             let rows = stmt.query_map(params![workspace, project], |row| {
                 let path: String = row.get(0)?;
                 let title: String = row.get(1)?;
@@ -3345,27 +3260,23 @@ impl ReaderPool {
         let project = project.to_owned();
         let page_path = page_path.to_owned();
         self.with_conn(move |conn| {
+            let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
+            let sql = format!(
+                "SELECT w.name, p.name, w.id, p.id, pg.path, pg.title, \
+                        {kind_expr}, \
+                        pg.tier, pg.pinned, pg.created_at, pg.updated_at, \
+                        sp.path AS supersedes_path, \
+                        au.username, au.name, au.email \
+                 FROM pages pg \
+                 JOIN projects p ON p.id = pg.project_id \
+                 JOIN workspaces w ON w.id = pg.workspace_id \
+                 LEFT JOIN pages sp ON sp.id = pg.supersedes \
+                 LEFT JOIN users au ON au.id = pg.author_id \
+                 WHERE w.name = ?1 AND p.name = ?2 AND pg.path = ?3 AND pg.is_latest = 1"
+            );
             let row_opt = conn
                 .query_row(
-                    "SELECT w.name, p.name, w.id, p.id, pg.path, pg.title, \
-                            COALESCE( \
-                                json_extract(pg.frontmatter_json, '$.kind'), \
-                                CASE \
-                                    WHEN pg.path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
-                                    WHEN pg.path LIKE 'decisions/%' THEN 'decision' \
-                                    WHEN pg.path LIKE 'gotchas/%' THEN 'gotcha' \
-                                    ELSE 'fact' \
-                                END \
-                            ), \
-                            pg.tier, pg.pinned, pg.created_at, pg.updated_at, \
-                            sp.path AS supersedes_path, \
-                            au.username, au.name, au.email \
-                     FROM pages pg \
-                     JOIN projects p ON p.id = pg.project_id \
-                     JOIN workspaces w ON w.id = pg.workspace_id \
-                     LEFT JOIN pages sp ON sp.id = pg.supersedes \
-                     LEFT JOIN users au ON au.id = pg.author_id \
-                     WHERE w.name = ?1 AND p.name = ?2 AND pg.path = ?3 AND pg.is_latest = 1",
+                    &sql,
                     params![workspace, project, page_path],
                     page_meta_from_row,
                 )

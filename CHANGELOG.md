@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Reader APIs now derive absent page kinds consistently from canonical path
+  families. Session, concept, procedure, note, and slot pages no longer surface
+  as generic facts, while an explicit frontmatter `kind` still takes precedence
+  ([#198]).
 - Native lifecycle hooks now accept one leading UTF-8 BOM on JSON stdin, which
   covers PowerShell pipelines on Windows. Other malformed payloads are dropped
   before spool or network delivery with a bounded content-free stderr warning;
