@@ -3,6 +3,10 @@
 use ai_memory_core::{AgentKind, ObservationKind};
 use serde::{Deserialize, Serialize};
 
+use crate::capture_policy::{
+    ToolObservationMetadata, tool_observation_metadata, tool_observation_outcome,
+};
+
 /// Query-string parameters on `POST /hook`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct HookQuery {
@@ -328,16 +332,39 @@ impl HookEnvelope {
         } else {
             None
         };
-        let title_hint = best_title_hint(event, &raw).or_else(|| {
-            source_event
-                .as_deref()
-                .map(|source| extension_title_hint(&raw, source))
-        });
-        let body_excerpt = best_body_excerpt(event, &raw).or_else(|| {
-            source_event
-                .as_deref()
-                .and_then(|_| extension_body_excerpt(&raw))
-        });
+        let tool_metadata = tool_observation_metadata(agent, &raw, event == HookEvent::PreToolUse);
+        let closed_tool_event = matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse)
+            && closed_tool_agent(agent);
+        let title_hint = if closed_tool_event {
+            tool_metadata.as_ref().map(safe_tool_title).or_else(|| {
+                (event == HookEvent::PostToolUse && agent == AgentKind::OpenCode)
+                    .then(|| legacy_tool_title(event, agent, &raw))
+                    .flatten()
+            })
+        } else if matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse) {
+            legacy_tool_title(event, agent, &raw)
+        } else {
+            best_title_hint(event, &raw).or_else(|| {
+                source_event
+                    .as_deref()
+                    .map(|source| extension_title_hint(&raw, source))
+            })
+        };
+        let body_excerpt = if closed_tool_event {
+            safe_tool_body(event, tool_metadata.as_ref(), agent, &raw).or_else(|| {
+                (event == HookEvent::PostToolUse && agent == AgentKind::OpenCode)
+                    .then(|| legacy_tool_body(event, agent, &raw))
+                    .flatten()
+            })
+        } else if matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse) {
+            legacy_tool_body(event, agent, &raw)
+        } else {
+            best_body_excerpt(event, &raw).or_else(|| {
+                source_event
+                    .as_deref()
+                    .and_then(|_| extension_body_excerpt(&raw))
+            })
+        };
         Self {
             event,
             agent,
@@ -354,6 +381,89 @@ impl HookEnvelope {
             body_excerpt,
             raw,
         }
+    }
+}
+
+fn legacy_tool_title(
+    event: HookEvent,
+    agent: AgentKind,
+    raw: &serde_json::Value,
+) -> Option<String> {
+    let payload = (event == HookEvent::PostToolUse && agent == AgentKind::OpenCode)
+        .then(|| raw.get("payload"))
+        .flatten()?;
+    extract_string(payload, &["tool"]).filter(|_| {
+        extract_content(
+            payload,
+            &["tool_response", "tool_output", "output", "result", "error"],
+        )
+        .is_some()
+    })
+}
+
+fn legacy_tool_body(event: HookEvent, agent: AgentKind, raw: &serde_json::Value) -> Option<String> {
+    let payload = (event == HookEvent::PostToolUse && agent == AgentKind::OpenCode)
+        .then(|| raw.get("payload"))
+        .flatten()?;
+    let tool = extract_string(payload, &["tool"])?;
+    let result = extract_content(
+        payload,
+        &["tool_response", "tool_output", "output", "result"],
+    )
+    .or_else(|| extract_content(payload, &["error"]))?;
+    Some(truncate_excerpt(&format!("tool: {tool}\n---\n{result}")))
+}
+
+const fn closed_tool_agent(agent: AgentKind) -> bool {
+    matches!(
+        agent,
+        AgentKind::ClaudeCode | AgentKind::OpenCode | AgentKind::Pi | AgentKind::AntigravityCli
+    )
+}
+
+fn safe_tool_title(metadata: &ToolObservationMetadata) -> String {
+    format!(
+        "tool {}",
+        serde_json::to_string(&metadata.tool_family)
+            .unwrap_or_default()
+            .trim_matches('"')
+    )
+}
+
+fn safe_tool_body(
+    event: HookEvent,
+    metadata: Option<&ToolObservationMetadata>,
+    agent: AgentKind,
+    raw: &serde_json::Value,
+) -> Option<String> {
+    let metadata = metadata?;
+    let mut summary = format!(
+        "tool_family: {}",
+        serde_json::to_string(&metadata.tool_family)
+            .ok()?
+            .trim_matches('"')
+    );
+    if let Some(id) = &metadata.tool_call_id {
+        summary.push_str("\ntool_call_id: ");
+        summary.push_str(id);
+    }
+    match event {
+        HookEvent::PreToolUse => Some(summary),
+        HookEvent::PostToolUse => {
+            summary.push_str("\noutcome: ");
+            summary.push_str(tool_observation_outcome(agent, raw).as_str());
+            if metadata.tool_family == crate::capture_policy::ToolFamily::Unknown {
+                return Some(summary);
+            }
+            let result =
+                extract_content(raw, &["tool_response", "tool_output", "output", "result"])
+                    .or_else(|| extract_content(raw, &["error"]))
+                    .unwrap_or_else(|| "(no output captured)".into());
+            summary.push_str("\n---\n");
+            summary.push_str(&result);
+            Some(truncate_excerpt(&summary))
+        }
+        _ => None,
     }
 }
 
@@ -461,7 +571,10 @@ fn best_title_hint(event: HookEvent, raw: &serde_json::Value) -> Option<String> 
     match event {
         HookEvent::SessionStart => extract_string(raw, &["model", "title"]),
         HookEvent::UserPrompt => {
-            extract_string(raw, &["prompt", "message", "text"]).map(|s| truncate_for_title(&s))
+            // Kimi Code sends `prompt` as content blocks
+            // (`[{"type":"text","text":...}]`); `extract_content` flattens
+            // them and returns identical values for plain-string agents.
+            extract_content(raw, &["prompt", "message", "text"]).map(|s| truncate_for_title(&s))
         }
         HookEvent::PreToolUse | HookEvent::PostToolUse => {
             extract_string(raw, &["tool", "tool_name", "name"])
@@ -585,11 +698,13 @@ fn truncate_excerpt(s: &str) -> String {
     if s.len() <= MAX {
         s.to_string()
     } else {
-        let mut buf = String::with_capacity(MAX + '…'.len_utf8());
+        // Reserve the ellipsis within the byte cap, not beyond it.
+        let limit = MAX - '…'.len_utf8();
+        let mut buf = String::with_capacity(MAX);
         let mut end = 0;
         for (idx, ch) in s.char_indices() {
             let next = idx + ch.len_utf8();
-            if next > MAX {
+            if next > limit {
                 break;
             }
             end = next;
@@ -790,7 +905,7 @@ mod tests {
             "cwd": "/tmp/x",
             "model": "claude-sonnet-4-6"
         });
-        let env = HookEnvelope::from_query_and_body(q, raw);
+        let env = HookEnvelope::from_query_and_body(q.clone(), raw);
         assert_eq!(env.event, HookEvent::SessionStart);
         assert_eq!(env.session_id.as_deref(), Some("abc-123"));
         assert_eq!(env.cwd.as_deref(), Some("/tmp/x"));
@@ -813,7 +928,7 @@ mod tests {
             "tool_response": {"success": true, "output": "ok", "error": null}
         });
 
-        let env = HookEnvelope::from_query_and_body(q, raw);
+        let env = HookEnvelope::from_query_and_body(q.clone(), raw);
 
         assert_eq!(env.event, HookEvent::PostToolUse);
         assert_eq!(env.agent, AgentKind::Devin);
@@ -939,7 +1054,7 @@ mod tests {
             Some("ec33ebf9-0cba-4100-8142-c61503f6c587")
         );
         assert_eq!(env.cwd.as_deref(), Some("/workspace/project"));
-        assert_eq!(env.title_hint.as_deref(), Some("run_command"));
+        assert_eq!(env.title_hint.as_deref(), Some("tool non-file"));
     }
 
     #[test]
@@ -956,13 +1071,8 @@ mod tests {
             "error": "exit status 1"
         });
         let env = HookEnvelope::from_query_and_body(q, raw);
-
-        assert_eq!(env.title_hint.as_deref(), Some("step 5"));
-        assert!(
-            env.body_excerpt
-                .as_deref()
-                .is_some_and(|body| body.contains("exit status 1"))
-        );
+        assert!(env.title_hint.is_none());
+        assert!(env.body_excerpt.is_none());
     }
 
     /// OpenCode's plugin SDK sends `sessionID` (capital `ID`) on the
@@ -1006,17 +1116,19 @@ mod tests {
                 "output": "tests passed"
             }
         });
-        let env = HookEnvelope::from_query_and_body(q, raw);
+        let env = HookEnvelope::from_query_and_body(q.clone(), raw);
         assert_eq!(env.session_id.as_deref(), Some("ses_nested"));
         assert_eq!(env.cwd.as_deref(), Some("/home/user/ai-memory"));
         assert_eq!(env.title_hint.as_deref(), Some("bash"));
-        assert!(
-            env.body_excerpt
-                .as_deref()
-                .is_some_and(|body| body.contains("tests passed")),
-            "post-tool body should include nested output: {:?}",
-            env.body_excerpt
+        assert_eq!(
+            env.body_excerpt.as_deref(),
+            Some("tool: bash\n---\ntests passed")
         );
+        let long = HookEnvelope::from_query_and_body(
+            q,
+            serde_json::json!({"payload":{"tool":"bash","output":"é".repeat(2_000)}}),
+        );
+        assert!(long.body_excerpt.unwrap().len() <= 2_000);
     }
 
     /// OpenCode's plugin `event` hook receives bus events shaped like
@@ -1179,6 +1291,28 @@ mod tests {
         assert!(title.ends_with('…'));
     }
 
+    /// Kimi Code's content-block `prompt` must flatten into the title
+    /// exactly like the body excerpt does.
+    #[test]
+    fn user_prompt_title_flattens_kimi_code_content_blocks() {
+        let q = HookQuery {
+            event: "user-prompt".into(),
+            agent: Some("kimi-code".into()),
+            ..Default::default()
+        };
+        let env = HookEnvelope::from_query_and_body(
+            q,
+            serde_json::json!({
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "session_kimi-1",
+                "cwd": "/tmp/proj",
+                "prompt": [ { "type": "text", "text": "hello" } ]
+            }),
+        );
+        assert_eq!(env.title_hint.as_deref(), Some("hello"));
+        assert_eq!(env.body_excerpt.as_deref(), Some("hello"));
+    }
+
     #[test]
     fn post_tool_excerpt_truncates_without_splitting_utf8() {
         let q = HookQuery {
@@ -1190,13 +1324,14 @@ mod tests {
         let env = HookEnvelope::from_query_and_body(
             q,
             serde_json::json!({
-                "tool": "bash",
+                "tool_name": "Bash",
+                "tool_input": {},
                 "result": output,
             }),
         );
         let excerpt = env.body_excerpt.unwrap();
         assert!(excerpt.ends_with('…'));
-        assert!(excerpt.starts_with("tool: bash\n---\n"));
+        assert!(excerpt.starts_with("tool_family: non-file\noutcome: unknown\n---\n"));
     }
 
     /// Regression: the native-binary hook command sends the script stem
@@ -1230,6 +1365,7 @@ mod tests {
             q,
             serde_json::json!({
                 "tool_name": "Bash",
+                "tool_input": {},
                 "tool_response": [{"type": "text", "text": "MARKER_OUTPUT_123"}],
             }),
         );
@@ -1257,6 +1393,7 @@ mod tests {
             q,
             serde_json::json!({
                 "tool_name": "Read",
+                "tool_input": {},
                 "tool_response": {"stdout": "MARKER_OBJ_456"},
             }),
         );
@@ -1282,5 +1419,251 @@ mod tests {
         );
         assert_eq!(env.event, HookEvent::UserPrompt);
         assert_eq!(env.body_excerpt.as_deref(), Some("MARKER_PROMPT_789"));
+    }
+
+    #[test]
+    fn closed_tool_summaries_keep_only_safe_metadata_and_cap_total_body() {
+        let fixtures = [
+            (
+                "claude-code",
+                serde_json::json!({"tool_name":"Bash","tool_input":{"command":"SENTINEL_COMMAND","path":"SENTINEL_PATH"},"tool_use_id":"claude-1","output":"SENTINEL_OUTPUT"}),
+                "claude-1",
+                "unknown",
+            ),
+            (
+                "open-code",
+                serde_json::json!({"tool":"bash","args":{"command":"SENTINEL_COMMAND"},"callID":"open-1","output":"SENTINEL_OUTPUT"}),
+                "open-1",
+                "unknown",
+            ),
+            (
+                "pi",
+                serde_json::json!({"tool":"bash","args":{"command":"SENTINEL_COMMAND"},"callID":"pi-1","isError":true,"output":"SENTINEL_OUTPUT"}),
+                "pi-1",
+                "error",
+            ),
+        ];
+        for (agent, raw, id, outcome) in fixtures {
+            let pre = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "pre-tool-use".into(),
+                    agent: Some(agent.into()),
+                    ..Default::default()
+                },
+                raw.clone(),
+            );
+            let pre_body = pre.body_excerpt.expect("pre summary");
+            assert!(pre_body.contains(id));
+            for sentinel in ["SENTINEL_COMMAND", "SENTINEL_PATH", "SENTINEL_OUTPUT"] {
+                assert!(!pre_body.contains(sentinel));
+            }
+            let post = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "post-tool-use".into(),
+                    agent: Some(agent.into()),
+                    ..Default::default()
+                },
+                raw,
+            );
+            let post_body = post.body_excerpt.expect("post summary");
+            assert!(post_body.contains(&format!("outcome: {outcome}")));
+        }
+
+        let long = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({"tool_name":"Bash","tool_input":{},"tool_use_id":"utf8-1","output": "é".repeat(2_000)}),
+        );
+        assert!(long.body_excerpt.unwrap().len() <= 2_000);
+    }
+
+    #[test]
+    fn unknown_closed_tool_post_never_includes_output_or_name() {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({"tool_name":"ARBITRARY_TOOL_SENTINEL","tool_use_id":"unknown-1","output":"OUTPUT_SENTINEL"}),
+        );
+        let body = env.body_excerpt.unwrap();
+        assert!(body.contains("tool_family: unknown"));
+        assert!(body.contains("tool_call_id: unknown-1"));
+        assert!(body.contains("outcome: unknown"));
+        assert!(!body.contains("ARBITRARY_TOOL_SENTINEL"));
+        assert!(!body.contains("OUTPUT_SENTINEL"));
+    }
+
+    #[test]
+    fn claude_and_opencode_paired_summaries_share_agent_ids() {
+        for (agent, pre_raw, post_raw, id) in [
+            (
+                "claude-code",
+                serde_json::json!({"tool_name":"Bash","tool_input":{"command":"PRE_COMMAND_SENTINEL"},"tool_use_id":"claude-pair"}),
+                serde_json::json!({"tool_name":"Bash","tool_use_id":"claude-pair","output":"POST_OUTPUT"}),
+                "claude-pair",
+            ),
+            (
+                "open-code",
+                serde_json::json!({"tool":"bash","args":{"path":"PRE_PATH_SENTINEL"},"callID":"open-pair"}),
+                serde_json::json!({"tool":"bash","callID":"open-pair","output":"POST_OUTPUT"}),
+                "open-pair",
+            ),
+        ] {
+            let pre = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "pre-tool-use".into(),
+                    agent: Some(agent.into()),
+                    ..Default::default()
+                },
+                pre_raw,
+            );
+            let post = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "post-tool-use".into(),
+                    agent: Some(agent.into()),
+                    ..Default::default()
+                },
+                post_raw,
+            );
+            let pre_body = pre.body_excerpt.unwrap();
+            let post_body = post.body_excerpt.unwrap();
+            assert!(pre_body.contains(id) && post_body.contains(id));
+            assert!(post_body.contains("POST_OUTPUT"));
+            assert!(!pre_body.contains("SENTINEL"));
+        }
+    }
+
+    #[test]
+    fn antigravity_omits_id_and_unsupported_pre_has_no_body() {
+        let antigravity = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({"toolCall":{"name":"run_command","args":{}},"error":"private"}),
+        );
+        let body = antigravity.body_excerpt.unwrap();
+        assert!(body.contains("outcome: error"));
+        assert!(!body.contains("tool_call_id"));
+        let unsupported = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "pre-tool-use".into(),
+                agent: Some("codex".into()),
+                ..Default::default()
+            },
+            serde_json::json!({"tool_name":"Bash","tool_input":{"command":"private"}}),
+        );
+        assert!(unsupported.body_excerpt.is_none());
+    }
+
+    #[test]
+    fn unsupported_and_stop_tool_payloads_never_render_content() {
+        for event in ["pre-tool-use", "post-tool-use"] {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("other".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({"tool":"SENTINEL_TOOL","args":{"command":"SENTINEL_COMMAND","path":"SENTINEL_PATH"},"output":"SENTINEL_OUTPUT"}),
+            );
+            assert!(env.title_hint.is_none());
+            assert!(env.body_excerpt.is_none());
+        }
+        let stop = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "stop".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({"last_assistant_message":"SENTINEL_ASSISTANT"}),
+        );
+        assert!(stop.body_excerpt.is_none());
+    }
+
+    #[test]
+    fn antigravity_outcome_and_call_id_boundaries_are_closed() {
+        let absent = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({"toolCall":{"name":"run_command","args":{}}}),
+        );
+        assert!(absent.body_excerpt.unwrap().contains("outcome: unknown"));
+        for (error, outcome) in [
+            (serde_json::json!(null), "unknown"),
+            (serde_json::json!(""), "unknown"),
+            (serde_json::json!("failed"), "error"),
+        ] {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "post-tool-use".into(),
+                    agent: Some("antigravity-cli".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({"toolCall":{"name":"run_command","args":{}},"error":error}),
+            );
+            assert!(
+                env.body_excerpt
+                    .unwrap()
+                    .contains(&format!("outcome: {outcome}"))
+            );
+        }
+        let id = "a".repeat(129);
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "pre-tool-use".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({"tool_name":"Bash","tool_input":{},"tool_use_id":id}),
+        );
+        assert!(!env.body_excerpt.unwrap().contains("tool_call_id"));
+    }
+
+    #[test]
+    fn pi_post_outcomes_and_stable_id_are_rendered() {
+        for (is_error, outcome) in [
+            (Some(false), "success"),
+            (Some(true), "error"),
+            (None, "unknown"),
+        ] {
+            let mut raw = serde_json::json!({"tool":"bash","args":{},"callID":"pi-stable-190","output":"result"});
+            if let Some(is_error) = is_error {
+                raw["isError"] = serde_json::json!(is_error);
+            }
+            let pre = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "pre-tool-use".into(),
+                    agent: Some("pi".into()),
+                    ..Default::default()
+                },
+                raw.clone(),
+            );
+            let post = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "post-tool-use".into(),
+                    agent: Some("pi".into()),
+                    ..Default::default()
+                },
+                raw,
+            );
+            assert!(
+                pre.body_excerpt
+                    .unwrap()
+                    .contains("tool_call_id: pi-stable-190")
+            );
+            let body = post.body_excerpt.unwrap();
+            assert!(body.contains("tool_call_id: pi-stable-190"));
+            assert!(body.contains(&format!("outcome: {outcome}")));
+        }
     }
 }

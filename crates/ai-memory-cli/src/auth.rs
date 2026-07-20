@@ -105,7 +105,10 @@ impl AuthState {
     #[must_use]
     pub fn new(expected: Option<String>) -> Self {
         Self {
-            expected,
+            // A blank configured value must never turn an absent credential
+            // into root authentication (`"" == ""`). Treat placeholders and
+            // whitespace-only environment values as auth-disabled instead.
+            expected: expected.filter(|token| !token.trim().is_empty()),
             ..Self::default()
         }
     }
@@ -693,6 +696,14 @@ mod tests {
         axum::Json(actor)
     }
 
+    async fn echo_auth_level(Extension(level): Extension<AuthLevel>) -> &'static str {
+        match level {
+            AuthLevel::Anonymous => "anonymous",
+            AuthLevel::Root => "root",
+            AuthLevel::User => "user",
+        }
+    }
+
     fn router_with_state(state: AuthState) -> Router {
         Router::new()
             .route("/probe", get(echo_actor))
@@ -952,6 +963,64 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let actor = body_as_actor(resp).await;
         assert_eq!(actor.user.as_deref(), Some("root"));
+    }
+
+    #[tokio::test]
+    async fn resolver_authenticates_user_added_after_router_construction() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let pepper = TokenPepper::new("test-pepper");
+        let state = AuthState::new(Some("root-token".into())).with_multiuser(
+            pepper.clone(),
+            store.reader.clone(),
+            store.writer.clone(),
+        );
+        let router = Router::new().route("/level", get(echo_auth_level)).layer(
+            axum::middleware::from_fn_with_state(Arc::new(state), require_bearer),
+        );
+
+        let token = ai_memory_store::generate_token().unwrap();
+        let mut user = NewUser {
+            username: "alice".into(),
+            name: None,
+            email: None,
+        };
+        user.validate().unwrap();
+        store
+            .writer
+            .create_user(user, ai_memory_store::hash_token(&token, &pepper))
+            .await
+            .unwrap();
+
+        for (token, expected_status, expected_level) in [
+            (token.as_str(), StatusCode::OK, Some("user")),
+            ("root-token", StatusCode::OK, Some("root")),
+            ("unknown-token", StatusCode::UNAUTHORIZED, None),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/level")
+                        .header("Authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected_status, "token {token}");
+            if let Some(expected_level) = expected_level {
+                let body = axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap();
+                assert_eq!(body.as_ref(), expected_level.as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn blank_root_token_is_not_enabled() {
+        assert!(!AuthState::new(Some("  ".into())).enabled());
     }
 
     #[tokio::test]

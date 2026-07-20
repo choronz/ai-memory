@@ -584,7 +584,23 @@ async fn require_root_for_multiuser_admin(
         .get::<ai_memory_core::AuthLevel>()
         .copied()
         .unwrap_or(ai_memory_core::AuthLevel::Anonymous);
-    match level.authorize(Capability::Admin, state.token_pepper.is_some()) {
+    // Read this for every request rather than caching a post-creation flag: a
+    // committed first user immediately closes bootstrap admin access, including
+    // across concurrent requests and without a server restart.
+    let multi_user_enabled = match state.reader.users_exist().await {
+        Ok(exists) => exists,
+        Err(error) => {
+            tracing::error!(%error, "admin authorization could not determine whether users exist");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "admin authorization unavailable: could not verify user configuration"
+                })),
+            )
+                .into_response();
+        }
+    };
+    match level.authorize(Capability::Admin, multi_user_enabled) {
         Ok(()) => next.run(req).await,
         Err(e) => (
             authz_status(e),
@@ -7763,6 +7779,12 @@ mod tests {
     #[tokio::test]
     async fn multiuser_admin_routes_reject_db_user_tier() {
         let (_tmp, router) = user_admin_test_router("root-token");
+        post_create_user(
+            &router,
+            "root-token",
+            serde_json::json!({"username": "alice"}),
+        )
+        .await;
 
         for (method, uri, payload) in admin_route_samples() {
             let mut builder = Request::builder()
@@ -7791,6 +7813,12 @@ mod tests {
     #[tokio::test]
     async fn multiuser_admin_routes_reject_anonymous() {
         let (_tmp, router) = user_admin_test_router("root-token");
+        post_create_user(
+            &router,
+            "root-token",
+            serde_json::json!({"username": "alice"}),
+        )
+        .await;
         for (method, uri, payload) in admin_route_samples() {
             let mut builder = Request::builder().method(method).uri(uri);
             let body = if payload.is_null() {
@@ -7826,6 +7854,124 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_mode_switches_after_first_user_without_restart() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+
+        let anonymous_before = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous_before.status(), StatusCode::OK);
+
+        let create = post_create_user(
+            &router,
+            "root-token",
+            serde_json::json!({"username": "alice"}),
+        )
+        .await;
+        assert_eq!(create.status(), StatusCode::OK);
+
+        for (token, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some("db-user-token"), StatusCode::FORBIDDEN),
+            (Some("root-token"), StatusCode::OK),
+        ] {
+            let mut request = Request::builder().uri("/admin/status");
+            if let Some(token) = token {
+                request = request.header("authorization", format!("Bearer {token}"));
+            }
+            let response = router
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "token {token:?}");
+        }
+
+        let expire = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/users/alice/expire")
+                    .header("authorization", "Bearer root-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(expire.status(), StatusCode::OK);
+
+        let anonymous_after_expire = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous_after_expire.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_mode_store_read_failure_fails_closed() {
+        use ai_memory_core::ActorContext;
+
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let missing_db_reader =
+            ai_memory_store::ReaderPool::new(&tmp.path().join("missing.sqlite"), 1).unwrap();
+        let router = admin_router(AdminState {
+            writer: store.writer.clone(),
+            reader: missing_db_reader,
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: Some(ai_memory_store::TokenPepper::new("test-pepper-admin")),
+            active_project: ai_memory_core::ActiveProject::new(),
+            scope_invalidator: None,
+        })
+        .layer(axum::middleware::from_fn(
+            |mut req: Request<Body>, next: axum::middleware::Next| async move {
+                req.extensions_mut()
+                    .insert(ai_memory_core::AuthLevel::Anonymous);
+                req.extensions_mut().insert(ActorContext::anonymous());
+                next.run(req).await
+            },
+        ));
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("could not verify user configuration"));
     }
 
     #[tokio::test]

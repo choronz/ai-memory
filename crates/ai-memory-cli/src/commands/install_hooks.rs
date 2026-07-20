@@ -20,16 +20,17 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::cli::{AgentChoice, InstallHooksArgs, McpClient};
-use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json};
+use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json, mutate_toml};
 use crate::commands::install_mcp;
 use crate::commands::openclaw_plugin;
 use crate::commands::path_util::home_dir;
 use crate::commands::render_shared::{
     ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, CURSOR_PROFILE,
-    GEMINI_PROFILE, build_antigravity_payload_with_data_dir,
+    GEMINI_PROFILE, KIMI_CODE_EVENTS, build_antigravity_payload_with_data_dir,
     build_claude_code_payload_with_data_dir, build_devin_payload_with_data_dir,
     build_grok_payload_with_data_dir, build_profile_payload_for_agent, hook_script_for_claude_code,
-    hook_script_for_current_platform, ts_string_literal,
+    hook_script_for_current_platform, kimi_code_hook_commands, local_hook_policy_v1_supported,
+    ts_capture_policy_v1, ts_string_literal,
 };
 use crate::config::{Config, DEFAULT_SERVER_URL};
 
@@ -139,6 +140,29 @@ pub(crate) fn pi_extension_path() -> anyhow::Result<std::path::PathBuf> {
         .join("ai-memory.ts"))
 }
 
+/// `$KIMI_CODE_HOME/config.toml` when set, else `~/.kimi-code/config.toml`.
+/// Kimi Code keeps hooks as `[[hooks]]` entries inside the same
+/// config.toml that stores the user's providers/model, so the apply
+/// path merges TOML-aware instead of rewriting the file.
+pub(crate) fn kimi_code_config_path() -> anyhow::Result<std::path::PathBuf> {
+    kimi_code_config_path_in(std::env::var_os("KIMI_CODE_HOME"))
+}
+
+/// The env value comes in as a parameter so tests can exercise both
+/// branches without mutating process env (mirrors
+/// `install_mcp::kimi_code_home`).
+fn kimi_code_config_path_in(
+    env_override: Option<std::ffi::OsString>,
+) -> anyhow::Result<std::path::PathBuf> {
+    if let Some(dir) = env_override.filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(dir).join("config.toml"));
+    }
+    Ok(home_dir()
+        .context("could not locate $HOME for ~/.kimi-code/config.toml")?
+        .join(".kimi-code")
+        .join("config.toml"))
+}
+
 /// Run the `install-hooks` subcommand.
 ///
 /// # Errors
@@ -167,6 +191,19 @@ pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
     validate_as_user(args.as_user.as_deref(), auth)?;
     if let Some(user) = args.as_user.as_deref().filter(|s| !s.trim().is_empty()) {
         eprintln!("[ai-memory] hooks installing for user: {user}");
+    }
+    let generated = matches!(
+        args.agent,
+        AgentChoice::OpenCode | AgentChoice::Omp | AgentChoice::Pi | AgentChoice::Openclaw
+    );
+    if generated || local_hook_policy_v1_supported() {
+        eprintln!(
+            "[ai-memory] capture-policy capability v1 enforced by this selected integration; re-run --apply to refresh existing installs."
+        );
+    } else {
+        eprintln!(
+            "[ai-memory] selected shell/PowerShell compatibility path does not enforce capture-policy v1; use a native platform selection or generated integration."
+        );
     }
     if args.apply {
         return match args.agent {
@@ -215,6 +252,10 @@ pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
                 apply_to_devin_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)
             }
             AgentChoice::Openclaw => openclaw_plugin::apply(&server_url, auth, &args),
+            AgentChoice::KimiCode => {
+                let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+                apply_to_kimi_code_config(&hooks_dir, &server_url, auth, &config.data_dir, &args)
+            }
         };
     }
     let strategy = args.project_strategy.baked();
@@ -282,6 +323,10 @@ pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
         AgentChoice::Openclaw => {
             openclaw_plugin::render(&server_url, auth, strategy);
             Ok(())
+        }
+        AgentChoice::KimiCode => {
+            let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+            render_kimi_code(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
         }
     }
 }
@@ -428,6 +473,11 @@ fn infer_installed_mcp_config(agent: AgentChoice) -> Result<Option<InferredMcpCo
             &["mcpServers", "ai-memory"],
             "url",
         )),
+        McpClient::KimiCode => Ok(infer_json_mcp_config(
+            &content,
+            &["mcpServers", "ai-memory"],
+            "url",
+        )),
         McpClient::ClaudeDesktop => Ok(None),
         // MCP-only client: no AgentChoice counterpart routes here.
         // Reachable only if a future install_hooks flow targets VS
@@ -484,6 +534,7 @@ fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
         AgentChoice::Zero => Some(McpClient::Zero),
         AgentChoice::Grok => Some(McpClient::Grok),
         AgentChoice::Devin => Some(McpClient::Devin),
+        AgentChoice::KimiCode => Some(McpClient::KimiCode),
         // Pi bridges MCP through its generated extension, not a native
         // mcp.json the installer can scrape.
         AgentChoice::Pi => None,
@@ -622,11 +673,19 @@ fn expand_grok_placeholders_with(
 }
 
 fn hook_server_url_from_mcp_url(url: &str) -> Option<String> {
-    let trimmed = url.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
+    // Drop query/fragment BEFORE the `/mcp` peel: Kimi Code's
+    // `?flavor=moonshot` marker must never leak into hook URLs (and it
+    // would stop the suffix from matching).
+    let base = url
+        .trim()
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('/');
+    if base.is_empty() {
         return None;
     }
-    Some(trimmed.strip_suffix("/mcp").unwrap_or(trimmed).to_string())
+    Some(base.strip_suffix("/mcp").unwrap_or(base).to_string())
 }
 
 fn bearer_token_from_header(header: &str) -> Option<String> {
@@ -1271,6 +1330,121 @@ fn merge_antigravity_hooks(
     })
 }
 
+/// Mutate Kimi Code's `config.toml` (`$KIMI_CODE_HOME/config.toml` when
+/// the var is set, else `~/.kimi-code/config.toml`) so Kimi Code fires
+/// the ai-memory scripts on its lifecycle events.
+///
+/// Kimi Code stores hooks as `[[hooks]]` array-of-tables entries inside
+/// the SAME config.toml that carries the user's providers and model,
+/// and any unknown key on a hook entry makes the whole config fail to
+/// load. The merge is therefore TOML-aware via `toml_edit` (the rest of
+/// the document is preserved as parsed) and each entry carries exactly
+/// `event` + `command` — `matcher` omitted (Kimi Code matches
+/// everything) and `timeout` omitted (30s default).
+fn apply_to_kimi_code_config(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let path = match &args.config_file {
+        Some(p) => p.clone(),
+        None => kimi_code_config_path()?,
+    };
+    let staged = stage_hook_scripts(hooks_dir, "kimi-code")?;
+    let command_dir = staged_command_dir(&staged, "kimi-code");
+    let strategy = args.project_strategy.baked();
+    let outcome = merge_kimi_code_hooks(
+        &command_dir,
+        server_url,
+        auth_token,
+        data_dir,
+        strategy,
+        &path,
+    )?;
+    println!(
+        "✓ {} {} ({})",
+        outcome.verb(),
+        path.display(),
+        match outcome {
+            ApplyOutcome::Created => "new file",
+            ApplyOutcome::Updated => "backup written next to it",
+            ApplyOutcome::NoOp => "already up to date",
+        }
+    );
+    Ok(())
+}
+
+fn merge_kimi_code_hooks(
+    staged: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    project_strategy: Option<&str>,
+    config_path: &Path,
+) -> Result<ApplyOutcome> {
+    let commands = kimi_code_hook_commands(
+        staged,
+        server_url,
+        auth_token,
+        Some(data_dir),
+        project_strategy,
+    );
+    apply_atomic(config_path, |existing| {
+        mutate_toml(existing, |doc| upsert_kimi_code_hooks(doc, &commands))
+    })
+}
+
+/// Insert or refresh ai-memory's `[[hooks]]` entries: drop any prior
+/// entry whose command references our staged scripts (so re-runs update
+/// in place instead of duplicating), append the fresh set, and leave
+/// every third-party `[[hooks]]` entry — and every other table in
+/// config.toml — untouched.
+fn upsert_kimi_code_hooks(
+    doc: &mut toml_edit::DocumentMut,
+    commands: &[(&str, String)],
+) -> Result<()> {
+    use toml_edit::{ArrayOfTables, Item, Table, value};
+
+    if doc.get("hooks").is_none() {
+        doc.insert("hooks", Item::ArrayOfTables(ArrayOfTables::new()));
+    }
+    let hooks = doc
+        .get_mut("hooks")
+        .and_then(Item::as_array_of_tables_mut)
+        .context("`hooks` is present in config.toml but not an array of tables")?;
+
+    let stale: Vec<usize> = hooks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, entry)| is_ai_memory_toml_hook_entry(entry).then_some(i))
+        .collect();
+    for i in stale.into_iter().rev() {
+        hooks.remove(i);
+    }
+    for (event, command) in commands {
+        let mut entry = Table::new();
+        entry["event"] = value(*event);
+        entry["command"] = value(command);
+        hooks.push(entry);
+    }
+    Ok(())
+}
+
+/// True if a `[[hooks]]` table belongs to ai-memory — i.e. its command
+/// references our staged script path or the inlined `AI_MEMORY_*` env
+/// vars. Broad matching is intentional (mirrors the shell-form branch
+/// of `is_ai_memory_hook_entry`): old installs may identify us by the
+/// script path or by the env prefix alone.
+fn is_ai_memory_toml_hook_entry(entry: &toml_edit::Table) -> bool {
+    let Some(command) = entry.get("command").and_then(|c| c.as_str()) else {
+        return false;
+    };
+    let lower = command.to_ascii_lowercase();
+    lower.contains("ai-memory") || lower.contains("ai_memory")
+}
+
 /// Generate an OpenCode plugin at `~/.config/opencode/plugins/ai-memory.ts`.
 ///
 /// OpenCode's integration surface is a TypeScript plugin, not a JSON
@@ -1434,6 +1608,7 @@ fn build_opencode_plugin(
         .map(|t| format!("const TOKEN: string | null = {};\n", ts_string_literal(t)))
         .unwrap_or_else(|| "const TOKEN: string | null = null;\n".to_string());
     let apply_marker_params = ts_apply_marker_params(project_strategy);
+    let capture_policy = ts_capture_policy_v1();
     format!(
         r#"// Auto-generated by `ai-memory install-hooks --agent opencode --apply`.
 // Edit by re-running the command, not by hand — install-hooks
@@ -1442,13 +1617,14 @@ fn build_opencode_plugin(
 
 import type {{ Plugin }} from "@opencode-ai/plugin";
 import {{ execFileSync }} from "node:child_process";
-import {{ existsSync, readFileSync }} from "node:fs";
+import {{ closeSync, existsSync, openSync, readFileSync as readMarkerText, readSync }} from "node:fs";
 import {{ basename, dirname, join, resolve }} from "node:path";
 import {{ homedir }} from "node:os";
 
 const SERVER = {server_literal}.replace(/\/+$/, "");
 const AGENT = "open-code";
 {token_line}
+{capture_policy}
 
 function timeoutSignal(ms: number): AbortSignal | undefined {{
   if (typeof AbortSignal === "undefined") return undefined;
@@ -1654,8 +1830,10 @@ function postHook(event: string, payload: Record<string, unknown>): void {{
   url.searchParams.set("event", event);
   url.searchParams.set("agent", AGENT);
   applyMarkerParams(url, typeof payload.cwd === "string" ? payload.cwd : undefined);
+  const policy = capturePolicy(payload, typeof payload.cwd === "string" ? payload.cwd : undefined);
+  if (policy.disposition === "drop") return;
   try {{
-    enqueueHook(event, url, payload);
+    enqueueHook(event, url, policy.payload);
   }} catch (_e) {{
     // Best-effort capture. Hooks must never block the agent.
   }}
@@ -2006,6 +2184,7 @@ fn build_omp_extension(
         .map(|t| format!("const TOKEN: string | null = {};\n", ts_string_literal(t)))
         .unwrap_or_else(|| "const TOKEN: string | null = null;\n".to_string());
     let apply_marker_params = ts_apply_marker_params(project_strategy);
+    let capture_policy = ts_capture_policy_v1();
     format!(
         r#"// Auto-generated by `ai-memory install-hooks --agent omp --apply`.
 // Edit by re-running the command, not by hand — install-hooks
@@ -2013,13 +2192,14 @@ fn build_omp_extension(
 // re-run.
 
 import {{ execFileSync }} from "node:child_process";
-import {{ existsSync, readFileSync }} from "node:fs";
+import {{ closeSync, existsSync, openSync, readFileSync as readMarkerText, readSync }} from "node:fs";
 import {{ basename, dirname, join, resolve }} from "node:path";
 import {{ homedir }} from "node:os";
 
 const SERVER = {server_literal}.replace(/\/+$/, "");
 const AGENT = "omp";
 {token_line}
+{capture_policy}
 
 function timeoutSignal(ms: number): AbortSignal | undefined {{
   if (typeof AbortSignal === "undefined") return undefined;
@@ -2209,8 +2389,10 @@ function postHook(event: string, payload: Record<string, unknown>): void {{
   url.searchParams.set("event", event);
   url.searchParams.set("agent", AGENT);
   applyMarkerParams(url, typeof payload.cwd === "string" ? payload.cwd : undefined);
+  const policy = capturePolicy(payload, typeof payload.cwd === "string" ? payload.cwd : undefined);
+  if (policy.disposition === "drop") return;
   try {{
-    enqueueHook(event, url, payload);
+    enqueueHook(event, url, policy.payload);
   }} catch (_e) {{
     // Best-effort capture. Hooks must never block the agent.
   }}
@@ -2910,6 +3092,56 @@ fn render_devin(
     Ok(())
 }
 
+/// Print Kimi Code's `[[hooks]]` TOML fragment to stdout (dry-run
+/// counterpart of [`apply_to_kimi_code_config`]). Rendered through the
+/// same upsert path the apply mode uses, so the printout is byte-for-
+/// byte what `--apply` would append to config.toml.
+fn render_kimi_code(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    project_strategy: Option<&str>,
+) -> Result<()> {
+    // Soft check (same rationale as render_claude_code): warn, don't bail,
+    // so the docker host-path flow still works.
+    for (_, script) in KIMI_CODE_EVENTS {
+        let script = hook_script_for_current_platform(script);
+        let abs = hooks_dir.join(script.as_ref());
+        if !abs.exists() {
+            eprintln!(
+                "# warning: {} not present on this filesystem. \
+                 If this command is running inside docker against a \
+                 host path, you can ignore this; otherwise extract \
+                 the scripts first with `ai-memory setup-agent`.",
+                abs.display()
+            );
+        }
+    }
+    let commands = kimi_code_hook_commands(
+        hooks_dir,
+        server_url,
+        auth_token,
+        Some(data_dir),
+        project_strategy,
+    );
+    let mut doc = toml_edit::DocumentMut::new();
+    upsert_kimi_code_hooks(&mut doc, &commands)?;
+    println!("# Kimi Code hook config — merge into $KIMI_CODE_HOME/config.toml");
+    println!("# (~/.kimi-code/config.toml when KIMI_CODE_HOME is unset), or re-run");
+    println!("# with --apply to merge it in place, preserving providers/model and");
+    println!("# any third-party [[hooks]] entries already in the file.");
+    println!("# Hook scripts: {}", hooks_dir.display());
+    println!("# AI-memory server URL: {server_url}");
+    if auth_token.is_some() {
+        println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
+        println!("#       Treat config.toml as sensitive (chmod 600).");
+    }
+    println!();
+    print!("{doc}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3451,6 +3683,65 @@ mod tests {
         assert_eq!(inferred.auth_token.as_deref(), Some("secret-token"));
     }
 
+    /// Inferring the hook URL from Kimi Code's flavored mcp.json entry
+    /// must yield the bare origin — hooks POST to `<origin>/hook`.
+    #[test]
+    fn kimi_code_mcp_inference_strips_flavor_query_and_mcp_path() {
+        let inferred = infer_json_mcp_config(
+            r#"{
+              "mcpServers": {
+                "ai-memory": {
+                  "url": "http://homelab:49374/mcp?flavor=moonshot",
+                  "headers": { "Authorization": "Bearer secret-token" }
+                }
+              }
+            }"#,
+            &["mcpServers", "ai-memory"],
+            "url",
+        )
+        .unwrap();
+
+        assert_eq!(
+            inferred.hook_server_url.as_deref(),
+            Some("http://homelab:49374")
+        );
+        assert_eq!(inferred.auth_token.as_deref(), Some("secret-token"));
+    }
+
+    #[test]
+    fn hook_server_url_from_mcp_url_strips_query_and_suffix() {
+        for (input, expected) in [
+            ("http://homelab:49374/mcp", Some("http://homelab:49374")),
+            ("http://homelab:49374", Some("http://homelab:49374")),
+            ("http://homelab:49374/", Some("http://homelab:49374")),
+            (
+                "http://homelab:49374/mcp?flavor=moonshot",
+                Some("http://homelab:49374"),
+            ),
+            (
+                "http://homelab:49374/mcp/?flavor=moonshot",
+                Some("http://homelab:49374"),
+            ),
+            // Reverse-proxy prefix survives; hooks POST under it.
+            (
+                "http://homelab:49374/wiki/mcp",
+                Some("http://homelab:49374/wiki"),
+            ),
+            (
+                "http://homelab:49374/wiki/mcp?flavor=moonshot",
+                Some("http://homelab:49374/wiki"),
+            ),
+            ("", None),
+            ("   ", None),
+        ] {
+            assert_eq!(
+                hook_server_url_from_mcp_url(input).as_deref(),
+                expected,
+                "input: {input:?}"
+            );
+        }
+    }
+
     #[test]
     fn codex_mcp_inference_accepts_block_form_config() {
         let inferred = infer_toml_mcp_config(
@@ -3566,6 +3857,7 @@ model = "gpt-5"
             "devin",
             "opencode",
             "antigravity-cli",
+            "kimi-code",
         ] {
             let dir = hooks_root.join(agent_dir);
             let mut sh = BTreeMap::new();
@@ -3915,7 +4207,11 @@ model = "gpt-5"
         assert!(generated.contains("async function drainHookQueue(): Promise<void>"));
         assert!(generated.contains("signal: timeoutSignal(HOOK_REQUEST_TIMEOUT_MS)"));
         assert!(generated.contains("await sleep(HOOK_INTER_REQUEST_DELAY_MS)"));
-        assert!(generated.contains("enqueueHook(event, url, payload);"));
+        assert!(generated.contains("const policy = capturePolicy(payload"));
+        assert!(generated.contains("if (policy.disposition === \"drop\") return;"));
+        assert!(generated.contains("enqueueHook(event, url, policy.payload);"));
+        assert!(generated.contains("const CAPTURE_POLICY_V1 = 1;"));
+        assert!(generated.contains("const CAPTURE_MARKER_MAX_BYTES = 64 * 1024;"));
         assert!(generated.contains("async function fetchHandoff"));
         assert!(generated.contains("const response = await fetch(url, {"));
         assert!(generated.contains("signal: timeoutSignal(1000)"));
@@ -4644,6 +4940,233 @@ model = "gpt-5"
         )
         .unwrap();
         assert_eq!(second, ApplyOutcome::NoOp, "second apply must be a no-op");
+    }
+
+    // ----------------------------------------------------------------
+    // Kimi Code tests
+    // ----------------------------------------------------------------
+
+    const KIMI_CODE_STUB_SCRIPTS: [&str; 9] = [
+        "session-start.sh",
+        "user-prompt-submit.sh",
+        "pre-tool-use.sh",
+        "post-tool-use.sh",
+        "pre-compact.sh",
+        "stop.sh",
+        "session-end.sh",
+        "subagent-start.sh",
+        "subagent-stop.sh",
+    ];
+
+    fn kimi_code_hooks_in(config_path: &Path) -> Vec<(String, String)> {
+        let doc: toml_edit::DocumentMut = fs::read_to_string(config_path)
+            .unwrap()
+            .parse()
+            .expect("config.toml must stay valid TOML");
+        doc.get("hooks")
+            .and_then(toml_edit::Item::as_array_of_tables)
+            .expect("`hooks` must be an array of tables")
+            .iter()
+            .map(|entry| {
+                let event = entry
+                    .get("event")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let command = entry
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                (event, command)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn kimi_code_apply_writes_all_events_into_fresh_config() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(hooks_tmp.path(), &KIMI_CODE_STUB_SCRIPTS);
+
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("config.toml");
+
+        let outcome = merge_kimi_code_hooks(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            None,
+            &config_path,
+        )
+        .unwrap();
+        assert_eq!(outcome, ApplyOutcome::Created);
+
+        let entries = kimi_code_hooks_in(&config_path);
+        assert_eq!(entries.len(), KIMI_CODE_EVENTS.len());
+        for (i, (event, script)) in KIMI_CODE_EVENTS.iter().enumerate() {
+            assert_eq!(entries[i].0, *event, "entry order follows KIMI_CODE_EVENTS");
+            let stem = script.strip_suffix(".sh").unwrap();
+            assert!(
+                entries[i].1.contains(stem),
+                "{event}: command must reference the staged script: {}",
+                entries[i].1
+            );
+        }
+        // Only the allowed keys are written — Kimi Code rejects unknown
+        // fields by failing the whole config load.
+        let doc: toml_edit::DocumentMut =
+            fs::read_to_string(&config_path).unwrap().parse().unwrap();
+        for entry in doc
+            .get("hooks")
+            .and_then(toml_edit::Item::as_array_of_tables)
+            .unwrap()
+        {
+            let keys: Vec<&str> = entry.iter().map(|(k, _)| k).collect();
+            assert_eq!(keys, ["event", "command"], "only event + command allowed");
+        }
+    }
+
+    #[test]
+    fn kimi_code_apply_preserves_providers_and_third_party_hooks() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(hooks_tmp.path(), &KIMI_CODE_STUB_SCRIPTS);
+
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"# Kimi Code user config
+model = "kimi-k2"
+
+[providers.moonshot]
+api_key = "sk-secret"
+base_url = "https://api.moonshot.cn/v1"
+
+[[hooks]]
+event = "SessionStart"
+command = "echo third-party"
+
+[[hooks]]
+event = "SessionStart"
+command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/session-start.sh"
+"#,
+        )
+        .unwrap();
+
+        merge_kimi_code_hooks(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            None,
+            &config_path,
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(&config_path).unwrap();
+        assert!(
+            content.contains("# Kimi Code user config"),
+            "comments survive"
+        );
+        assert!(
+            content.contains(r#"api_key = "sk-secret""#),
+            "providers table survives"
+        );
+
+        let doc: toml_edit::DocumentMut = content.parse().unwrap();
+        assert_eq!(
+            doc.get("model").and_then(|v| v.as_str()),
+            Some("kimi-k2"),
+            "model setting survives"
+        );
+        assert_eq!(
+            doc.get("providers")
+                .and_then(|p| p.get("moonshot"))
+                .and_then(|m| m.get("base_url"))
+                .and_then(|v| v.as_str()),
+            Some("https://api.moonshot.cn/v1"),
+            "providers.moonshot survives"
+        );
+
+        let entries = kimi_code_hooks_in(&config_path);
+        // Third-party entry + our 9: the stale ai-memory entry must be
+        // replaced, not duplicated.
+        assert_eq!(entries.len(), 1 + KIMI_CODE_EVENTS.len());
+        let ours: Vec<&(String, String)> = entries
+            .iter()
+            .filter(|(_, command)| {
+                let lower = command.to_ascii_lowercase();
+                lower.contains("ai-memory") || lower.contains("ai_memory")
+            })
+            .collect();
+        assert_eq!(ours.len(), KIMI_CODE_EVENTS.len(), "no duplicated entries");
+        assert!(
+            entries
+                .iter()
+                .any(|(_, command)| command == "echo third-party"),
+            "third-party hook survives: {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|(_, command)| command.contains("/old/")),
+            "stale ai-memory entry must be replaced: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn kimi_code_apply_is_idempotent() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(hooks_tmp.path(), &KIMI_CODE_STUB_SCRIPTS);
+
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("config.toml");
+
+        let first = merge_kimi_code_hooks(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            None,
+            &config_path,
+        )
+        .unwrap();
+        assert_ne!(
+            first,
+            ApplyOutcome::NoOp,
+            "first apply should not be a no-op"
+        );
+
+        let second = merge_kimi_code_hooks(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            None,
+            &config_path,
+        )
+        .unwrap();
+        assert_eq!(second, ApplyOutcome::NoOp, "second apply must be a no-op");
+    }
+
+    #[test]
+    fn kimi_code_config_path_honours_kimi_code_home() {
+        let custom = if cfg!(windows) {
+            r"C:\custom\kimi"
+        } else {
+            "/custom/kimi"
+        };
+        let path = kimi_code_config_path_in(Some(std::ffi::OsString::from(custom))).unwrap();
+        assert_eq!(path, Path::new(custom).join("config.toml"));
+
+        // Empty override and unset var both fall back to ~/.kimi-code.
+        for env in [None, Some(std::ffi::OsString::new())] {
+            let path = kimi_code_config_path_in(env).unwrap();
+            assert!(
+                path.ends_with(Path::new(".kimi-code").join("config.toml")),
+                "default must be ~/.kimi-code/config.toml, got {}",
+                path.display()
+            );
+        }
     }
 
     // ----------------------------------------------------------------

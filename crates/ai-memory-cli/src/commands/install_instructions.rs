@@ -96,12 +96,14 @@ pub fn run(_config: &Config, args: InstallInstructionsArgs) -> Result<()> {
 /// 3. Only `CLAUDE.md` exists → write to it.
 /// 4. Only `AGENTS.md` exists → write to it.
 /// 5. Neither exists → default to `CLAUDE.md` AND print a hint about
-///    `--target AGENTS.md` for Codex / OpenCode / Cursor / Gemini.
+///    `--target AGENTS.md` for Codex / OpenCode / Cursor / Gemini /
+///    Kimi Code.
 ///
 /// The auto-pick exists because Claude Code uses CLAUDE.md while
-/// every other supported agent (Codex, OpenCode, Cursor, Gemini CLI)
-/// converged on AGENTS.md. The heuristic "extend whatever's already
-/// there" matches the user's intent better than a hard-coded default.
+/// every other supported agent (Codex, OpenCode, Cursor, Gemini CLI,
+/// Kimi Code) converged on AGENTS.md. The heuristic "extend whatever's
+/// already there" matches the user's intent better than a hard-coded
+/// default.
 fn resolve_targets(explicit: Option<&std::path::PathBuf>) -> Result<Vec<std::path::PathBuf>> {
     if let Some(p) = explicit {
         return Ok(vec![p.clone()]);
@@ -119,7 +121,8 @@ fn resolve_targets(explicit: Option<&std::path::PathBuf>) -> Result<Vec<std::pat
             eprintln!(
                 "note: neither CLAUDE.md nor AGENTS.md exists in {}; \
                  creating CLAUDE.md. If you use Codex / OpenCode / \
-                 Cursor / Gemini CLI / Antigravity CLI, re-run with `--target AGENTS.md`.",
+                 Cursor / Gemini CLI / Antigravity CLI / Kimi Code, \
+                 re-run with `--target AGENTS.md`.",
                 cwd.display()
             );
             Ok(vec![claude_md])

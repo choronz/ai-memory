@@ -17,13 +17,15 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ai_memory_core::{AgentKind, SessionId};
+use ai_memory_hooks::capture_policy::metadata_only_body;
+use ai_memory_hooks::{CaptureDisposition, PolicyState};
 use ai_memory_llm::OidcToken;
 
 use crate::cli::HookArgs;
 
 use super::hook_capture::{
-    build_client, extract_cwd, get_handoff, marker_query_suffix, resolve_cwd_with_fallbacks,
-    url_encode,
+    build_client, canonical_context, capture_policy, extract_cwd, get_handoff, marker_query_suffix,
+    resolve_cwd_with_fallbacks, url_encode,
 };
 use super::hook_drain_process;
 use super::hook_spool;
@@ -198,7 +200,10 @@ fn cwd_query_suffix_with(
     current_dir: impl FnOnce() -> Option<PathBuf>,
 ) -> String {
     let agent_kind = AgentKind::from_wire(agent);
-    let cwd = if agent_kind == AgentKind::Devin {
+    let (canonical_cwd, _) = canonical_context(raw);
+    let cwd = if canonical_cwd.is_some() {
+        canonical_cwd
+    } else if agent_kind == AgentKind::Devin {
         resolve_cwd_with_fallbacks(raw, env_lookup, current_dir)
     } else {
         extract_cwd(raw).filter(|s| !s.trim().is_empty())
@@ -300,7 +305,67 @@ where
     W: std::io::Write,
     S: FnOnce(&Path) -> std::io::Result<()>,
 {
-    let json: serde_json::Value = serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
+    let (mut payload, mut json) = match parse_hook_payload(payload) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            eprintln!(
+                "ai-memory hook warning: could not parse event payload as JSON; nothing was captured"
+            );
+            writeln!(stdout, "{{}}")?;
+            return Ok(());
+        }
+    };
+    let (policy_cwd, canonical_session_id) = hook_context(&args.agent, &json);
+    let policy = policy_cwd.as_deref().map(capture_policy);
+    let tool_event = is_tool_event(&args.event);
+    let decision = policy.as_ref().filter(|_| tool_event).map(|policy| {
+        policy.inspect(
+            AgentKind::from_wire(&args.agent),
+            &json,
+            policy_cwd.as_deref().unwrap_or(""),
+        )
+    });
+    if args.check_capture {
+        let protocol = decision.as_ref().map(|decision| decision.protocol());
+        let output = serde_json::json!({
+            "version": protocol.map_or(1, |protocol| protocol.version()),
+            "policy_state": protocol.map_or(PolicyState::Inactive, |protocol| protocol.policy_state()),
+            "tool_family": protocol.map_or(ai_memory_hooks::ToolFamily::Unknown, |protocol| protocol.tool_family()),
+            "path_count": protocol.map_or(0, |protocol| protocol.path_count()),
+            "disposition": protocol.map_or(CaptureDisposition::Keep, |protocol| protocol.disposition()),
+            "extraction_state": protocol.map_or(ai_memory_hooks::ExtractionState::NotApplicable, |protocol| protocol.extraction_state()),
+        });
+        writeln!(stdout, "{output}")?;
+        return Ok(());
+    }
+    if let Some(decision) = decision {
+        match decision.protocol().disposition() {
+            CaptureDisposition::Drop => {
+                writeln!(stdout, "{{}}")?;
+                return Ok(());
+            }
+            CaptureDisposition::MetadataOnly => {
+                json = metadata_only_body(
+                    canonical_session_id.as_deref(),
+                    policy_cwd.as_deref(),
+                    &decision,
+                );
+                payload = serde_json::to_string(&json)?;
+            }
+            CaptureDisposition::Keep
+                if decision.protocol().policy_state() != PolicyState::Inactive =>
+            {
+                if let Some(object) = json.as_object_mut() {
+                    object.insert(
+                        "_ai_memory_capture".into(),
+                        serde_json::to_value(decision.protocol())?,
+                    );
+                    payload = serde_json::to_string(&json)?;
+                }
+            }
+            CaptureDisposition::Keep => {}
+        }
+    }
 
     let qs = cwd_query_suffix(
         &args.agent,
@@ -411,6 +476,39 @@ where
     Ok(())
 }
 
+fn parse_hook_payload(mut payload: String) -> serde_json::Result<(String, serde_json::Value)> {
+    if payload.starts_with('\u{feff}') {
+        payload.drain(..'\u{feff}'.len_utf8());
+    }
+    let json = serde_json::from_str(&payload)?;
+    Ok((payload, json))
+}
+
+fn hook_context(agent: &str, raw: &serde_json::Value) -> (Option<String>, Option<String>) {
+    let (cwd, session_id) = canonical_context(raw);
+    if cwd.is_some() {
+        return (cwd, session_id);
+    }
+    if AgentKind::from_wire(agent) == AgentKind::Devin {
+        (
+            resolve_cwd_with_fallbacks(raw, env_lookup, || std::env::current_dir().ok()),
+            session_id,
+        )
+    } else {
+        (
+            extract_cwd(raw).filter(|cwd| !cwd.trim().is_empty()),
+            session_id,
+        )
+    }
+}
+
+fn is_tool_event(event: &str) -> bool {
+    matches!(
+        event.to_ascii_lowercase().replace(['-', '_'], "").as_str(),
+        "pretooluse" | "posttooluse" | "tooluse"
+    )
+}
+
 /// Resolve the data dir cheaply, without loading the full config (the hook
 /// fast-path skips config for latency). Mirrors `config.rs`: explicit
 /// `--data-dir`, else `AI_MEMORY_DATA_DIR`, else the platform local-data dir.
@@ -443,6 +541,7 @@ mod tests {
             server_url: "http://127.0.0.1:1".into(),
             auth_token: None,
             project_strategy: None,
+            check_capture: false,
         }
     }
 
@@ -912,6 +1011,7 @@ mod tests {
             server_url: "http://127.0.0.1:1".into(),
             auth_token: None,
             project_strategy: None,
+            check_capture: false,
         };
 
         run_with_payload(
@@ -952,6 +1052,7 @@ mod tests {
                 server_url: "http://127.0.0.1:1".into(),
                 auth_token: None,
                 project_strategy: None,
+                check_capture: false,
             };
 
             run_with_payload(
@@ -991,6 +1092,7 @@ mod tests {
             server_url: "http://127.0.0.1:1".into(),
             auth_token: None,
             project_strategy: None,
+            check_capture: false,
         };
 
         run_with_payload(Some(data_dir), args, "{}".into(), &mut stdout, |_path| {
@@ -1016,6 +1118,7 @@ mod tests {
             server_url: "http://127.0.0.1:1".into(),
             auth_token: None,
             project_strategy: None,
+            check_capture: false,
         };
 
         run_with_payload(
@@ -1095,5 +1198,174 @@ mod tests {
             background_drain_budget_from(one_minute_for(BACKGROUND_DRAIN_BUDGET_ENV)),
             Duration::from_secs(60)
         );
+    }
+
+    #[tokio::test]
+    async fn capture_drop_prevents_spool_and_drainer() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"secret/**\"]\n",
+        )
+        .unwrap();
+        let data_dir = tmp.path().join("data");
+        let mut stdout = Vec::new();
+        let called = std::cell::Cell::new(false);
+        let mut args = devin_hook_args("post-tool-use");
+        args.server_url = "http://127.0.0.1:1".into();
+        run_with_payload(Some(data_dir.clone()), args, serde_json::json!({"cwd":tmp.path(),"tool_name":"Edit","tool_input":{"path":"secret/SENTINEL"}}).to_string(), &mut stdout, |_| { called.set(true); Ok(()) }).await.unwrap();
+        assert_eq!(stdout, b"{}\n");
+        assert!(!called.get());
+        assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_capture_marker_spools_only_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "[capture]\nunknown = 1\n",
+        )
+        .unwrap();
+        let data_dir = tmp.path().join("data");
+        let mut stdout = Vec::new();
+        run_with_payload(Some(data_dir.clone()), devin_hook_args("post-tool-use"), serde_json::json!({"cwd":tmp.path(),"tool_name":"Edit","tool_input":{"path":"SENTINEL_PATH","args":"SENTINEL_ARGS"},"output":"SENTINEL_OUTPUT","error":"SENTINEL_ERROR","nested":{"raw":"SENTINEL_NESTED"}}).to_string(), &mut stdout, |_| Ok(())).await.unwrap();
+        let entry = read_spooled_entries(&hook_spool::spool_dir(&data_dir))
+            .pop()
+            .unwrap();
+        for sentinel in [
+            "SENTINEL_PATH",
+            "SENTINEL_ARGS",
+            "SENTINEL_OUTPUT",
+            "SENTINEL_ERROR",
+            "SENTINEL_NESTED",
+        ] {
+            assert!(!entry.body.contains(sentinel));
+        }
+        assert!(entry.body.contains("_ai_memory_capture"));
+    }
+
+    #[tokio::test]
+    async fn check_capture_has_no_spool_side_effects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let mut args = devin_hook_args("post-tool-use");
+        args.check_capture = true;
+        let mut stdout = Vec::new();
+        run_with_payload(Some(data_dir.clone()), args, serde_json::json!({"cwd":tmp.path(),"tool_name":"Edit","tool_input":{"path":"SENTINEL"}}).to_string(), &mut stdout, |_| Err(std::io::Error::other("must not spawn"))).await.unwrap();
+        let output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(output.as_object().unwrap().len(), 6);
+        assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
+        assert!(!String::from_utf8(stdout).unwrap().contains("SENTINEL"));
+    }
+
+    #[tokio::test]
+    async fn inactive_preserves_bytes_and_active_keep_adds_protocol() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inactive_data = tmp.path().join("inactive-data");
+        let inactive_payload =
+            serde_json::json!({"cwd":tmp.path(),"tool_name":"Edit","tool_input":{"path":"public"}})
+                .to_string();
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(inactive_data.clone()),
+            devin_hook_args("post-tool-use"),
+            inactive_payload.clone(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_spooled_entries(&hook_spool::spool_dir(&inactive_data))[0].body,
+            inactive_payload
+        );
+
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"secret/**\"]\n",
+        )
+        .unwrap();
+        let active_data = tmp.path().join("active-data");
+        run_with_payload(
+            Some(active_data.clone()),
+            devin_hook_args("post-tool-use"),
+            serde_json::json!({"cwd":tmp.path(),"tool_name":"Edit","tool_input":{"path":"public"}})
+                .to_string(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        let body: serde_json::Value = serde_json::from_str(
+            &read_spooled_entries(&hook_spool::spool_dir(&active_data))[0].body,
+        )
+        .unwrap();
+        assert_eq!(body["_ai_memory_capture"]["disposition"], "keep");
+        assert_eq!(body["_ai_memory_capture"]["policy_state"], "active");
+    }
+
+    #[tokio::test]
+    async fn antigravity_workspace_path_drops_before_side_effects() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "workspace = \"canonical\"\n[capture]\nignore_paths = [\"secret/**\"]\n",
+        )
+        .unwrap();
+        let data_dir = tmp.path().join("data");
+        let mut args = devin_hook_args("post-tool-use");
+        args.agent = "antigravity-cli".into();
+        let mut stdout = Vec::new();
+        let raw = serde_json::json!({"workspacePaths":[tmp.path()],"toolCall":{"name":"Edit","args":{"path":"secret/a"}}});
+        assert!(cwd_query_suffix("antigravity-cli", &raw, None).contains("workspace=canonical"));
+        run_with_payload(
+            Some(data_dir.clone()),
+            args,
+            raw.to_string(),
+            &mut stdout,
+            |_| Err(std::io::Error::other("must not spawn")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stdout, b"{}\n");
+        assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
+    }
+
+    #[tokio::test]
+    async fn metadata_only_canonicalizes_supported_session_aliases() {
+        for (key, value) in [
+            ("session_id", serde_json::json!("one")),
+            ("sessionId", serde_json::json!("two")),
+            ("sessionID", serde_json::json!("three")),
+            ("conversationId", serde_json::json!("four")),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                tmp.path().join(".ai-memory.toml"),
+                "[capture]\nunknown = true\n",
+            )
+            .unwrap();
+            let data_dir = tmp.path().join("data");
+            let mut raw = serde_json::json!({"cwd":tmp.path(),"tool_name":"Edit","tool_input":{"path":"secret"}});
+            raw.as_object_mut()
+                .unwrap()
+                .insert(key.into(), value.clone());
+            let mut stdout = Vec::new();
+            run_with_payload(
+                Some(data_dir.clone()),
+                devin_hook_args("post-tool-use"),
+                raw.to_string(),
+                &mut stdout,
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
+            let body: serde_json::Value = serde_json::from_str(
+                &read_spooled_entries(&hook_spool::spool_dir(&data_dir))[0].body,
+            )
+            .unwrap();
+            assert_eq!(body["session_id"], value, "{key}");
+        }
     }
 }

@@ -170,10 +170,9 @@ impl AuthLevel {
 
     /// Check whether this auth tier can use `capability`.
     ///
-    /// `multi_user_enabled` mirrors the configured `[auth].token_pepper` gate:
-    /// operational admin routes keep their historical single-user behavior
-    /// until multi-user mode is enabled, while user-management is always
-    /// root-only.
+    /// `multi_user_enabled` is the store-backed presence of any user row:
+    /// operational admin routes keep their historical bootstrap behavior until
+    /// the first user is created, while user-management is always root-only.
     pub fn authorize(
         self,
         capability: Capability,

@@ -34,7 +34,10 @@ fn command_with_home(home: &Path) -> Command {
         .env("APPDATA", app_data)
         .env("LOCALAPPDATA", local_app_data)
         .env("AI_MEMORY_HOME", home)
-        .env("AI_MEMORY_DATA_DIR", home.join(".ai-memory-data"));
+        .env("AI_MEMORY_DATA_DIR", home.join(".ai-memory-data"))
+        // A host-level KIMI_CODE_HOME would pull uninstall's kimi-code
+        // config sweep out of the sandbox; tests opt back in explicitly.
+        .env_remove("KIMI_CODE_HOME");
     command
 }
 
@@ -911,4 +914,172 @@ fn uninstall_mcp_removes_devin_only() {
         after["mcpServers"].get("other-mcp").is_some(),
         "third-party MCP server must survive"
     );
+}
+
+#[test]
+fn uninstall_kimi_code_hooks_preserves_user_entries() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let kimi = home.path().join(".kimi-code");
+    std::fs::create_dir_all(&kimi).unwrap();
+    let config = kimi.join("config.toml");
+    std::fs::write(
+        &config,
+        r#"model = "kimi-k2"
+
+[providers.kimi]
+base_url = "https://api.moonshot.cn/v1"
+api_key = "sk-user-key"
+
+[[hooks]]
+event = "SessionStart"
+command = "AI_MEMORY_HOOK_URL=http://h /x/session-start.sh"
+
+[[hooks]]
+event = "SessionStart"
+matcher = "*"
+command = "/usr/bin/user-session-start"
+timeout = 10
+
+[[hooks]]
+event = "Stop"
+command = "'/usr/local/bin/ai-memory' hook --event stop --agent kimi-code --server-url http://h:49374"
+"#,
+    )
+    .unwrap();
+
+    let status = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
+        .status()
+        .unwrap();
+    assert!(status.success(), "uninstall failed");
+
+    let after = std::fs::read_to_string(&config).unwrap();
+    let doc: toml_edit::DocumentMut = after.parse().unwrap();
+    assert_eq!(doc.get("model").and_then(|m| m.as_str()), Some("kimi-k2"));
+    assert_eq!(
+        doc.get("providers")
+            .and_then(|p| p.get("kimi"))
+            .and_then(|k| k.get("api_key"))
+            .and_then(|k| k.as_str()),
+        Some("sk-user-key"),
+        "[providers] table must survive"
+    );
+    let hooks = doc
+        .get("hooks")
+        .and_then(toml_edit::Item::as_array_of_tables)
+        .expect("third-party [[hooks]] entries must survive");
+    assert_eq!(hooks.len(), 1, "only ai-memory rules removed");
+    assert_eq!(
+        hooks
+            .get(0)
+            .and_then(|t| t.get("command"))
+            .and_then(|c| c.as_str()),
+        Some("/usr/bin/user-session-start")
+    );
+    assert!(
+        !after.contains("AI_MEMORY_HOOK_URL") && !after.contains("--agent kimi-code"),
+        "no ai-memory hook command may remain: {after}"
+    );
+}
+
+#[test]
+fn uninstall_mcp_custom_url_removes_kimi_code_only_by_endpoint() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    // KIMI_CODE_HOME moves the whole data dir; point it away from HOME to
+    // prove uninstall honours the override.
+    let kimi = home.path().join("custom-kimi-home");
+    std::fs::create_dir_all(&kimi).unwrap();
+    let mcp = kimi.join("mcp.json");
+    std::fs::write(
+        &mcp,
+        r#"{
+          "mcpServers": {
+            "ai-memory": {"url":"http://example.invalid/mcp"},
+            "custom-memory": {"url":"http://lan:49374/mcp"},
+            "other": {"url":"http://other/mcp","headers":{"Authorization":"Bearer t"}}
+          }
+        }"#,
+    )
+    .unwrap();
+
+    let status = command_with_home(home.path())
+        .args([
+            "uninstall",
+            "--apply",
+            "--only",
+            "mcp",
+            "--mcp-url",
+            "http://lan:49374/mcp",
+            "--yes",
+        ])
+        .env("KIMI_CODE_HOME", &kimi)
+        .status()
+        .unwrap();
+    assert!(status.success(), "uninstall failed");
+
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+    assert!(after["mcpServers"].get("custom-memory").is_none());
+    assert!(
+        after["mcpServers"].get("ai-memory").is_some(),
+        "same name with a different endpoint must survive"
+    );
+    assert!(after["mcpServers"].get("other").is_some());
+}
+
+#[test]
+fn default_uninstall_removes_installed_kimi_code_flavored_url() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let kimi = home.path().join(".kimi-code");
+    std::fs::create_dir_all(&kimi).unwrap();
+    let mcp = kimi.join("mcp.json");
+    std::fs::write(
+        &mcp,
+        r#"{"mcpServers":{"other":{"url":"http://other/mcp"}}}"#,
+    )
+    .unwrap();
+
+    let install = command_with_home(home.path())
+        .args([
+            "install-mcp",
+            "--client",
+            "kimi-code",
+            "--server-url",
+            "http://127.0.0.1:49374",
+            "--apply",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "install-mcp failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let installed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+    assert_eq!(
+        installed["mcpServers"]["ai-memory"]["url"],
+        "http://127.0.0.1:49374/mcp?flavor=moonshot"
+    );
+
+    let output = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--only", "mcp", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+    assert!(
+        after["mcpServers"].get("ai-memory").is_none(),
+        "the exact flavored URL install-mcp writes must be removed"
+    );
+    assert!(after["mcpServers"].get("other").is_some());
 }

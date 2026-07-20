@@ -174,7 +174,9 @@ The shipped feature is an audit-first learning reviewer:
 1. Scheduled auto-improvement is enabled when an LLM provider is configured and
    `[auto_improve.scheduler] enabled = true`. Manual runs do not affect the
    scheduler.
-2. Reads a completed session, recent pages, and relevant existing wiki pages.
+2. Reads stored observations/session pages, recent pages, and relevant existing
+   wiki pages. Capture exclusions are upstream of storage: excluded content
+   cannot be recovered by `include_raw_fallback` because it was never stored.
 3. Produces a structured proposal containing small page creates or updates.
 4. Stores the proposal in a pending-review queue with evidence and diffs.
 5. Applies approved proposals through `Wiki::apply_batch`, admission webhooks,
@@ -260,6 +262,10 @@ Any implementation should preserve these invariants:
     mutations per run.
 14. Write a machine-readable audit row for every run and human-readable proposal
     sidecars whenever proposals exist.
+
+Capture policy is a client-side storage boundary, not a filter performed by the
+reviewer. Reviewers can only consume what was stored; see
+[Capture exclusions](marker-file.md#capture-exclusions).
 
 ## Existing User Upgrade Contract
 

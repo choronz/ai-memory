@@ -19,9 +19,13 @@ use ai_memory_wiki::{Wiki, WikiError, WritePageRequest};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, Content, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
+    CallToolResult, Content, Implementation, ListToolsResult, PaginatedRequestParams,
+    ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
 };
-use rmcp::{ErrorData as McpError, ServerHandler, schemars, tool, tool_handler, tool_router};
+use rmcp::service::RequestContext;
+use rmcp::{
+    ErrorData as McpError, RoleServer, ServerHandler, schemars, tool, tool_handler, tool_router,
+};
 use serde::{Deserialize, Serialize};
 
 const HANDOFF_SUMMARY_MAX_CHARS: usize = 3_000;
@@ -655,6 +659,10 @@ struct ExploreArgs {
 // `required` with `path: null` and still hit the runtime error. Encoding
 // it here lets schema-respecting clients refuse the invalid call before
 // it ever reaches the server.
+//
+// Moonshot ("moonshot flavored json schema") rejects this root-level
+// `anyOf`; Kimi Code sessions get a patched schema instead
+// (`moonshot_safe_tool_list`). Every other client keeps this exact shape.
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[schemars(extend("anyOf" = [
     {"required": ["path"], "properties": {"path": {"type": "string"}}},
@@ -1446,8 +1454,9 @@ impl AiMemoryServer {
         (single-page) rewrites sessions/<id>.md from the observation \
         log. multi_page=true fans out into a batch of concept/decision/\
         gotcha pages plus the session page, all written in one atomic \
-        SQL transaction. Off by default; requires \
-        AI_MEMORY_LLM_PROVIDER + AI_MEMORY_LLM_MODEL set on the server. \
+        SQL transaction. Off by default; requires AI_MEMORY_LLM_PROVIDER \
+        plus that provider's credentials. AI_MEMORY_LLM_MODEL is optional \
+        for providers with a built-in default. \
         The consolidation target is resolved from where the session's \
         observations actually landed, so a session that adopted its scope \
         marker mid-run still consolidates into the right project. Admission \
@@ -1463,7 +1472,7 @@ impl AiMemoryServer {
     ) -> Result<CallToolResult, McpError> {
         let Some(consolidator) = self.consolidator.as_ref() else {
             return Err(McpError::internal_error(
-                "memory_consolidate not configured (set AI_MEMORY_LLM_PROVIDER + AI_MEMORY_LLM_MODEL)",
+                "memory_consolidate not configured (set AI_MEMORY_LLM_PROVIDER and the provider's required credentials; providers without a built-in model also require AI_MEMORY_LLM_MODEL)",
                 None,
             ));
         };
@@ -2453,6 +2462,7 @@ impl AiMemoryServer {
                 "antigravity_cli": "AGENTS.md",
                 "zero": "AGENTS.md",
                 "devin": "AGENTS.md",
+                "kimi_code": "AGENTS.md",
                 "grok": "AGENTS.md",
                 "default": "AGENTS.md"
             },
@@ -2518,6 +2528,58 @@ impl ServerHandler for AiMemoryServer {
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_instructions(MEMORY_INSTRUCTIONS.to_string())
     }
+
+    // Declared manually so `#[tool_handler]` skips its generated
+    // `list_tools` and the flavor patch runs on every tools/list.
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        let tools = self.tool_router.list_all();
+        // rmcp injects `http::request::Parts` into request extensions in
+        // both stateless and stateful modes, so the flavor marker is
+        // available even without peer clientInfo.
+        let moonshot = context
+            .extensions
+            .get::<http::request::Parts>()
+            .and_then(|parts| parts.uri.query())
+            .is_some_and(|query| query.split('&').any(|pair| pair == "flavor=moonshot"));
+        if moonshot {
+            Ok(ListToolsResult::with_all_items(moonshot_safe_tool_list(
+                tools,
+            )))
+        } else {
+            Ok(ListToolsResult::with_all_items(tools))
+        }
+    }
+}
+
+/// Moonshot ("moonshot flavored json schema") rejects root-level
+/// `anyOf`/`oneOf`/`allOf` in tool parameter schemas with a 400 at
+/// `tools/list` time. Requests marked `?flavor=moonshot` (the URL
+/// `install-mcp --client kimi-code` writes) get the tool list with
+/// those root keys stripped; nested combinators stay, and the handlers'
+/// runtime validation still enforces the arg contracts.
+fn moonshot_safe_tool_list(tools: Vec<Tool>) -> Vec<Tool> {
+    const ROOT_COMBINATORS: [&str; 3] = ["anyOf", "oneOf", "allOf"];
+    tools
+        .into_iter()
+        .map(|mut tool| {
+            if !ROOT_COMBINATORS
+                .iter()
+                .any(|key| tool.input_schema.contains_key(*key))
+            {
+                return tool;
+            }
+            let mut schema = (*tool.input_schema).clone();
+            for key in ROOT_COMBINATORS {
+                schema.shift_remove(key);
+            }
+            tool.input_schema = Arc::new(schema);
+            tool
+        })
+        .collect()
 }
 
 impl AiMemoryServer {
@@ -3296,6 +3358,10 @@ mod tests {
         );
         assert_eq!(
             response["agent_filenames"]["devin"].as_str().unwrap(),
+            "AGENTS.md"
+        );
+        assert_eq!(
+            response["agent_filenames"]["kimi_code"].as_str().unwrap(),
             "AGENTS.md"
         );
         // Proposed symmetrically alongside the devin assertion above:
@@ -4463,6 +4529,63 @@ mod tests {
                  clients cannot satisfy it"
             );
         }
+    }
+
+    // Pins what the patch strips (root combinators) and what it preserves.
+    #[test]
+    fn moonshot_safe_tool_list_strips_root_combinators_only() {
+        let schema: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "title": "ReadPageArgs",
+                "type": "object",
+                "description": "Read one wiki page.",
+                "properties": {
+                    "path": { "type": "string", "description": "Exact wiki path" },
+                    // Nested combinator: must survive (rejection is root-specific).
+                    "query": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+                },
+                "anyOf": [{ "required": ["path"] }, { "required": ["query"] }],
+                "oneOf": [{ "required": ["path"] }],
+                "allOf": [{ "required": ["query"] }]
+            }))
+            .unwrap();
+        let tool = Tool::new("memory_read_page", "Read a wiki page", schema);
+
+        let patched = moonshot_safe_tool_list(vec![tool]);
+        let out = &patched[0].input_schema;
+
+        for key in ["anyOf", "oneOf", "allOf"] {
+            assert!(
+                !out.contains_key(key),
+                "root `{key}` must be stripped: {out:?}"
+            );
+        }
+        for key in ["$schema", "title", "type", "description", "properties"] {
+            assert!(out.contains_key(key), "root `{key}` must survive: {out:?}");
+        }
+        assert_eq!(
+            out["properties"]["query"]["anyOf"],
+            serde_json::json!([{ "type": "string" }, { "type": "null" }]),
+            "nested combinators are out of scope for the patch"
+        );
+    }
+
+    #[test]
+    fn moonshot_safe_tool_list_leaves_flat_tools_untouched() {
+        let schema: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "type": "object",
+                "properties": { "verbose": { "type": "boolean" } }
+            }))
+            .unwrap();
+        let tool = Tool::new("memory_status", "Status counts", schema);
+        let before = serde_json::to_value(&tool).unwrap();
+
+        let patched = moonshot_safe_tool_list(vec![tool]);
+        let after = serde_json::to_value(&patched[0]).unwrap();
+
+        assert_eq!(before, after, "flat tools must pass through unchanged");
     }
 
     // Issue #155: the neither-arg error must teach a looping model what a
@@ -6258,6 +6381,14 @@ mod tests {
         assert!(
             msg.contains("not configured"),
             "error should mention configuration: {msg}",
+        );
+        assert!(
+            msg.contains("provider's required credentials"),
+            "error should direct users to provider credentials: {msg}",
+        );
+        assert!(
+            msg.contains("without a built-in model"),
+            "error should not imply every provider needs an explicit model: {msg}",
         );
     }
 

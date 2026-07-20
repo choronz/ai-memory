@@ -16,6 +16,7 @@ mod auto_improve;
 pub mod decay;
 mod error;
 mod fts_query;
+mod maintenance;
 mod migrations;
 mod ops;
 mod reader;
@@ -34,6 +35,7 @@ pub use auto_improve::{
 };
 pub use decay::{DecayParams, retention_score};
 pub use error::{StoreError, StoreResult};
+pub use maintenance::MaintenanceJob;
 pub use ops::{
     DeleteWorkspaceSummary, EmbeddingWrite, MoveSummary, PurgeSessionSummary, PurgeSessionsSummary,
     PurgeSummary, ReorgSummary,
@@ -214,6 +216,45 @@ mod tests {
             hash.try_into().unwrap(),
             updated,
         )
+    }
+
+    #[tokio::test]
+    async fn maintenance_scheduler_state_round_trips_per_job() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let store = Store::open(tmp.path()).unwrap();
+            assert_eq!(
+                store
+                    .reader
+                    .maintenance_job_last_success(MaintenanceJob::ForgetSweep)
+                    .await
+                    .unwrap(),
+                None
+            );
+
+            store
+                .writer
+                .record_maintenance_job_success(MaintenanceJob::ForgetSweep)
+                .await
+                .unwrap();
+        }
+        let store = Store::open(tmp.path()).unwrap();
+        assert!(
+            store
+                .reader
+                .maintenance_job_last_success(MaintenanceJob::ForgetSweep)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            store
+                .reader
+                .maintenance_job_last_success(MaintenanceJob::RuleLint)
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     fn telemetry_count(rows: &[AutoImproveTelemetryCount], key: &str) -> usize {
@@ -2967,6 +3008,169 @@ mod tests {
         let paths: Vec<&str> = pages.iter().map(|p| p.path.as_str()).collect();
         assert!(paths.contains(&"x.md"));
         assert!(paths.contains(&"y.md"));
+    }
+
+    #[tokio::test]
+    async fn reader_page_kinds_follow_canonical_paths_across_surfaces() {
+        const CASES: [(&str, &str); 9] = [
+            ("_rules/rule.md", "rule"),
+            ("_slots/focus.md", "slot"),
+            ("sessions/session.md", "session"),
+            ("decisions/decision.md", "decision"),
+            ("gotchas/gotcha.md", "gotcha"),
+            ("concepts/concept.md", "concept"),
+            ("procedures/procedure.md", "procedure"),
+            ("notes/note.md", "note"),
+            ("misc/fallback.md", "fact"),
+        ];
+
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "kind-test", None)
+            .await
+            .unwrap();
+
+        let mut session_id = None;
+        for (path, _) in CASES {
+            let id = store
+                .writer
+                .upsert_page(sample_page(ws, proj, path, "body"))
+                .await
+                .unwrap();
+            if path == "sessions/session.md" {
+                session_id = Some(id);
+            }
+        }
+
+        let mut override_page = sample_page(ws, proj, "sessions/override.md", "override");
+        override_page.frontmatter_json = serde_json::json!({"kind": "note"});
+        store.writer.upsert_page(override_page).await.unwrap();
+
+        let mut source = sample_page(ws, proj, "notes/source.md", "linked source");
+        source.links = vec![PagePath::new("sessions/session.md").unwrap().into()];
+        store.writer.upsert_page(source).await.unwrap();
+
+        let assert_briefing_kinds = |pages: &[BriefingPage]| {
+            for (path, expected) in CASES {
+                let page = pages.iter().find(|page| page.path == path).unwrap();
+                assert_eq!(page.kind, expected, "wrong briefing kind for {path}");
+            }
+            let override_page = pages
+                .iter()
+                .find(|page| page.path == "sessions/override.md")
+                .unwrap();
+            assert_eq!(override_page.kind, "note", "explicit kind must win");
+        };
+
+        let listed = store
+            .reader
+            .list_pages("default", "kind-test")
+            .await
+            .unwrap();
+        for (path, expected) in CASES {
+            let page = listed.iter().find(|page| page.path == path).unwrap();
+            assert_eq!(page.kind, expected, "wrong list kind for {path}");
+        }
+        assert_eq!(
+            listed
+                .iter()
+                .find(|page| page.path == "sessions/override.md")
+                .unwrap()
+                .kind,
+            "note",
+            "explicit kind must win"
+        );
+
+        assert_briefing_kinds(&store.reader.briefing(100).await.unwrap().recent_pages);
+        assert_briefing_kinds(
+            &store
+                .reader
+                .briefing_for_workspace(ws, 100)
+                .await
+                .unwrap()
+                .recent_pages,
+        );
+        let project_briefing = store
+            .reader
+            .briefing_for_project(ws, proj, 100)
+            .await
+            .unwrap();
+        assert_briefing_kinds(&project_briefing.recent_pages);
+        assert_eq!(project_briefing.rules[0].kind, "rule");
+        assert_eq!(project_briefing.slots[0].kind, "slot");
+        let (_, session_recent) = store
+            .reader
+            .session_brief_pages(ws, proj, 100, 100)
+            .await
+            .unwrap();
+        assert_briefing_kinds(&session_recent);
+
+        let session_id = session_id.unwrap();
+        assert_eq!(
+            store
+                .reader
+                .page_meta("default", "kind-test", "sessions/session.md")
+                .await
+                .unwrap()
+                .unwrap()
+                .kind,
+            "session"
+        );
+        assert_eq!(
+            store
+                .reader
+                .page_meta_by_id(session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .kind,
+            "session"
+        );
+        assert_eq!(
+            store
+                .reader
+                .page_meta_by_path("concepts/concept.md")
+                .await
+                .unwrap()
+                .unwrap()
+                .kind,
+            "concept"
+        );
+
+        let source_links = store
+            .reader
+            .page_links(ws, proj, "notes/source.md".into())
+            .await
+            .unwrap();
+        assert_eq!(source_links.links[0].kind, "session");
+        let target_links = store
+            .reader
+            .page_links(ws, proj, "sessions/session.md".into())
+            .await
+            .unwrap();
+        assert_eq!(target_links.backlinks[0].kind, "note");
+
+        let health = store
+            .reader
+            .health_detail_for_project(ws, proj, 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            health
+                .orphans
+                .iter()
+                .find(|page| page.path == "procedures/procedure.md")
+                .unwrap()
+                .kind,
+            "procedure"
+        );
     }
 
     #[tokio::test]

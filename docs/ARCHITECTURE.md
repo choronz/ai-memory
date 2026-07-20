@@ -6,9 +6,9 @@
 
 ## Purpose
 
-ai-memory is a single Rust binary that gives AI coding agents (Claude
-Code, OpenAI Codex, Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI,
-OpenClaw, OpenCode, OMP, and MCP-capable clients) long-term memory shared across CLIs.
+ai-memory is a single Rust binary that gives the coding agents in the
+[README Support Matrix](../README.md#support-matrix), plus other MCP-capable
+clients, long-term memory shared across CLIs.
 Quit one mid-task; open another in the same directory; continue. No
 manual `write_note` ceremony, no copy-pasting summaries between
 sessions.
@@ -52,6 +52,10 @@ from hook paths.
    minute-based env vars.
    Agent hot paths never block on the network; saturated servers return HTTP
    429 instead of queueing unbounded work.
+   For supported native commands and generated OpenCode/OMP/Pi/OpenClaw
+   integrations, the nearest-marker capture policy runs first: a dropped
+   recognized file-tool event never enters spool, queue, transport, logs, or
+   storage. See [Capture exclusions](marker-file.md#capture-exclusions).
 2. Server's hook router sanitises the payload (the only path from
    untrusted text into the store), assigns an [`ObservationKind`], and
    enqueues a `WriteCmd` to the writer actor. `log.md` gets an
@@ -59,8 +63,9 @@ from hook paths.
 3. On true `SessionEnd` events, the server synthesises a
    `sessions/<id>.md` summary page (rule-based, no LLM) and opens a
    `Handoff` row for the next agent. Auto-commits the wiki. Clients
-   without a true session-end hook (currently Antigravity CLI) should call
-   `memory_handoff_begin` before quitting when a handoff is needed.
+   without a reliable true session-end hook need an explicit ending action:
+   Codex provides `ai-memory finalize-session`, while Antigravity CLI should
+   call `memory_handoff_begin` before quitting when a handoff is needed.
 4. When `AI_MEMORY_LLM_PROVIDER` is set, `memory_consolidate` rewrites
    that summary into a richer durable page or fans out into a
    multi-page batch under `concepts/`, `decisions/`, `gotchas/`.
@@ -178,9 +183,9 @@ contradict specific existing content.
 
 ## Cross-project links
 
-Pages normally link within their own project (`[[decisions/0001.md]]`,
-`[label](../gotchas/x.md)`). A wikilink can also name another project so
-that dependencies between projects become explicit edges in the graph:
+Pages normally link within their own project (`[[decisions/0001.md]]`, or a
+`label` pointing to `../gotchas/x.md`). A wikilink can also name another project
+so that dependencies between projects become explicit edges in the graph:
 
 * `[[project:path.md]]` — a sibling project in the same workspace.
 * `[[workspace/project:path.md]]` — a project in another workspace.
@@ -382,7 +387,7 @@ min_session_age_secs = 600
 **LLM provider env** (opt-in):
 ```
 AI_MEMORY_LLM_PROVIDER     anthropic | openai | openai-oauth | copilot | gemini | openai-compat
-AI_MEMORY_LLM_MODEL        e.g. claude-sonnet-4-6, gpt-5.5, gemini-2.5-flash
+AI_MEMORY_LLM_MODEL        optional when the provider has a default; e.g. claude-haiku-4-5, gpt-5.4-mini
 ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / LLM_API_KEY
 AI_MEMORY_LLM_BASE_URL     for openai-compat (Ollama, vLLM)
 COPILOT_GITHUB_TOKEN       optional GitHub token for copilot

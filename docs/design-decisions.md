@@ -1,8 +1,10 @@
 # ai-memory - Design Decisions (Synthesis)
 
-> Distills the four research reports (`research-*.md`) and three issue-tracker
-> reports (`issues-*.md`) into the concrete decisions this project will make.
-> Read this first; the research files are the receipts.
+> Historical rationale distilled from the original research and issue-tracker
+> reports. For the current operational map, read
+> [`ARCHITECTURE.md`](ARCHITECTURE.md); for current client support, use the
+> [README Support Matrix](../README.md#support-matrix). The research files are
+> the historical receipts.
 
 ## 1. Product shape
 
@@ -113,6 +115,18 @@ Three capture surfaces, in priority order:
 2. **Transcript tail** (universal fallback). Watch `~/.claude/projects/`, `~/.codex/`, `~/.config/opencode/sessions/`. Lossier but works for any agent. Required for the basic-memory #669/#687/#730 demand the tracker has been asking for.
 
 3. **Manual MCP tool** (`memory_remember`) - only for ad-hoc explicit captures from the user ("remember this"). Not the primary path; not what the agent reaches for by default.
+
+### Capture-policy boundary (#194)
+
+The nearest `.ai-memory.toml` may use `[capture] ignore_paths` to exclude
+recognized file-tool events before client spool or transport. This is a strict,
+schema-specific lexical boundary, not a general content or DLP filter: private
+patterns and candidates never leave the client, but shell/patch text, aliases,
+and non-path-attributable bodies remain outside its scope. The authoritative
+grammar, limits, supported integrations, and `--check-capture` affordance are
+in [the marker-file reference](marker-file.md#capture-exclusions). It adds no
+MCP tool and needs no DB migration; new-client/old-server is safe, while old
+clients retain their previous capture behavior.
 
 ## 7. Memory model (temporal)
 

@@ -31,7 +31,7 @@ workspace-only markers can still resolve `project = basename(cwd)` for
 handoff lookups.
 
 The marker path is shared by the POSIX/PowerShell hook scripts and the
-generated OpenCode / OMP / OpenClaw TypeScript integrations. In all cases,
+generated OpenCode / OMP / Pi / OpenClaw TypeScript integrations. In all cases,
 hook capture and handoff lookup send the same `cwd`, `workspace`, `project`,
 `project_strategy`, `drop_subagent`, `default_global`, `briefing`, and
 `briefing_budget` query params to the server when a marker declares them;
@@ -119,6 +119,95 @@ subagent captures stored as usual. Top-level (non-subagent) sessions are
 always stored regardless. This is per-project on purpose: there is no
 server-global switch, so opting one noisy project in never sheds subagent
 captures for the others on a shared instance.
+
+## Capture exclusions
+
+Use the exact per-repository shape `[capture]` plus `ignore_paths = [...]`
+below to keep recognized file-tool activity under matching paths out of capture:
+
+```toml
+[capture]
+ignore_paths = ["private/**", "~/personal-notes/**"]
+```
+
+The **nearest** `.ai-memory.toml` is authoritative; marker sections do not
+merge. A missing `[capture]` section or `ignore_paths = []` is inactive and
+preserves current behavior. `[capture]` accepts only `ignore_paths`: unknown
+keys, invalid types/globs/roots, unreadable markers, or a marker over 64 KiB
+invalidate the whole capture policy rather than partially applying it.
+
+Patterns match an entire lexically normalized path, not a substring. Use only
+`*`, `?`, and `**`; relative patterns are rooted at the marker directory,
+relative file-tool paths are resolved from the event's actual `cwd`, and `~/`
+expands to the home directory. Prefer forward slashes on every platform.
+POSIX matching is case-sensitive; Windows drive/UNC matching is ASCII
+case-insensitive. Bounds are 128 patterns, 1,024 characters per pattern, 32
+direct candidates and 4,096 characters per candidate, and 1,000,000 bounded
+pattern/candidate comparisons.
+
+For fixture-proven direct file tools, ai-memory reads only explicit path fields
+and documented direct arrays for multi-file calls. If any candidate matches, the
+entire event is **dropped locally** before spool, queue, network, transport
+logs, or server storage. With an active policy, recognized search/list tools are
+dropped conservatively; missing or malformed recognized file candidates, an
+unsupported recognized schema, or an invalid policy become **metadata-only**.
+That form contains only bounded routing/tool/decision metadata, never paths,
+patterns, arguments, output, errors, titles, or nested payload. Known non-file
+and unknown tools retain current behavior. Excluding content before transport
+matters because it cannot then reach observations/FTS, session pages, handoffs,
+reviewer requests, proposals, or logs.
+
+This is a lexical capture boundary, **not complete DLP**. It does not resolve
+symlinks, junctions, bind mounts, or Windows 8.3 aliases. Shell commands and
+free-form patches are not parsed; prompts, assistant text, notifications, and
+quoted content are not path-attributable. Add each relevant visible alias
+explicitly, and do not rely on this feature to detect every way private content
+can be mentioned.
+
+### Supported integrations and refresh
+
+Capture policy v1 is enforced by native `ai-memory hook` commands (including
+native POSIX/Windows hook commands) and generated OpenCode, OMP, Pi, and
+OpenClaw integrations. Local installers default to native commands where that
+path is supported. Legacy `.sh`/`.ps1` hooks and remote-only/Docker script
+bundles do **not** enforce it. Reinstall hooks or refresh/reinstall generated
+plugins after upgrading; existing hooks/plugins keep their prior behavior.
+Installer capability output describes the selected integration.
+
+New clients remain safe with old servers because stripping and dropping happen
+on the client. Old clients talking to new servers retain old behavior and cannot
+enforce a host-only marker policy; the server cannot warn about policy it never
+saw. The policy adds no MCP tool and no database migration.
+
+### Check a decision locally
+
+`ai-memory hook --event ... --agent ... --check-capture` reads one JSON payload
+from stdin and performs no spool, queue, drain, network, or handoff work. It
+prints only bounded decision metadata (protocol version, policy state, tool
+family, path count, disposition, and extraction state), never paths, patterns,
+or payload content:
+
+```bash
+printf '%s\n' '{"session_id":"demo","cwd":"/example/workspace","tool_name":"Edit","tool_input":{"path":"docs/example.md"}}' \
+  | ai-memory hook --event post-tool-use --agent claude-code \
+      --server-url http://127.0.0.1:49374 --check-capture
+```
+
+The normal capture contract is intentionally narrow: supported Claude Code,
+OpenCode, Pi, and Antigravity tool events retain only canonical tool family,
+an agent-provided validated call ID when their documented schema proves one,
+and a PostToolUse outcome class. `PreToolUse` never retains commands,
+arguments, paths, input bodies, or arbitrary tool names. `PostToolUse` appends
+its existing tool-response/error excerpt and caps the complete rendered body at
+2,000 UTF-8-safe bytes. Unsupported tool envelopes do not gain a PreToolUse
+body, and association is only by matching agent-provided call IDs. User-prompt stores its prompt
+text, notification stores its message/text, and post-compaction stores its
+summary; other event bodies are currently empty unless explicitly supported.
+Stop and assistant-message capture remain disabled and deferred. The metadata
+header is closed; the PostToolUse response/error excerpt remains the existing
+bounded content capture.
+Capture exclusions are evaluated only where paths have a proven schema, so they
+do not claim to filter those other bodies.
 
 ## Four canonical examples
 
@@ -219,7 +308,7 @@ repo root — so an agent that runs `mkdir sub && cd sub` and stays there no
 longer forks the rest of the session into a phantom project named `sub`.
 
 This is **install-time config**, written into the agent's hook command (and
-the generated OpenCode / OMP / OpenClaw plugins) — the same status as the
+the generated OpenCode / OMP / Pi / OpenClaw plugins) — the same status as the
 `AI_MEMORY_AUTH_TOKEN` / `AI_MEMORY_HOOK_URL` it sits beside, *not* a user-set
 runtime override (which was deliberately rejected in #16). The flag accepts
 `basename` (the default — bakes nothing, behavior unchanged) or `repo-root`.

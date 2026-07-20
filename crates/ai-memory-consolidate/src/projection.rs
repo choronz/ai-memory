@@ -547,7 +547,7 @@ mod tests {
             78,
             ObservationKind::PostToolUse,
             "final correction",
-            "final state supersedes earlier draft",
+            "tool_family: file\noutcome: unknown\n---\nfinal state supersedes earlier draft",
             3,
         );
         observations[79] = obs(79, ObservationKind::SessionEnd, "session end", "done", 5);

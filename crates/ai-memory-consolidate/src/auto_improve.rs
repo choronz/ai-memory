@@ -2467,6 +2467,45 @@ mod tests {
     }
 
     #[test]
+    fn prompt_keeps_paired_safe_tool_observations_below_sampling_threshold() {
+        let call_id = "stable-call-190";
+        let observations = vec![
+            obs(
+                0,
+                ObservationKind::PreToolUse,
+                "tool non-file",
+                &format!("tool_family: non-file\ntool_call_id: {call_id}"),
+                5,
+            ),
+            obs(
+                1,
+                ObservationKind::PostToolUse,
+                "tool non-file",
+                &format!(
+                    "tool_family: non-file\ntool_call_id: {call_id}\noutcome: unknown\n---\nPOST_OUTPUT_SURVIVES"
+                ),
+                5,
+            ),
+        ];
+        assert!(observations.len() < 48);
+        let prompt = build_prompt_input(
+            SessionId::new(),
+            &observations,
+            3_600,
+            None,
+            &[],
+            &[],
+            &[],
+            &cfg(),
+        );
+        assert_eq!(prompt.prompt.matches(call_id).count(), 2);
+        assert!(prompt.prompt.contains("POST_OUTPUT_SURVIVES"));
+        for sentinel in ["SENTINEL_COMMAND", "SENTINEL_PATH"] {
+            assert!(!prompt.prompt.contains(sentinel));
+        }
+    }
+
+    #[test]
     fn prompt_bounds_patchable_context_and_charges_observation_budget() {
         let session_id = SessionId::new();
         let observations: Vec<_> = (0..20)

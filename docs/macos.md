@@ -129,6 +129,12 @@ cleanup, and starts a detached session-end `hook-drain` helper; the whole-minute
 spool-timing overrides are shared with Windows and documented in
 [`docs/windows.md`](windows.md#tuning-the-spool-timings-high-latency-instances).
 
+Native `posix-native` `ai-memory hook` commands enforce the nearest-marker
+`[capture] ignore_paths` policy before spool or network delivery. The Docker
+wrapper's `posix` shell-script path does not. Re-run `install-hooks --agent
+<agent> --apply` after upgrading to refresh an existing native install; see
+[Capture exclusions](marker-file.md#capture-exclusions).
+
 ## Troubleshooting on macOS
 
 - **`403 forbidden host` from Docker-wrapper CLI commands:** update the Docker

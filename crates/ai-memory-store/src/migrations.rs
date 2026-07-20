@@ -96,7 +96,7 @@ mod tests {
     fn schema_ahead_message_is_actionable() {
         let rendered = StoreError::DataSchemaAhead {
             applied: "V99 (future_feature)".to_string(),
-            supported: 28,
+            supported: 30,
         }
         .to_string();
 
@@ -109,6 +109,36 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("V99 (future_feature)"), "{rendered}");
-        assert!(rendered.contains("through V28"), "{rendered}");
+        assert!(rendered.contains("through V30"), "{rendered}");
+    }
+
+    #[test]
+    fn v28_to_v29_preserves_existing_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 28).unwrap();
+        let workspace_id = [7_u8; 16];
+        conn.execute(
+            "INSERT INTO workspaces (id, name, created_at) VALUES (?1, 'existing', 1)",
+            params![workspace_id.as_slice()],
+        )
+        .unwrap();
+
+        run(&mut conn).unwrap();
+        let name: String = conn
+            .query_row(
+                "SELECT name FROM workspaces WHERE id = ?1",
+                params![workspace_id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "existing");
+        let state_table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'maintenance_scheduler_state'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state_table, 1);
     }
 }

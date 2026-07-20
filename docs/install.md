@@ -9,7 +9,7 @@ path (docker + Claude Code). This page covers everything else:
 - [Arch Linux native packages (AUR)](#arch-linux-native-packages-aur)
   (systemd system service or user service)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, OpenClaw, VS Code Copilot)
+  (Codex, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, Kimi Code, OpenClaw, VS Code Copilot)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -368,6 +368,16 @@ then stages runnable copies under `~/.local/share/ai-memory/hooks/<agent>/` so
 the agent can execute files owned by your user. Re-run `install-hooks --apply`
 after package upgrades to refresh those staged copies.
 
+### Capture-policy capability and refresh
+
+`[capture] ignore_paths` is enforced only by native `ai-memory hook` commands
+and generated OpenCode/OMP/Pi/OpenClaw integrations. Local installers select
+native commands where supported; legacy `.sh`/`.ps1` hooks and remote-only or
+Docker script bundles do not enforce it. Re-run `install-hooks --agent <agent>
+--apply` or refresh/reinstall generated plugins after upgrading; installer
+capability output reflects the selected integration. See the canonical
+[capture exclusions reference](marker-file.md#capture-exclusions).
+
 Native `ai-memory hook --event ...` commands spool events locally. Session start
 does a short bounded cleanup drain before fetching a handoff; cancellation-prone
 boundary events (`stop`, `pre-compact`, and `session-end`) start a detached
@@ -474,9 +484,9 @@ AI_MEMORY_NATIVE_TEST_IMAGE=quay.io/toolbx/arch-toolbox:latest scripts/test-nati
 
 ## Configuring other agent CLIs
 
-> `install-mcp --server-url` takes the MCP endpoint **including** `/mcp`
-> (e.g. `http://homelab:49374/mcp`) — the rendered client config expects the
-> full MCP URL. `install-hooks --server-url` takes the bare server **origin**
+> `install-mcp --server-url` accepts either the bare server origin or the full
+> MCP endpoint and appends a missing `/mcp` exactly once.
+> `install-hooks --server-url` takes the bare server **origin**
 > (e.g. `http://homelab:49374`) — hook scripts append `/hook`, `/handoff`,
 > etc. themselves.
 
@@ -488,21 +498,19 @@ Each agent CLI needs two things:
    Without this, the agent can still query memory but capture
    becomes manual.
 
-Claude Desktop is MCP-only today. Claude Code, Codex, Devin CLI, OpenCode,
-OMP, Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, and OpenClaw have lifecycle capture paths through
-`install-hooks`.
+Claude Desktop and VS Code Copilot are MCP-only today. The hook-capable clients
+in the [README Support Matrix](../README.md#support-matrix), including Pi and
+Zero, have lifecycle capture paths through `install-hooks`.
 
-> **Two-step hook install pattern.** Claude Code, Codex, Cursor,
-> Gemini CLI, Antigravity CLI, Grok Build CLI, and Devin CLI use shell/PowerShell hook scripts: (1) `docker cp` the
-> bundled scripts to your home dir, (2) `docker run --rm install-hooks`
-> to render the config snippet.
-> On native Windows, Claude Code is the exception to the PowerShell default:
-> it uses Claude exec form (`command` = real `ai-memory.exe`, `args` = argv
-> tokens for `hook --event ...`) by default. Set
-> `AI_MEMORY_HOOK_PLATFORM=windows-bash` before `install-hooks` to opt back into
-> Git Bash `bash -c` commands for the `.sh` scripts, including for older Claude
-> Code builds that do not support exec form.
-> OpenClaw, OpenCode, and OMP are different: they use generated
+> **Hook install pattern.** Local supported profiles default to host-native
+> commands. Claude Code may use its supported Windows exec form (`command` =
+> real `ai-memory.exe`, `args` = argv tokens for `hook --event ...`); other
+> agents use native single command strings according to their hook schema.
+> PowerShell/Git Bash script bundles are compatibility fallbacks and do not
+> enforce capture-policy v1. Remote-only/Docker script installs still use the
+> two-step path: (1) `docker cp` bundled scripts to your home dir, (2)
+> `docker run --rm install-hooks` renders the config snippet.
+> OpenClaw, OpenCode, OMP, and Pi are different: they use generated
 > TypeScript plugin/extension files, so no shell-script extraction is
 > needed for those clients.
 
@@ -567,6 +575,43 @@ The `SessionStart` hook injects pending handoffs through Devin's
 from `DEVIN_PROJECT_DIR` or the hook process working directory when the payload
 omits it, and mints/reuses a per-host session id from hook state when necessary,
 so those events are still captured. A payload-provided value always wins.
+
+### Kimi Code
+
+Kimi Code keeps MCP servers in `~/.kimi-code/mcp.json` and lifecycle hooks in
+`~/.kimi-code/config.toml`; both move together when `$KIMI_CODE_HOME` is set.
+The CLI also accepts `--agent kimi` as an alias. `install-mcp` writes the
+server URL with a `?flavor=moonshot` query because the Moonshot API rejects
+root-level `anyOf`/`oneOf`/`allOf` in tool parameter schemas ("moonshot
+flavored json schema") — the ai-memory server answers flavored requests with
+flat schemas, and all other clients keep the upstream shape.
+
+```bash
+ai-memory install-mcp --client kimi-code --apply \
+    --server-url "http://homelab:49374/mcp" \
+    --auth-token "$TOKEN"
+
+ai-memory install-hooks --agent kimi-code --apply \
+    --server-url "http://homelab:49374" \
+    --auth-token "$TOKEN"
+```
+
+`install-hooks` merges `[[hooks]]` entries into `config.toml`, preserving the
+provider/model settings the same file holds. Entries cover 10 events —
+`SessionStart`, `SessionEnd`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
+`PostToolUseFailure` (Kimi Code reports tool failures separately from
+successful calls; it reuses the post-tool-use handler), `Stop`,
+`SubagentStart`, `SubagentStop`, and `PreCompact` — and default to
+native `ai-memory hook --event … --agent kimi-code` commands on local installs
+(local spool plus batched delivery, capture-policy v1 enforced); the staged
+script bundle under `~/.local/share/ai-memory/hooks/kimi-code/` is the
+compatibility fallback (fire-and-forget POSTs to `/hook`). A pending handoff
+is injected at `SessionStart` through the hook's stdout, which Kimi Code
+appends to the model context.
+
+Kimi Code hook entries accept only `event`, `matcher`, `command`, and
+`timeout`; extra fields make the whole `config.toml` fail to load, so prefer
+`install-hooks --apply` over hand edits.
 
 ### OpenCode
 
@@ -1172,9 +1217,15 @@ enable `embedding_backfill_interval_secs` after configuring an embedder,
 each scheduled tick backfills every existing workspace/project and may
 increase provider usage accordingly.
 
+Forget sweep and rule-based lint persist their last successful completion. On
+restart, a job that is not due waits only its remaining interval; a never-run
+or overdue job runs once after a bounded startup delay. Failed runs are not
+recorded as successful and retry after that bounded delay. Embedding backfill
+remains opt-in and keeps its interval-only behavior (no startup catch-up).
+
 ---
 
-## Bootstrap mid-project {#bootstrap-mid-project}
+## Bootstrap mid-project
 
 When you adopt ai-memory in a project that's already been around for
 a while, the wiki starts empty. `ai-memory bootstrap` ingests the
@@ -1361,7 +1412,7 @@ write to `~/.local/share/ai-memory/hooks/`.
   (`bin/deploy`, cloudflared TLS, env-file management)
 - [`docs/usage.md`](usage.md) - handoffs, proactive querying, web UI, slim
   routing snippet + managed Agent Skills, migration from other memory tools, and raw-wiki inspection
-- [`docs/mcp-install.md`](mcp-install.md) - per-client MCP config
-  reference for Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, OpenClaw, OMP, VS Code Copilot
+- [`docs/mcp-install.md`](mcp-install.md) - per-client MCP config reference for
+  every client in the [README Support Matrix](../README.md#support-matrix)
 - [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) - what's actually
   running inside ai-memory

@@ -31,6 +31,10 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::capture_policy::{
+    CaptureConfig, CaptureDisposition, CapturePolicy, CaptureProtocol, CaptureSource, PolicyState,
+    ToolFamily, metadata_only_body, tool_observation_outcome, valid_call_id,
+};
 use crate::log;
 use crate::payload::{
     HookEnvelope, HookEvent, HookQuery, ProjectStrategy, body_is_subagent, parse_agent,
@@ -436,6 +440,9 @@ async fn handle_hook(
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let env = HookEnvelope::from_query_and_body(query, body);
+    let Some(env) = inspect_capture_envelope(env) else {
+        return (StatusCode::ACCEPTED, "capture policy dropped");
+    };
     // Accept-but-drop subagent captures (incl. the unmarked tail of tracked
     // subagent sessions) when the operator opts in. Returning 202 (not an error)
     // means the client treats the event as delivered and never retries/spools
@@ -592,6 +599,13 @@ async fn handle_hook_batch(
     for (idx, item) in items.into_iter().enumerate() {
         let query = parse_hook_query(&item.url);
         let env = HookEnvelope::from_query_and_body(query, item.body);
+        let Some(env) = inspect_capture_envelope(env) else {
+            // A protocol-directed drop is committed from the spool's point of
+            // view, but intentionally spends neither ingress capacity nor a
+            // source-rate token.
+            accepted_indices.push(idx);
+            continue;
+        };
         let actor_key = ActorKey {
             user: actor_user.clone(),
             session_id: env.session_id.clone(),
@@ -638,6 +652,240 @@ async fn handle_hook_batch(
         StatusCode::OK,
         Json(HookBatchAck::indexed_full_scan(accepted_indices)),
     )
+}
+
+/// Apply the client capture protocol before any admission or store work.
+/// `None` is an acknowledged Drop; `Some` is either the legacy envelope or a
+/// strict metadata-only replacement. This deliberately never logs protocol or
+/// raw tool data: those fields can contain paths and captured content.
+fn inspect_capture_envelope(env: HookEnvelope) -> Option<HookEnvelope> {
+    let Some(raw_protocol) = env.raw.get("_ai_memory_capture") else {
+        return Some(env);
+    };
+    let cwd = env.cwd.as_deref().unwrap_or("/");
+    let direct = |state| capture_inspector(state, cwd).inspect(env.agent, &env.raw, cwd);
+
+    let Some(protocol) = CaptureProtocol::parse(raw_protocol) else {
+        // A new/malformed marker must not make a recognized file operation
+        // less private. Mark the replacement invalid: an inactive/keep
+        // protocol would falsely describe the server's privacy fallback.
+        // Non-file legacy payloads retain their old behavior.
+        let decision = direct(PolicyState::Invalid);
+        if decision.protocol().tool_family() == ToolFamily::File {
+            return Some(metadata_envelope(env, &decision, None));
+        }
+        return Some(env);
+    };
+
+    // Parsed Drops are terminal client-side policy decisions. They must stay
+    // admission-free even when their other protocol fields are nonsensical.
+    if protocol.disposition() == CaptureDisposition::Drop {
+        return None;
+    }
+
+    if protocol.disposition() == CaptureDisposition::MetadataOnly {
+        return metadata_only_protocol_envelope(env, &protocol);
+    }
+
+    let decision = direct(protocol.policy_state());
+    let inspected = decision.protocol();
+    if !protocol_matches_inspection(&protocol, inspected) {
+        // A client protocol that contradicts direct inspection cannot be used
+        // to retain a recognized file tool's raw arguments or response. The
+        // invalid decision also gives the replacement a canonical, truthful
+        // invalid/metadata-only protocol rather than echoing the bad claim.
+        if protocol.tool_family() == ToolFamily::File || inspected.tool_family() == ToolFamily::File
+        {
+            let fallback = direct(PolicyState::Invalid);
+            return Some(metadata_envelope(env, &fallback, None));
+        }
+        return match inspected.disposition() {
+            CaptureDisposition::Drop => None,
+            CaptureDisposition::MetadataOnly => Some(metadata_envelope(env, &decision, None)),
+            CaptureDisposition::Keep => Some(env),
+        };
+    }
+
+    Some(env)
+}
+
+/// Validate and rebuild a client-stripped metadata body without attempting to
+/// recover its intentionally omitted tool arguments. Invalid stripped shapes
+/// are dropped rather than risking retention of an unallowlisted field.
+fn metadata_only_protocol_envelope(
+    mut env: HookEnvelope,
+    protocol: &CaptureProtocol,
+) -> Option<HookEnvelope> {
+    if !metadata_protocol_is_legal(protocol) {
+        return None;
+    }
+    let object = env.raw.as_object()?;
+    // Unknown fields are deliberately ignored below: the reconstructed body
+    // contains only this allowlist, so a stale or malicious extra cannot leak.
+    let valid_scalar = |key: &str, max: usize| {
+        object.get(key).is_none_or(|value| {
+            value
+                .as_str()
+                .is_some_and(|value| !value.is_empty() && value.len() <= max)
+        })
+    };
+    if !valid_scalar("session_id", 512)
+        || !valid_scalar("cwd", 4_096)
+        || !object
+            .get("tool_call_id")
+            .is_none_or(valid_metadata_call_id)
+        || object.get("tool_family") != Some(&serde_json::json!(protocol.tool_family()))
+        || object.get("tool_name")
+            != Some(&serde_json::json!(canonical_tool_name(
+                protocol.tool_family()
+            )))
+    {
+        return None;
+    }
+
+    let mut raw = serde_json::Map::new();
+    for key in ["session_id", "cwd", "tool_call_id"] {
+        if let Some(value) = object.get(key) {
+            raw.insert(key.into(), value.clone());
+        }
+    }
+    raw.insert(
+        "tool_family".into(),
+        serde_json::json!(protocol.tool_family()),
+    );
+    raw.insert(
+        "tool_name".into(),
+        serde_json::json!(canonical_tool_name(protocol.tool_family())),
+    );
+    raw.insert("_ai_memory_capture".into(), serde_json::json!(protocol));
+    env.title_hint = Some(canonical_tool_name(protocol.tool_family()).into());
+    env.body_excerpt = metadata_summary_with_outcome(
+        env.event,
+        protocol.tool_family(),
+        object.get("tool_call_id"),
+        "unknown",
+    );
+    env.raw = serde_json::Value::Object(raw);
+    Some(env)
+}
+
+const fn metadata_protocol_is_legal(protocol: &CaptureProtocol) -> bool {
+    matches!(
+        (protocol.policy_state(), protocol.tool_family()),
+        (PolicyState::Active | PolicyState::Invalid, ToolFamily::File)
+    )
+}
+
+fn valid_metadata_call_id(value: &serde_json::Value) -> bool {
+    value.as_str().is_some_and(valid_call_id)
+}
+
+/// Whether a claimed protocol can be produced by the claimed policy state for
+/// the directly inspected tool. Active, successfully-extracted file calls may
+/// be either kept or dropped because the server intentionally does not receive
+/// the client's private ignore patterns; every other disposition is fixed by
+/// the shared decision table.
+fn protocol_matches_inspection(protocol: &CaptureProtocol, inspected: &CaptureProtocol) -> bool {
+    if protocol.policy_state() != inspected.policy_state()
+        || protocol.tool_family() != inspected.tool_family()
+        || protocol.extraction_state() != inspected.extraction_state()
+        || protocol.path_count() != inspected.path_count()
+    {
+        return false;
+    }
+
+    match (
+        protocol.policy_state(),
+        protocol.tool_family(),
+        inspected.disposition(),
+    ) {
+        (PolicyState::Active, ToolFamily::File, CaptureDisposition::Keep) => matches!(
+            protocol.disposition(),
+            CaptureDisposition::Keep | CaptureDisposition::Drop
+        ),
+        _ => protocol.disposition() == inspected.disposition(),
+    }
+}
+
+/// Build a policy solely to use the shared, fixture-backed direct schema
+/// inspection API. The active sentinel cannot match a normalized real path;
+/// active extracted file calls can therefore be either Keep or Drop during
+/// protocol validation.
+fn capture_inspector(state: PolicyState, cwd: &str) -> CapturePolicy {
+    const ACTIVE_SENTINEL: &str = "/__ai_memory_capture_server_inspection_never_match__";
+    match state {
+        PolicyState::Active => CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec![ACTIVE_SENTINEL.into()],
+            }),
+            cwd,
+            None,
+        ),
+        PolicyState::Invalid => CapturePolicy::resolve(CaptureSource::Invalid, cwd, None),
+        PolicyState::Inactive => CapturePolicy::resolve(CaptureSource::Absent, cwd, None),
+    }
+}
+
+fn metadata_envelope(
+    mut env: HookEnvelope,
+    decision: &crate::capture_policy::CaptureDecision,
+    protocol: Option<&CaptureProtocol>,
+) -> HookEnvelope {
+    let protocol = protocol.unwrap_or(decision.protocol());
+    let outcome = tool_observation_outcome(env.agent, &env.raw);
+    let mut raw = metadata_only_body(env.session_id.as_deref(), env.cwd.as_deref(), decision);
+    if let Some(object) = raw.as_object_mut() {
+        object.insert(
+            "tool_family".into(),
+            serde_json::json!(protocol.tool_family()),
+        );
+        object.insert(
+            "tool_name".into(),
+            serde_json::json!(canonical_tool_name(protocol.tool_family())),
+        );
+        object.insert("_ai_memory_capture".into(), serde_json::json!(protocol));
+    }
+    // These were extracted from the pre-replacement raw body. Clearing them is
+    // essential: normal extraction must never retain a removed payload.
+    env.title_hint = Some(canonical_tool_name(protocol.tool_family()).into());
+    env.body_excerpt = metadata_summary_with_outcome(
+        env.event,
+        protocol.tool_family(),
+        raw.get("tool_call_id"),
+        outcome.as_str(),
+    );
+    env.raw = raw;
+    env
+}
+
+fn metadata_summary_with_outcome(
+    event: HookEvent,
+    family: ToolFamily,
+    call_id: Option<&serde_json::Value>,
+    outcome: &str,
+) -> Option<String> {
+    if !matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse) {
+        return None;
+    }
+    let mut body = format!("tool_family: {}", canonical_tool_name(family));
+    if let Some(id) = call_id.and_then(serde_json::Value::as_str) {
+        body.push_str("\ntool_call_id: ");
+        body.push_str(id);
+    }
+    if event == HookEvent::PostToolUse {
+        body.push_str("\noutcome: ");
+        body.push_str(outcome);
+    }
+    Some(body)
+}
+
+const fn canonical_tool_name(family: ToolFamily) -> &'static str {
+    match family {
+        ToolFamily::File => "file",
+        ToolFamily::SearchList => "search-list",
+        ToolFamily::NonFile => "non-file",
+        ToolFamily::Unknown => "unknown",
+    }
 }
 
 /// Decide whether to accept-but-drop this event under `drop_subagent_captures`,
@@ -1834,15 +2082,47 @@ const fn importance_for(event: HookEvent) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
+    use ai_memory_consolidate::{AutoImproveReviewConfig, run_auto_improve_review};
     use ai_memory_core::Sanitizer;
+    use ai_memory_llm::{ChatRequest, ChatResponse, LlmProvider, LlmResult};
     use ai_memory_store::Store;
     use ai_memory_wiki::Wiki;
     use tempfile::TempDir;
 
     use super::*;
     use crate::payload::HookQuery;
+
+    struct RecordingLlm(Mutex<Option<ChatRequest>>);
+
+    #[async_trait::async_trait]
+    impl LlmProvider for RecordingLlm {
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+        fn model(&self) -> &str {
+            "recording-test"
+        }
+        async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse> {
+            *self.0.lock().unwrap() = Some(request);
+            Ok(ChatResponse {
+                text: "unused".into(),
+                usage: None,
+                model: self.model().into(),
+            })
+        }
+        async fn complete_structured_raw(
+            &self,
+            request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> LlmResult<serde_json::Value> {
+            *self.0.lock().unwrap() = Some(request);
+            Ok(
+                serde_json::json!({ "summary": "safe review", "proposals": [], "rejected_candidates": [] }),
+            )
+        }
+    }
 
     /// Build a minimal `HookState` backed by a real on-disk store.
     async fn make_state(tmp: &TempDir) -> HookState {
@@ -5618,6 +5898,582 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "PostCompaction checkpoint must not create a handoff"
+        );
+    }
+
+    fn capture_protocol(
+        disposition: &str,
+        policy_state: &str,
+        family: &str,
+        path_count: u16,
+        extraction: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "version": 1,
+            "disposition": disposition,
+            "policy_state": policy_state,
+            "tool_family": family,
+            "path_count": path_count,
+            "extraction_state": extraction,
+        })
+    }
+
+    #[test]
+    fn capture_protocol_legacy_payload_is_unchanged() {
+        let raw = serde_json::json!({ "session_id": "legacy", "prompt": "keep me" });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt-submit".into(),
+                ..Default::default()
+            },
+            raw.clone(),
+        );
+        assert_eq!(inspect_capture_envelope(env).unwrap().raw, raw);
+    }
+
+    #[test]
+    fn capture_protocol_keep_file_mismatch_becomes_metadata_only() {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "mismatch",
+                "tool_name": "Write",
+                "tool_input": { "file_path": "/repo/real.txt" },
+                "tool_response": "SENTINEL_SECRET",
+                "_ai_memory_capture": capture_protocol("keep", "active", "file", 2, "extracted"),
+            }),
+        );
+        let env = inspect_capture_envelope(env).unwrap();
+        assert_eq!(env.title_hint.as_deref(), Some("file"));
+        assert_eq!(
+            env.body_excerpt.as_deref(),
+            Some("tool_family: file\noutcome: unknown")
+        );
+        assert!(!env.raw.to_string().contains("SENTINEL_SECRET"));
+        assert_eq!(env.raw["tool_name"], "file");
+    }
+
+    #[test]
+    fn capture_protocol_valid_keep_is_unchanged() {
+        let raw = serde_json::json!({
+            "session_id": "valid-keep", "tool_name": "Write",
+            "tool_input": { "file_path": "/repo/real.txt" },
+            "_ai_memory_capture": capture_protocol("keep", "active", "file", 1, "extracted"),
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            raw.clone(),
+        );
+        assert_eq!(inspect_capture_envelope(env).unwrap().raw, raw);
+    }
+
+    #[test]
+    fn capture_protocol_invalid_file_keep_becomes_canonical_metadata_only() {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "invalid-keep",
+                "tool_name": "Write",
+                "tool_input": { "file_path": "/repo/real.txt" },
+                "tool_response": "SENTINEL_SECRET",
+                "_ai_memory_capture": capture_protocol("keep", "invalid", "file", 1, "extracted"),
+            }),
+        );
+        let env = inspect_capture_envelope(env).unwrap();
+        assert_eq!(env.raw["_ai_memory_capture"]["policy_state"], "invalid");
+        assert_eq!(
+            env.raw["_ai_memory_capture"]["disposition"],
+            "metadata-only"
+        );
+        assert_eq!(env.raw["_ai_memory_capture"]["tool_family"], "file");
+        assert!(!env.raw.to_string().contains("SENTINEL_SECRET"));
+    }
+
+    #[test]
+    fn capture_protocol_impossible_active_search_keep_is_dropped() {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "active-search-keep",
+                "tool_name": "Glob",
+                "tool_input": { "pattern": "**/*" },
+                "_ai_memory_capture": capture_protocol("keep", "active", "search-list", 0, "not-applicable"),
+            }),
+        );
+        assert!(inspect_capture_envelope(env).is_none());
+    }
+
+    #[test]
+    fn capture_protocol_metadata_with_original_args_is_dropped() {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "active-file-metadata",
+                "tool_name": "Write",
+                "tool_input": { "file_path": "/repo/real.txt" },
+                "tool_response": "SENTINEL_SECRET",
+                "_ai_memory_capture": capture_protocol("metadata-only", "active", "file", 1, "extracted"),
+            }),
+        );
+        assert!(inspect_capture_envelope(env).is_none());
+    }
+
+    #[test]
+    fn capture_protocol_native_metadata_shape_is_rebuilt_without_body() {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "native-metadata", "cwd": "/repo",
+                "tool_family": "file", "tool_name": "file", "tool_call_id": "safe-ID.1",
+                "_ai_memory_capture": capture_protocol("metadata-only", "invalid", "file", 1, "extracted"),
+            }),
+        );
+        let env = inspect_capture_envelope(env).unwrap();
+        assert_eq!(env.raw["session_id"], "native-metadata");
+        assert_eq!(env.raw["cwd"], "/repo");
+        assert_eq!(env.raw["tool_call_id"], "safe-ID.1");
+        assert_eq!(
+            env.body_excerpt.as_deref(),
+            Some("tool_family: file\ntool_call_id: safe-ID.1\noutcome: unknown")
+        );
+    }
+
+    #[test]
+    fn capture_protocol_generated_metadata_shape_is_rebuilt() {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "generated-metadata", "cwd": "/generated",
+                "tool_family": "file", "tool_name": "file",
+                "_ai_memory_capture": capture_protocol("metadata-only", "active", "file", 0, "missing-or-malformed"),
+            }),
+        );
+        let env = inspect_capture_envelope(env).unwrap();
+        assert_eq!(env.raw["session_id"], "generated-metadata");
+        assert_eq!(env.raw["cwd"], "/generated");
+        assert_eq!(
+            env.body_excerpt.as_deref(),
+            Some("tool_family: file\noutcome: unknown")
+        );
+    }
+
+    #[test]
+    fn capture_protocol_metadata_extra_is_stripped() {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "metadata-extra", "tool_family": "file", "tool_name": "file",
+                "extra": "SENTINEL_SECRET",
+                "_ai_memory_capture": capture_protocol("metadata-only", "invalid", "file", 0, "missing-or-malformed"),
+            }),
+        );
+        let env = inspect_capture_envelope(env).unwrap();
+        assert!(!env.raw.to_string().contains("SENTINEL_SECRET"));
+        assert!(env.raw.get("extra").is_none());
+    }
+
+    #[test]
+    fn capture_protocol_metadata_only_ignores_pi_and_antigravity_outcome_extras() {
+        for (agent, extra) in [
+            (
+                "pi",
+                serde_json::json!({"isError": true, "output": "PI_SENTINEL"}),
+            ),
+            (
+                "antigravity-cli",
+                serde_json::json!({"error": "AGY_SENTINEL", "output": "OUTPUT_SENTINEL"}),
+            ),
+        ] {
+            let mut body = serde_json::json!({
+                "tool_family": "file", "tool_name": "file",
+                "_ai_memory_capture": capture_protocol("metadata-only", "invalid", "file", 0, "missing-or-malformed"),
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "post-tool-use".into(),
+                    agent: Some(agent.into()),
+                    ..Default::default()
+                },
+                body,
+            );
+            let env = inspect_capture_envelope(env).unwrap();
+            assert_eq!(
+                env.body_excerpt.as_deref(),
+                Some("tool_family: file\noutcome: unknown")
+            );
+            for sentinel in ["PI_SENTINEL", "AGY_SENTINEL", "OUTPUT_SENTINEL"] {
+                assert!(!env.raw.to_string().contains(sentinel));
+                assert!(!env.body_excerpt.as_deref().unwrap().contains(sentinel));
+            }
+            assert!(env.raw.get("isError").is_none());
+            assert!(env.raw.get("error").is_none());
+            assert!(env.raw.get("output").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn privacy_protocol_evidence_never_persists_protected_tool_sentinel() {
+        const SENTINEL: &str = "PHASE3_PROTECTED_PATH_AND_CONTENT_7f6c";
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let session_id = "privacy-evidence";
+
+        for (event, body) in [
+            (
+                "session-start",
+                serde_json::json!({ "session_id": session_id, "cwd": "/repo" }),
+            ),
+            (
+                "user-prompt-submit",
+                serde_json::json!({ "session_id": session_id, "cwd": "/repo", "prompt": "safe observation" }),
+            ),
+        ] {
+            process(
+                &state,
+                HookEnvelope::from_query_and_body(
+                    HookQuery {
+                        event: event.into(),
+                        agent: Some("claude-code".into()),
+                        ..Default::default()
+                    },
+                    body,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        // A parsed Drop with malicious original input is acknowledged before
+        // admission; it never reaches process/store capacity.
+        let dropped = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": session_id, "tool_name": "Write",
+                "tool_input": { "file_path": SENTINEL }, "tool_response": SENTINEL,
+                "_ai_memory_capture": capture_protocol("drop", "inactive", "unknown", 99, "extracted"),
+            }),
+        );
+        assert!(inspect_capture_envelope(dropped).is_none());
+
+        let metadata = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": session_id, "cwd": "/repo", "tool_family": "file", "tool_name": "file",
+                "_ai_memory_capture": capture_protocol("metadata-only", "invalid", "file", 1, "extracted"),
+            }),
+        );
+        let metadata = inspect_capture_envelope(metadata).expect("valid metadata is retained");
+        assert!(
+            metadata.body_excerpt.as_deref() == Some("tool_family: file\noutcome: unknown"),
+            "metadata-only protocol renders only its safe summary"
+        );
+        process(&state, metadata, None).await.unwrap();
+
+        process(
+            &state,
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "session-end".into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({ "session_id": session_id, "cwd": "/repo" }),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let sid = resolve_session_id(&HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "session-start".into(),
+                ..Default::default()
+            },
+            serde_json::json!({ "session_id": session_id }),
+        ))
+        .unwrap();
+        let (workspace_id, project_id) = state
+            .reader
+            .session_project_ids(sid)
+            .await
+            .unwrap()
+            .unwrap();
+        let observations = state.reader.observations_for_session(sid).await.unwrap();
+        assert!(observations.iter().all(|observation| {
+            observation.body.is_empty() || !observation.body.contains(SENTINEL)
+        }));
+        assert!(observations.iter().any(|observation| {
+            observation.title == "file" && observation.body == "tool_family: file\noutcome: unknown"
+        }));
+        assert!(
+            state
+                .reader
+                .search_observations_for_project(workspace_id, project_id, SENTINEL.into(), 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let page = state
+            .reader
+            .page_body_by_ids(workspace_id, project_id, &format!("sessions/{sid}.md"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!page.body.contains(SENTINEL));
+        let handoff = state
+            .reader
+            .latest_open_handoff(workspace_id, project_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!handoff.summary.contains(SENTINEL));
+        assert!(
+            !state
+                .wiki
+                .recent_checkpoints(20)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.summary.contains(SENTINEL))
+        );
+
+        let llm: &'static RecordingLlm = Box::leak(Box::new(RecordingLlm(Mutex::new(None))));
+        let llm_provider: &'static dyn LlmProvider = llm;
+        let report = run_auto_improve_review(
+            &state.reader,
+            llm_provider,
+            workspace_id,
+            project_id,
+            sid,
+            AutoImproveReviewConfig {
+                min_observations: 3,
+                min_session_duration_secs: 0,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let request = llm
+            .0
+            .lock()
+            .unwrap()
+            .take()
+            .expect("review called recording LLM");
+        let request_text = format!("{:?}{:?}", request.system, request.messages);
+        assert!(!request_text.contains(SENTINEL));
+        let report_text = serde_json::to_string(&report).unwrap();
+        assert!(!report_text.contains(SENTINEL));
+        // Review is read-only: no pending sidecar or approved page is created.
+        assert!(
+            state
+                .reader
+                .page_body_by_ids(workspace_id, project_id, "_pending/auto-improve")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unknown_capture_protocol_version_protects_recognized_file_tool() {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "unknown-version",
+                "tool_name": "Write",
+                "tool_input": { "file_path": "/repo/real.txt" },
+                "tool_response": "SENTINEL_SECRET",
+                "_ai_memory_capture": { "version": 99 },
+            }),
+        );
+        let env = inspect_capture_envelope(env).unwrap();
+        assert_eq!(env.title_hint.as_deref(), Some("file"));
+        assert_eq!(
+            env.body_excerpt.as_deref(),
+            Some("tool_family: file\noutcome: unknown")
+        );
+        assert!(!env.raw.to_string().contains("SENTINEL_SECRET"));
+        assert_eq!(env.raw["_ai_memory_capture"]["policy_state"], "invalid");
+        assert_eq!(
+            env.raw["_ai_memory_capture"]["disposition"],
+            "metadata-only"
+        );
+        assert_eq!(env.raw["_ai_memory_capture"]["tool_family"], "file");
+    }
+
+    #[test]
+    fn malformed_capture_protocol_protects_recognized_file_tool() {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "malformed-protocol",
+                "tool_name": "Write",
+                "tool_input": { "file_path": "/repo/real.txt" },
+                "tool_response": "SENTINEL_SECRET",
+                "_ai_memory_capture": { "version": 1, "disposition": "keep" },
+            }),
+        );
+        let env = inspect_capture_envelope(env).unwrap();
+        assert_eq!(env.raw["_ai_memory_capture"]["policy_state"], "invalid");
+        assert_eq!(
+            env.raw["_ai_memory_capture"]["disposition"],
+            "metadata-only"
+        );
+        assert_eq!(env.raw["_ai_memory_capture"]["tool_family"], "file");
+        assert!(!env.raw.to_string().contains("SENTINEL_SECRET"));
+    }
+
+    #[tokio::test]
+    async fn capture_protocol_batch_mixes_keep_drop_and_metadata_without_spending_drop_capacity() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.ingest_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let state = Arc::new(state);
+        let response = handle_hook_batch(
+            State(state.clone()),
+            None,
+            Json(vec![
+                HookBatchItem {
+                    url: "http://h/hook?event=session-start&agent=claude-code".into(),
+                    body: serde_json::json!({ "session_id": "capture-mixed" }),
+                },
+                HookBatchItem {
+                    url: "http://h/hook?event=post-tool-use&agent=claude-code".into(),
+                    body: serde_json::json!({
+                        "session_id": "capture-mixed", "tool_name": "Read",
+                        "tool_input": { "file_path": "/repo/private.txt" },
+                        "_ai_memory_capture": capture_protocol("drop", "active", "file", 1, "extracted"),
+                    }),
+                },
+                HookBatchItem {
+                    url: "http://h/hook?event=post-tool-use&agent=claude-code".into(),
+                    body: serde_json::json!({
+                        "session_id": "capture-mixed", "tool_family": "file", "tool_name": "file",
+                        "_ai_memory_capture": capture_protocol("metadata-only", "invalid", "file", 1, "extracted"),
+                    }),
+                },
+            ]),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(ack["accepted"], 3);
+        let sid = resolve_session_id(&HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "session-start".into(),
+                ..Default::default()
+            },
+            serde_json::json!({ "session_id": "capture-mixed" }),
+        ))
+        .unwrap();
+        let observations = state.reader.observations_for_session(sid).await.unwrap();
+        assert_eq!(observations.len(), 2, "Drop must not be stored");
+        let metadata = observations.last().unwrap();
+        assert_eq!(metadata.title, "file");
+        assert_eq!(metadata.body, "tool_family: file\noutcome: unknown");
+        assert!(
+            observations
+                .iter()
+                .all(|o| !o.body.contains("SENTINEL_SECRET"))
+        );
+    }
+
+    #[tokio::test]
+    async fn parsed_impossible_drop_is_acked_without_ingest_capacity() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.ingest_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        let state = Arc::new(state);
+        let response = handle_hook_batch(
+            State(state.clone()),
+            None,
+            Json(vec![HookBatchItem {
+                url: "http://h/hook?event=post-tool-use&agent=claude-code".into(),
+                body: serde_json::json!({
+                    "session_id": "drop-without-capacity", "tool_name": "Write",
+                    "tool_input": { "file_path": "/repo/private.txt" },
+                    "_ai_memory_capture": capture_protocol("drop", "inactive", "unknown", 99, "extracted"),
+                }),
+            }]),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(ack["accepted"], 1);
+        let sid = resolve_session_id(&HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                ..Default::default()
+            },
+            serde_json::json!({ "session_id": "drop-without-capacity" }),
+        ))
+        .unwrap();
+        assert!(
+            state
+                .reader
+                .observations_for_session(sid)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 }

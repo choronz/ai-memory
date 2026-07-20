@@ -10,7 +10,7 @@
 > re-explaining the architecture, the failed approaches, or the open
 > questions.
 
-[![status: v0.8 multi-user](https://img.shields.io/badge/status-v0.8--multiuser-green)](docs/ARCHITECTURE.md)
+[![Release](https://img.shields.io/github/v/release/akitaonrails/ai-memory)](https://github.com/akitaonrails/ai-memory/releases/latest)
 [![Rust](https://img.shields.io/badge/rust-1.95+-blue)](rust-toolchain.toml)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
@@ -21,20 +21,21 @@
 | Linux | Supported | Primary Docker/server target and CI platform. Published Docker images support `linux/amd64` and `linux/arm64`. Native Arch/AUR packages include system and user systemd units. |
 | macOS | Supported | Workspace tests run in CI; tagged releases publish native `ai-memory-macos-aarch64.tar.gz` and `ai-memory-macos-x86_64.tar.gz` binaries. The native binary is the recommended path on Apple Silicon. See [`docs/macos.md`](docs/macos.md). |
 | Windows via WSL2 | Supported | Use the Linux install path inside WSL2 when the agent runs there. |
-| Native Windows | Experimental | Tagged releases publish `ai-memory-windows-x86_64.zip` with `ai-memory.exe`; Docker Desktop wrapper and source builds are also available. Claude Code uses Claude exec form with a real native `ai-memory.exe` by default; other script-hook agents use the current PowerShell defaults pending harness feedback. See [`docs/windows.md`](docs/windows.md). |
-| Claude Code | Supported | MCP config + lifecycle hooks. |
-| Codex | Supported | MCP config + lifecycle hooks; no automatic true session-end hook, so run `ai-memory finalize-session` when you need a final summary/handoff. |
+| Native Windows | Experimental | Tagged releases publish `ai-memory-windows-x86_64.zip` with `ai-memory.exe`; Docker Desktop wrapper and source builds are also available. Local supported profiles default to host-native hook commands; Claude Code may use its Windows exec form, while other agents use native single command strings matching their hook schema. PowerShell/Git Bash scripts are compatibility fallbacks. See [`docs/windows.md`](docs/windows.md). |
+| Claude Code | Supported | MCP config + lifecycle hooks; native commands enforce capture exclusions. |
+| Codex | Supported | MCP config + lifecycle hooks; native commands enforce capture exclusions. No automatic true session-end hook, so run `ai-memory finalize-session` when you need a final summary/handoff. |
 | Devin CLI | Supported | MCP config + lifecycle hooks. Hooks use Devin's `PostCompaction` event, inject handoffs via `hookSpecificOutput.additionalContext`, and omit subagent events because Devin does not expose them. |
-| OpenCode | Supported | Remote MCP config + generated TypeScript plugin. |
+| OpenCode | Supported | Remote MCP config + generated TypeScript plugin; generated plugin enforces capture exclusions. |
 | Cursor | Supported | MCP config + lifecycle hooks. |
 | Gemini CLI | Supported | MCP config + lifecycle hooks. |
-| Oh My Pi / OMP | Supported | Use `--client omp` / `--agent omp` (or `oh-my-pi`) for native `.omp` MCP config + TypeScript extension. |
-| Pi | Supported | Generated `~/.pi/agent/extensions/ai-memory.ts` extension provides lifecycle capture and an HTTP MCP bridge; use `install-hooks --agent pi --apply`. |
+| Oh My Pi / OMP | Supported | Use `--client omp` / `--agent omp` (or `oh-my-pi`) for native `.omp` MCP config + TypeScript extension; generated extension enforces capture exclusions. |
+| Pi | Supported | Generated `~/.pi/agent/extensions/ai-memory.ts` extension provides lifecycle capture and an HTTP MCP bridge; generated extension enforces capture exclusions. |
 | Claude Desktop | MCP-only | Uses `mcp-remote`; no lifecycle hooks. |
-| OpenClaw | Supported | MCP config + native plugin lifecycle hooks. |
+| OpenClaw | Supported | MCP config + native plugin lifecycle hooks; generated plugin enforces capture exclusions. |
 | Antigravity CLI | Supported | MCP config (`serverUrl`) + lifecycle hooks (`agy` alias). |
 | Grok Build CLI | Supported | MCP config (`install-mcp --client grok` → `$GROK_HOME/config.toml`, default `~/.grok/config.toml`) + lifecycle hooks (`install-hooks --agent grok` → `$GROK_HOME/hooks/ai-memory.json`, default `~/.grok/hooks/ai-memory.json`, Grok-specific hook bundle). Capture works; no handoff injection — Grok ignores `SessionStart` stdout, so recover handoffs via MCP `memory_handoff_accept`. Skills root: `.grok/skills` / `$GROK_HOME/skills` (default `~/.grok/skills`). |
 | Zero | Supported | `install-mcp --client zero` (native HTTP + bearer in `~/.config/zero/config.json`) + lifecycle hooks via `install-hooks --agent zero --apply` (exec-form native commands in `~/.config/zero/hooks.json`, JSON payload on stdin, no shell). Capture works incl. specialist (subagent) events; no handoff injection — Zero discards `sessionStart` stdout, so recover handoffs via MCP `memory_handoff_accept`. |
+| Kimi Code | Supported | MCP config (`url` entry in `~/.kimi-code/mcp.json`) + lifecycle hooks (`[[hooks]]` in `~/.kimi-code/config.toml`, 10 events including subagent start/stop and `PostToolUseFailure` for tool-failure capture); both paths honor `$KIMI_CODE_HOME`. Handoffs inject via `SessionStart` stdout. |
 | VS Code Copilot | MCP-only | `.vscode/mcp.json` for Copilot agent mode; no lifecycle hooks (Copilot does not expose them yet). |
 | Hermes Agent | Community | A community-maintained [`ai-memory-hermes-plugin`](https://github.com/MrLuciano/ai-memory-hermes-plugin) is available. It is not part of ai-memory's first-party install surface; review its compatibility matrix, install/uninstall scripts, and secret handling before using it. |
 | LLM/auth providers | Supported | Anthropic, OpenAI, OpenAI OAuth/Codex, GitHub Copilot, Gemini, OpenCode Zen/Go, OpenAI-compatible endpoints, and generic OIDC device auth for native hooks. |
@@ -59,6 +60,9 @@ priors are at the [bottom](#influences-and-prior-art).
 
 - **Zero-friction capture.** Lifecycle hooks fire-and-forget every
   prompt + tool call + session boundary. You never type `write_note`.
+- **Per-repository capture exclusions.** A nearest-marker `[capture]`
+  `ignore_paths` policy drops matching recognized file-tool events before they
+  reach the local spool or server. See [the capture policy reference](docs/marker-file.md#capture-exclusions).
 - **Cross-agent handoffs.** Quit Claude Code mid-task, start Codex
   in the same directory hours later - the next agent sees a
   "where you left off" block before its first prompt.
@@ -92,9 +96,9 @@ priors are at the [bottom](#influences-and-prior-art).
   mode. Mounted on the same axum server as MCP.
 - **Multi-agent + multi-machine ready.** Supported clients: Claude
   Code, Codex, Devin CLI, OpenCode, Cursor, Claude Desktop (via `mcp-remote`),
-  Gemini CLI, Antigravity CLI, Grok Build CLI, OpenClaw, Oh My Pi / OMP
-  (`omp` / `oh-my-pi`), Pi via generated bridge extension, and VS Code GitHub
-  Copilot agent mode
+  Gemini CLI, Antigravity CLI, Grok Build CLI, Kimi Code, OpenClaw, Oh My Pi
+  / OMP (`omp` / `oh-my-pi`), Pi via generated bridge extension, and VS Code
+  GitHub Copilot agent mode
   (MCP-only, workspace `.vscode/mcp.json`).
   Server runs local (loopback) OR on a homelab box (LAN/VPN/cloud)
   with bearer-token auth. Shared servers can opt into
@@ -227,8 +231,8 @@ packaged unit. Full user-service, system-service, auth, and provider setup is in
 
 ### Docker
 
-You need: Docker + an agent CLI (Claude Code, Codex, Devin CLI, OpenCode, OMP,
-Cursor, Antigravity CLI, Grok Build CLI, or anything else that speaks MCP).
+You need: Docker + an agent CLI from the [Support Matrix](#support-matrix), or
+anything else that speaks MCP.
 
 The published Docker image includes `linux/amd64` and `linux/arm64` variants,
 so Apple Silicon Macs and ARM64 Linux hosts can pull `akitaonrails/ai-memory`
@@ -271,7 +275,7 @@ docker run -d --name ai-memory \
 # 3. Wire your agent CLI in two commands. The wrapper takes care of
 #    mounts + auto-detecting ~/.claude/settings.json. Re-run with
 #    `--agent codex`, `--agent devin`, `--agent opencode`, `--agent gemini-cli`,
-#    `--agent grok`, `--agent omp`, `--agent oh-my-pi`, `--client cursor`,
+#    `--agent grok`, `--agent kimi-code`, `--agent omp`, `--agent oh-my-pi`, `--client cursor`,
 #    `--client gemini-cli`, `--client grok`, etc.
 #    for additional agents; full list in docs/install.md.
 ai-memory install-mcp   --client claude-code --apply
@@ -320,11 +324,11 @@ one matching entry.
 ### Install Notes
 
 - **Windows:** use the Linux path inside WSL2, or the native Windows wrapper
-  from PowerShell/cmd. Native Claude Code uses Claude exec form with a real
-  `ai-memory.exe` by default, with `AI_MEMORY_HOOK_PLATFORM=windows-bash`
-  available for Git Bash `.sh` hooks and older Claude Code builds; other
-  script-hook agents use PowerShell defaults. Do not
-  mix path worlds. See
+  from PowerShell/cmd. Local supported profiles default to host-native commands:
+  Claude Code may use its supported `ai-memory.exe` exec form, while other
+  agents use native single command strings matching their hook schema.
+  PowerShell/Git Bash script bundles are compatibility fallbacks and do not
+  enforce capture-policy v1. Do not mix path worlds. See
   [`docs/windows.md`](docs/windows.md).
 - **Docker compose:** `docker compose -f docker/docker-compose.yml up -d`
   is supported; agent setup is the same as step 3 above.
@@ -345,10 +349,9 @@ one matching entry.
   projects) when you want new tool guidance. The refresh writes the slim
   markered snippet and managed Agent Skills from the same binary-owned assets.
 
-For Codex, Devin CLI, OpenCode, OMP, Cursor, Claude Desktop, Gemini CLI,
-Antigravity CLI, Grok Build CLI, OpenClaw, VS Code Copilot,
-curl-based hook installs, source builds,
-CLI env vars, and the full subcommand reference, see [`docs/install.md`](docs/install.md).
+For every client in the [Support Matrix](#support-matrix), plus curl-based hook
+installs, source builds, CLI environment variables, and the full subcommand
+reference, see [`docs/install.md`](docs/install.md).
 
 ## Security
 
@@ -432,13 +435,13 @@ it doesn't earn its keep.
 shares a server, ai-memory can attribute each write to a named user.
 The bearer token continues to authenticate at the wire level; users
 created via `ai-memory user add` get their own tokens that resolve to
-their identity in audit logs (and, in subsequent milestones, page
-frontmatter + the web UI). Data stays single-tenant — there is no
-per-page RBAC — but once `[auth].token_pepper` enables multi-user
-mode, every `/admin/*` endpoint requires the root token, including
-status/search/read-page and user-management routes. Existing single-user installs
-are not affected unless you opt in by setting `[auth].token_pepper`
-(auto-generated for new installs by `ai-memory init`). See
+their identity in audit logs, page frontmatter, `/api/v1` responses, and the
+page view UI. Data stays single-tenant — there is no per-page RBAC. A
+`[auth].token_pepper` is required for DB-user authentication, but creating the
+first user row is what immediately switches every `/admin/*` endpoint to
+root-only, including status/search/read-page and user-management routes.
+`ai-memory init` generates a pepper for new installs without changing
+single-user behavior until a user is added. See
 [`docs/users.md`](docs/users.md) for the full walkthrough and the
 four-rung auth ladder.
 

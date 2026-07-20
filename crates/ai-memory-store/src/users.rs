@@ -288,6 +288,14 @@ pub fn list_users(conn: &Connection) -> StoreResult<Vec<User>> {
     Ok(rows)
 }
 
+/// Return whether any user row exists, including users whose tokens have
+/// expired. This is the multi-user admin-mode predicate, so it intentionally
+/// does not filter on token activity or load user records.
+pub fn users_exist(conn: &Connection) -> StoreResult<bool> {
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM users)", [], |row| row.get(0))
+        .map_err(StoreError::from)
+}
+
 // ── helpers ────────────────────────────────────────────────────────
 
 fn row_to_user(row: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
@@ -617,6 +625,21 @@ mod tests {
         assert_eq!(users.len(), 3);
         let usernames: Vec<_> = users.iter().map(|u| u.username.as_str()).collect();
         assert_eq!(usernames, vec!["alice", "bob", "carol"]);
+    }
+
+    #[test]
+    fn users_exist_counts_expired_rows() {
+        let conn = fresh_conn();
+        assert!(!users_exist(&conn).unwrap());
+
+        let p = pepper();
+        let mut user = sample_new_user("alice");
+        user.validate().unwrap();
+        let id = insert_user(&conn, &user, &hash_token("token", &p)).unwrap();
+        assert!(users_exist(&conn).unwrap());
+
+        expire_user_token(&conn, id).unwrap();
+        assert!(users_exist(&conn).unwrap());
     }
 
     #[test]

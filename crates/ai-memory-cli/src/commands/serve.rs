@@ -1,6 +1,7 @@
 //! `ai-memory serve` — MCP server with optional filesystem watcher.
 
 use std::convert::Infallible;
+use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,7 +42,7 @@ use tracing::info;
 
 use crate::auth::{AuthState, require_bearer};
 use crate::cli::{ServeArgs, TransportKind};
-use crate::config::{AutoImproveSettings, Config, MaintenanceSettings};
+use crate::config::{AuthSettings, AutoImproveSettings, Config, MaintenanceSettings};
 
 /// 10 MB cap on inbound HTTP bodies. The /hook ingress accepts the
 /// agent's raw payload which can include a tool output excerpt
@@ -55,11 +56,112 @@ const EMBEDDING_WRITE_BATCH: usize = 100;
 /// `POST /admin/bootstrap` may carry a large JSON array of sources even
 /// after client-side prune; keep hooks/MCP at [`MAX_BODY_BYTES`].
 const BOOTSTRAP_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// Startup and failure retry delay, capped by each job's configured interval.
+const MAINTENANCE_STARTUP_DELAY_CAP: Duration = Duration::from_secs(60);
+
+/// Validate the credentials that keep an existing multi-user installation
+/// closed. Bootstrap installs have no user rows yet and retain their historical
+/// compatibility behavior regardless of placeholder auth values.
+fn validate_existing_users_auth(users_exist: bool, auth: &AuthSettings) -> Result<()> {
+    if !users_exist {
+        return Ok(());
+    }
+
+    let pepper_present = auth
+        .token_pepper
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    let bearer_present = auth
+        .bearer_token
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    match (pepper_present, bearer_present) {
+        (true, true) => Ok(()),
+        (false, false) => anyhow::bail!(
+            "users exist but [auth].token_pepper and [auth].bearer_token are missing or blank; restore both original secrets from configuration backup before serving"
+        ),
+        (false, true) => anyhow::bail!(
+            "users exist but [auth].token_pepper is missing or blank; restore the original pepper from configuration backup before serving"
+        ),
+        (true, false) => anyhow::bail!(
+            "users exist but [auth].bearer_token is missing or blank; configure the original static root bearer token before serving"
+        ),
+    }
+}
 
 struct ConsolidatorSetup {
     server: AiMemoryServer,
     consolidator: Option<Arc<Consolidator>>,
     admin_llm: Option<Arc<dyn LlmProvider>>,
+}
+
+fn maintenance_start_delay(
+    last_success_at: Option<i64>,
+    now_microseconds: i64,
+    interval: Duration,
+) -> Duration {
+    let fallback = interval.min(MAINTENANCE_STARTUP_DELAY_CAP);
+    let Some(last_success_at) = last_success_at else {
+        return fallback;
+    };
+    let interval_microseconds = i64::try_from(interval.as_micros()).unwrap_or(i64::MAX);
+    let due_at = last_success_at.saturating_add(interval_microseconds);
+    if due_at <= now_microseconds {
+        fallback
+    } else {
+        // A future persisted timestamp (clock correction / restore) must not
+        // defer maintenance longer than its configured interval.
+        Duration::from_micros(due_at.saturating_sub(now_microseconds) as u64).min(interval)
+    }
+}
+
+async fn run_persisted_maintenance_job<F, Fut, R, RFut, N>(
+    writer: WriterHandle,
+    job: ai_memory_store::MaintenanceJob,
+    interval: Duration,
+    mut load_last_success: R,
+    now_microseconds: N,
+    mut tick: F,
+) where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<()>> + Send,
+    R: FnMut() -> RFut + Send + 'static,
+    RFut: Future<Output = Result<Option<i64>>> + Send,
+    N: Fn() -> i64 + Send + 'static,
+{
+    let retry_delay = interval.min(MAINTENANCE_STARTUP_DELAY_CAP);
+    let mut cadence_known = false;
+    let mut delay = Duration::ZERO;
+
+    loop {
+        tokio::time::sleep(delay).await;
+        if !cadence_known {
+            match load_last_success().await {
+                Ok(last_success_at) => {
+                    delay = maintenance_start_delay(last_success_at, now_microseconds(), interval);
+                    cadence_known = true;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, job = job.as_str(), "maintenance cadence state read failed; retrying before running work");
+                    delay = retry_delay;
+                }
+            }
+            continue;
+        }
+        match tick().await {
+            Ok(()) => match writer.record_maintenance_job_success(job).await {
+                Ok(()) => delay = interval,
+                Err(error) => {
+                    tracing::warn!(%error, job = job.as_str(), "maintenance success state write failed; retrying job");
+                    delay = retry_delay;
+                }
+            },
+            Err(error) => {
+                tracing::warn!(%error, job = job.as_str(), "scheduled maintenance job failed; retrying");
+                delay = retry_delay;
+            }
+        }
+    }
 }
 
 /// Run the `serve` subcommand.
@@ -94,6 +196,8 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             "healed catch-all project repo_path rows ($HOME, filesystem root, or non-git-root path)"
         );
     }
+
+    validate_existing_users_auth(store.reader.users_exist().await?, &config.auth)?;
 
     // Run any outstanding wiki-structure migrations before the watcher starts
     // so file moves and renames are never raced by the reconciler.
@@ -337,11 +441,10 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             //     stays as-is, middleware injects anonymous actor.
             //   - rung 1 (bearer_token set, no token_pepper) → root_actor
             //     stamps writes with [auth].root_* identity.
-            //   - rung 2 (bearer_token + token_pepper + users in DB) →
-            //     unknown bearer routes through users-table lookup.
-            // The pepper is auto-generated by `ai-memory init`, so almost
-            // every operator-installed server reaches rung 2; the only
-            // rung-1-only setups are those whose config predates v0.8.
+            //   - token_pepper present → unknown bearers always route through
+            //     the users-table lookup, including before the first user is
+            //     created. Admin mode separately switches on a fresh
+            //     store-backed users-exist read.
             let mut auth_state = AuthState::new(config.auth.bearer_token.clone());
             let root_user = config.auth.root_username.clone();
             if root_user.as_deref().is_some_and(|s| !s.trim().is_empty()) {
@@ -500,22 +603,51 @@ async fn start_maintenance_scheduler(
         let writer = writer.clone();
         tasks.push(tokio::spawn(async move {
             let interval = std::time::Duration::from_secs(forget_sweep_interval_secs);
-            loop {
-                tokio::time::sleep(interval).await;
-                let started = std::time::Instant::now();
-                match run_scheduled_sweep_tick(&reader, &writer, &decay).await {
-                    Ok(outcome) => info!(
-                        scopes = outcome.scopes,
-                        candidates_evaluated = outcome.candidates_evaluated,
-                        evicted = outcome.evicted,
-                        hard_deleted = outcome.hard_deleted,
-                        errors = outcome.errors,
-                        elapsed_ms = started.elapsed().as_millis(),
-                        "scheduled forget sweep completed"
-                    ),
-                    Err(e) => tracing::warn!(error = %e, "scheduled forget sweep failed"),
-                }
-            }
+            run_persisted_maintenance_job(
+                writer.clone(),
+                ai_memory_store::MaintenanceJob::ForgetSweep,
+                interval,
+                {
+                    let reader = reader.clone();
+                    move || {
+                        let reader = reader.clone();
+                        async move {
+                            Ok(reader
+                                .maintenance_job_last_success(
+                                    ai_memory_store::MaintenanceJob::ForgetSweep,
+                                )
+                                .await?)
+                        }
+                    }
+                },
+                || jiff::Timestamp::now().as_microsecond(),
+                move || {
+                    let reader = reader.clone();
+                    let writer = writer.clone();
+                    let decay = decay;
+                    async move {
+                        let started = std::time::Instant::now();
+                        let outcome = run_scheduled_sweep_tick(&reader, &writer, &decay).await?;
+                        if outcome.errors > 0 {
+                            anyhow::bail!(
+                                "scheduled forget sweep had {} scope errors",
+                                outcome.errors
+                            );
+                        }
+                        info!(
+                            scopes = outcome.scopes,
+                            candidates_evaluated = outcome.candidates_evaluated,
+                            evicted = outcome.evicted,
+                            hard_deleted = outcome.hard_deleted,
+                            errors = outcome.errors,
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "scheduled forget sweep completed"
+                        );
+                        Ok(())
+                    }
+                },
+            )
+            .await;
         }));
     }
 
@@ -558,24 +690,54 @@ async fn start_maintenance_scheduler(
 
     if maintenance_enabled && lint_interval_secs > 0 {
         let reader = reader.clone();
+        let writer = writer.clone();
         let wiki = wiki.clone();
         let llm = llm.clone();
         tasks.push(tokio::spawn(async move {
             let interval = std::time::Duration::from_secs(lint_interval_secs);
-            loop {
-                tokio::time::sleep(interval).await;
-                let started = std::time::Instant::now();
-                match run_scheduled_lint_tick(&reader, &wiki, llm.as_ref()).await {
-                    Ok(outcome) => info!(
-                        scopes = outcome.scopes,
-                        findings = outcome.findings,
-                        errors = outcome.errors,
-                        elapsed_ms = started.elapsed().as_millis(),
-                        "scheduled rule-based lint completed"
-                    ),
-                    Err(e) => tracing::warn!(error = %e, "scheduled lint failed"),
-                }
-            }
+            run_persisted_maintenance_job(
+                writer,
+                ai_memory_store::MaintenanceJob::RuleLint,
+                interval,
+                {
+                    let reader = reader.clone();
+                    move || {
+                        let reader = reader.clone();
+                        async move {
+                            Ok(reader
+                                .maintenance_job_last_success(
+                                    ai_memory_store::MaintenanceJob::RuleLint,
+                                )
+                                .await?)
+                        }
+                    }
+                },
+                || jiff::Timestamp::now().as_microsecond(),
+                move || {
+                    let reader = reader.clone();
+                    let wiki = wiki.clone();
+                    let llm = llm.clone();
+                    async move {
+                        let started = std::time::Instant::now();
+                        let outcome = run_scheduled_lint_tick(&reader, &wiki, llm.as_ref()).await?;
+                        if outcome.errors > 0 {
+                            anyhow::bail!(
+                                "scheduled rule-based lint had {} scope errors",
+                                outcome.errors
+                            );
+                        }
+                        info!(
+                            scopes = outcome.scopes,
+                            findings = outcome.findings,
+                            errors = outcome.errors,
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "scheduled rule-based lint completed"
+                        );
+                        Ok(())
+                    }
+                },
+            )
+            .await;
         }));
     }
 
@@ -2034,6 +2196,516 @@ mod tests {
     use tempfile::TempDir;
     use tower::ServiceExt;
 
+    #[test]
+    fn existing_users_require_nonempty_pepper_and_root_bearer() {
+        for users_exist in [false, true] {
+            for (pepper_label, token_pepper) in [
+                ("missing", None),
+                ("blank", Some("  ")),
+                ("present", Some("pepper")),
+            ] {
+                for (bearer_label, bearer_token) in [
+                    ("missing", None),
+                    ("blank", Some("\t")),
+                    ("present", Some("root-token")),
+                ] {
+                    let auth = AuthSettings {
+                        token_pepper: token_pepper.map(str::to_string),
+                        bearer_token: bearer_token.map(str::to_string),
+                        ..AuthSettings::default()
+                    };
+                    let result = validate_existing_users_auth(users_exist, &auth);
+                    let should_pass =
+                        !users_exist || (pepper_label == "present" && bearer_label == "present");
+                    assert_eq!(
+                        result.is_ok(),
+                        should_pass,
+                        "users={users_exist}, pepper={pepper_label}, bearer={bearer_label}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn maintenance_start_delay_handles_never_overdue_and_remaining_cadence() {
+        let interval = Duration::from_secs(120);
+        let now = 1_000_000_000i64;
+        assert_eq!(
+            maintenance_start_delay(None, now, interval),
+            MAINTENANCE_STARTUP_DELAY_CAP
+        );
+        assert_eq!(
+            maintenance_start_delay(Some(now - 120_000_000), now, interval),
+            MAINTENANCE_STARTUP_DELAY_CAP
+        );
+        assert_eq!(
+            maintenance_start_delay(Some(now - 30_000_000), now, interval),
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            maintenance_start_delay(None, now, Duration::from_secs(10)),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            maintenance_start_delay(Some(i64::MAX), now, interval),
+            interval,
+            "future/extreme persisted timestamps cannot defer beyond interval"
+        );
+        assert_eq!(
+            maintenance_start_delay(Some(i64::MIN), i64::MAX, interval),
+            MAINTENANCE_STARTUP_DELAY_CAP,
+            "opposite-sign extremes must not overflow"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persisted_maintenance_retries_failures_and_waits_after_success() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let attempts_for_tick = attempts.clone();
+        let reader_for_state = store.reader.clone();
+        let task = tokio::spawn(run_persisted_maintenance_job(
+            store.writer.clone(),
+            ai_memory_store::MaintenanceJob::ForgetSweep,
+            Duration::from_secs(2),
+            move || {
+                let reader = reader_for_state.clone();
+                async move {
+                    Ok(reader
+                        .maintenance_job_last_success(ai_memory_store::MaintenanceJob::ForgetSweep)
+                        .await?)
+                }
+            },
+            || jiff::Timestamp::now().as_microsecond(),
+            move || {
+                let attempts = attempts_for_tick.clone();
+                let events = events.clone();
+                async move {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                    events.send(attempt).unwrap();
+                    if attempt == 1 {
+                        anyhow::bail!("injected failure");
+                    }
+                    Ok(())
+                }
+            },
+        ));
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(received.recv().await, Some(1));
+        assert_eq!(
+            store
+                .reader
+                .maintenance_job_last_success(ai_memory_store::MaintenanceJob::ForgetSweep)
+                .await
+                .unwrap(),
+            None,
+            "failed ticks must not advance persisted cadence"
+        );
+
+        tokio::time::advance(Duration::from_millis(1999)).await;
+        tokio::task::yield_now().await;
+        assert!(received.try_recv().is_err(), "failure retry is not early");
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(received.try_recv(), Ok(2));
+        let mut persisted = false;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            persisted = store
+                .reader
+                .maintenance_job_last_success(ai_memory_store::MaintenanceJob::ForgetSweep)
+                .await
+                .unwrap()
+                .is_some();
+            if persisted {
+                break;
+            }
+        }
+        assert!(persisted, "successful ticks persist cadence");
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(
+            received.try_recv().is_err(),
+            "next tick waits full interval"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(received.recv().await, Some(3));
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn maintenance_state_read_failure_retries_before_running_work() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let work = Arc::new(AtomicUsize::new(0));
+        let reads_for_loader = reads.clone();
+        let work_for_tick = work.clone();
+        let task = tokio::spawn(run_persisted_maintenance_job(
+            store.writer.clone(),
+            ai_memory_store::MaintenanceJob::RuleLint,
+            Duration::from_secs(2),
+            move || {
+                let reads = reads_for_loader.clone();
+                async move {
+                    if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                        anyhow::bail!("injected cadence read failure");
+                    }
+                    Ok(None)
+                }
+            },
+            || jiff::Timestamp::now().as_microsecond(),
+            move || {
+                let work = work_for_tick.clone();
+                async move {
+                    work.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+        ));
+
+        tokio::task::yield_now().await;
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            work.load(Ordering::SeqCst),
+            0,
+            "read failure must not run work"
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            work.load(Ordering::SeqCst),
+            0,
+            "successful retry still observes startup delay"
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(work.load(Ordering::SeqCst), 1);
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persisted_loop_runs_one_bounded_startup_catchup_for_never_and_overdue() {
+        const NOW: i64 = 10_000_000;
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let never_events = events.clone();
+        let overdue_events = events.clone();
+        let never = tokio::spawn(run_persisted_maintenance_job(
+            store.writer.clone(),
+            ai_memory_store::MaintenanceJob::ForgetSweep,
+            Duration::from_secs(2),
+            || async { Ok(None) },
+            || NOW,
+            move || {
+                let events = never_events.clone();
+                async move {
+                    events.send("never").unwrap();
+                    Ok(())
+                }
+            },
+        ));
+        let overdue = tokio::spawn(run_persisted_maintenance_job(
+            store.writer.clone(),
+            ai_memory_store::MaintenanceJob::RuleLint,
+            Duration::from_secs(2),
+            || async { Ok(Some(NOW - 2_000_000)) },
+            || NOW,
+            move || {
+                let events = overdue_events.clone();
+                async move {
+                    events.send("overdue").unwrap();
+                    Ok(())
+                }
+            },
+        ));
+        tokio::task::yield_now().await;
+        assert!(received.try_recv().is_err());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        let mut seen = [false, false];
+        while let Ok(event) = received.try_recv() {
+            match event {
+                "never" => seen[0] = true,
+                "overdue" => seen[1] = true,
+                _ => unreachable!(),
+            }
+        }
+        assert_eq!(seen, [true, true]);
+        tokio::task::yield_now().await;
+        assert!(
+            received.try_recv().is_err(),
+            "no immediate repeat after catch-up"
+        );
+        never.abort();
+        overdue.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persisted_loop_waits_exact_remaining_interval_when_not_due() {
+        const NOW: i64 = 20_000_000;
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(run_persisted_maintenance_job(
+            store.writer.clone(),
+            ai_memory_store::MaintenanceJob::ForgetSweep,
+            Duration::from_secs(4),
+            || async { Ok(Some(NOW - 1_000_000)) },
+            || NOW,
+            move || {
+                let events = events.clone();
+                async move {
+                    events.send(()).unwrap();
+                    Ok(())
+                }
+            },
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(2999)).await;
+        tokio::task::yield_now().await;
+        assert!(received.try_recv().is_err());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(received.try_recv(), Ok(()));
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persisted_loop_waits_after_long_tick_without_overlap() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(run_persisted_maintenance_job(
+            store.writer.clone(),
+            ai_memory_store::MaintenanceJob::RuleLint,
+            Duration::from_secs(2),
+            || async { Ok(None) },
+            || 0,
+            move || {
+                let events = events.clone();
+                async move {
+                    events.send("start").unwrap();
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    events.send("end").unwrap();
+                    Ok(())
+                }
+            },
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(received.try_recv(), Ok("start"));
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            received.try_recv().is_err(),
+            "second tick cannot overlap long first tick"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(received.try_recv(), Ok("end"));
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+            if store
+                .reader
+                .maintenance_job_last_success(ai_memory_store::MaintenanceJob::RuleLint)
+                .await
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+        }
+        assert!(
+            store
+                .reader
+                .maintenance_job_last_success(ai_memory_store::MaintenanceJob::RuleLint)
+                .await
+                .unwrap()
+                .is_some(),
+            "successful completion must be persisted before measuring the next interval"
+        );
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            received.try_recv().is_err(),
+            "interval starts after completion"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            received.try_recv(),
+            Ok("start"),
+            "next tick starts after the full post-completion interval"
+        );
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persisted_loop_restart_waits_remaining_interval_from_real_state() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let interval = Duration::from_secs(4);
+        let (first_events, mut first_received) = tokio::sync::mpsc::unbounded_channel();
+        let first = tokio::spawn(run_persisted_maintenance_job(
+            store.writer.clone(),
+            ai_memory_store::MaintenanceJob::ForgetSweep,
+            interval,
+            || async { Ok(None) },
+            || 0,
+            move || {
+                let events = first_events.clone();
+                async move {
+                    events.send(()).unwrap();
+                    Ok(())
+                }
+            },
+        ));
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(interval).await;
+        tokio::task::yield_now().await;
+        assert_eq!(first_received.try_recv(), Ok(()));
+
+        let mut persisted = None;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+            persisted = store
+                .reader
+                .maintenance_job_last_success(ai_memory_store::MaintenanceJob::ForgetSweep)
+                .await
+                .unwrap();
+            if persisted.is_some() {
+                break;
+            }
+        }
+        let persisted = persisted.expect("first scheduler persisted successful completion");
+        first.abort();
+
+        // Restart one second into the persisted cadence: exactly three seconds remain.
+        let (second_events, mut second_received) = tokio::sync::mpsc::unbounded_channel();
+        let (state_loaded, mut state_loaded_received) = tokio::sync::mpsc::unbounded_channel();
+        let second_reader = store.reader.clone();
+        let second = tokio::spawn(run_persisted_maintenance_job(
+            store.writer.clone(),
+            ai_memory_store::MaintenanceJob::ForgetSweep,
+            interval,
+            move || {
+                let reader = second_reader.clone();
+                let state_loaded = state_loaded.clone();
+                async move {
+                    let state = reader
+                        .maintenance_job_last_success(ai_memory_store::MaintenanceJob::ForgetSweep)
+                        .await?;
+                    state_loaded.send(()).unwrap();
+                    Ok(state)
+                }
+            },
+            move || persisted + 1_000_000,
+            move || {
+                let events = second_events.clone();
+                async move {
+                    events.send(()).unwrap();
+                    Ok(())
+                }
+            },
+        ));
+        assert_eq!(state_loaded_received.recv().await, Some(()));
+        tokio::time::advance(Duration::from_millis(2999)).await;
+        tokio::task::yield_now().await;
+        assert!(second_received.try_recv().is_err());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(second_received.try_recv(), Ok(()));
+        second.abort();
+    }
+
+    #[tokio::test]
+    async fn disabled_maintenance_creates_no_persisted_job_state() {
+        let (_tmp, store, wiki, _ws, _first, _second) = two_project_wiki().await;
+        let tasks = start_maintenance_scheduler(
+            MaintenanceSettings {
+                enabled: false,
+                forget_sweep_interval_secs: 1,
+                lint_interval_secs: 1,
+                embedding_backfill_interval_secs: 1,
+            },
+            AutoImproveSettings::default(),
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki,
+            None,
+            None,
+            ai_memory_store::DecayParams::default(),
+        )
+        .await;
+        assert!(tasks.is_empty());
+        for job in [
+            ai_memory_store::MaintenanceJob::ForgetSweep,
+            ai_memory_store::MaintenanceJob::RuleLint,
+        ] {
+            assert_eq!(
+                store
+                    .reader
+                    .maintenance_job_last_success(job)
+                    .await
+                    .unwrap(),
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_interval_omits_only_that_maintenance_job() {
+        for settings in [
+            MaintenanceSettings {
+                enabled: true,
+                forget_sweep_interval_secs: 0,
+                lint_interval_secs: 60,
+                embedding_backfill_interval_secs: 0,
+            },
+            MaintenanceSettings {
+                enabled: true,
+                forget_sweep_interval_secs: 60,
+                lint_interval_secs: 0,
+                embedding_backfill_interval_secs: 0,
+            },
+        ] {
+            let (_tmp, store, wiki, _ws, _first, _second) = two_project_wiki().await;
+            let tasks = start_maintenance_scheduler(
+                settings,
+                AutoImproveSettings::default(),
+                store.reader.clone(),
+                store.writer.clone(),
+                wiki,
+                None,
+                None,
+                ai_memory_store::DecayParams::default(),
+            )
+            .await;
+            // One enabled lint/sweep job plus the independent hollow-project job.
+            assert_eq!(tasks.len(), 2);
+            for task in tasks {
+                task.abort();
+            }
+        }
+    }
+
     struct PanicLlm;
 
     impl LlmProvider for PanicLlm {
@@ -2180,7 +2852,8 @@ mod tests {
             .await;
         }
 
-        let outcome = run_scheduled_lint_tick(&store.reader, &wiki, None)
+        let panic_llm: Arc<dyn LlmProvider> = Arc::new(PanicLlm);
+        let outcome = run_scheduled_lint_tick(&store.reader, &wiki, Some(&panic_llm))
             .await
             .unwrap();
 

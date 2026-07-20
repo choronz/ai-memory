@@ -6,10 +6,70 @@
 //! `.ai-memory.toml` marker, and build the query-string suffix. The two
 //! request helpers are best-effort with shell-parity timeouts.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::commands::path_util::home_dir;
+use ai_memory_hooks::capture_policy::MAX_MARKER_BYTES;
+use ai_memory_hooks::{CaptureConfig, CapturePolicy, CaptureSource};
+
+/// Resolve the nearest marker's capture policy without changing routing parsing.
+/// Root-level marker keys are intentionally ignored here; only `[capture]` is strict.
+pub fn capture_policy(cwd: &str) -> CapturePolicy {
+    let home = home_dir();
+    let Some(marker) = find_marker(cwd) else {
+        return CapturePolicy::resolve(
+            CaptureSource::Absent,
+            cwd,
+            home.as_deref().and_then(Path::to_str),
+        );
+    };
+    let marker_dir = marker.parent().and_then(Path::to_str).unwrap_or(cwd);
+    match read_capture_config(&marker) {
+        Ok(config) => CapturePolicy::resolve(
+            CaptureSource::Parsed(&config),
+            marker_dir,
+            home.as_deref().and_then(Path::to_str),
+        ),
+        Err(()) => CapturePolicy::resolve(
+            CaptureSource::Invalid,
+            marker_dir,
+            home.as_deref().and_then(Path::to_str),
+        ),
+    }
+}
+
+fn read_capture_config(marker: &Path) -> Result<CaptureConfig, ()> {
+    let mut bytes = Vec::with_capacity(MAX_MARKER_BYTES + 1);
+    std::fs::File::open(marker)
+        .map_err(|_| ())?
+        .take((MAX_MARKER_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ())?;
+    if bytes.len() > MAX_MARKER_BYTES {
+        return Err(());
+    }
+    let text = String::from_utf8(bytes).map_err(|_| ())?;
+    let document = text.parse::<toml_edit::DocumentMut>().map_err(|_| ())?;
+    let Some(capture) = document.get("capture") else {
+        return Ok(CaptureConfig::default());
+    };
+    let table = capture.as_table().ok_or(())?;
+    if table.iter().any(|(key, _)| key != "ignore_paths") {
+        return Err(());
+    }
+    let ignore_paths = match table.get("ignore_paths") {
+        None => Vec::new(),
+        Some(item) => item
+            .as_array()
+            .ok_or(())?
+            .iter()
+            .map(|value| value.as_str().map(str::to_owned).ok_or(()))
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    Ok(CaptureConfig { ignore_paths })
+}
 
 /// First top-level `cwd` string in the payload (parity with
 /// `ai_memory_extract_cwd`: take the top-level value, ignore nested
@@ -19,6 +79,72 @@ pub fn extract_cwd(payload: &serde_json::Value) -> Option<String> {
         .get("cwd")
         .and_then(|v| v.as_str())
         .map(str::to_owned)
+}
+
+/// Fixture-backed canonical routing context shared by native marker routing and
+/// pre-spool capture. Only explicit agent payload shapes are accepted.
+pub fn canonical_context(payload: &serde_json::Value) -> (Option<String>, Option<String>) {
+    let direct = |keys: &[&str]| {
+        keys.iter().find_map(|key| {
+            payload
+                .get(*key)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+        })
+    };
+    let nested = |path: &[&str]| {
+        path.iter()
+            .try_fold(payload, |value, key| value.get(*key))
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+    };
+    let cwd = direct(&["cwd", "current_dir", "working_dir", "directory"])
+        .or_else(|| {
+            payload
+                .get("workspacePaths")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|paths| paths.first())
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            [
+                ["path", "cwd"].as_slice(),
+                ["info", "directory"].as_slice(),
+                ["properties", "info", "directory"].as_slice(),
+                ["event", "properties", "info", "directory"].as_slice(),
+                ["payload", "path", "cwd"].as_slice(),
+                ["payload", "info", "directory"].as_slice(),
+                ["payload", "properties", "info", "directory"].as_slice(),
+            ]
+            .iter()
+            .find_map(|path| nested(path))
+        });
+    let session = direct(&[
+        "session_id",
+        "sessionId",
+        "sessionID",
+        "session",
+        "conversationId",
+    ])
+    .or_else(|| {
+        [
+            ["info", "id"].as_slice(),
+            ["properties", "sessionID"].as_slice(),
+            ["properties", "info", "id"].as_slice(),
+            ["event", "properties", "sessionID"].as_slice(),
+            ["event", "properties", "info", "id"].as_slice(),
+            ["payload", "info", "id"].as_slice(),
+            ["payload", "properties", "sessionID"].as_slice(),
+            ["payload", "properties", "info", "id"].as_slice(),
+        ]
+        .iter()
+        .find_map(|path| nested(path))
+    });
+    (cwd, session)
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -37,7 +163,7 @@ pub fn resolve_cwd_with_fallbacks(
     mut env_lookup: impl FnMut(&str) -> Option<String>,
     current_dir: impl FnOnce() -> Option<PathBuf>,
 ) -> Option<String> {
-    non_empty(extract_cwd(payload))
+    non_empty(canonical_context(payload).0)
         .or_else(|| non_empty(env_lookup("DEVIN_PROJECT_DIR")))
         .or_else(|| {
             current_dir().and_then(|path| {
@@ -610,6 +736,42 @@ project = "infra" # this is fine
         std::fs::create_dir_all(&deep).unwrap();
         let found = find_marker(deep.to_str().unwrap());
         assert_eq!(found.as_deref(), Some(marker.as_path()));
+    }
+
+    #[test]
+    fn capture_section_is_strict_and_marker_read_is_bounded() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join(".ai-memory.toml");
+        std::fs::write(
+            &marker,
+            "workspace = \"allowed\"\n[capture]\nignore_paths = [\"secret/**\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_capture_config(&marker).unwrap().ignore_paths,
+            ["secret/**"]
+        );
+        std::fs::write(&marker, "[capture]\nunknown = true\n").unwrap();
+        assert!(read_capture_config(&marker).is_err());
+        std::fs::write(&marker, "[capture\n").unwrap();
+        assert!(read_capture_config(&marker).is_err());
+        std::fs::write(&marker, "x".repeat(MAX_MARKER_BYTES + 1)).unwrap();
+        assert!(read_capture_config(&marker).is_err());
+    }
+
+    #[test]
+    fn canonical_context_matches_supported_routing_shapes() {
+        let agy =
+            serde_json::json!({"workspacePaths":["/workspace/project"],"conversationId":"conv"});
+        assert_eq!(
+            canonical_context(&agy),
+            (Some("/workspace/project".into()), Some("conv".into()))
+        );
+        let generated = serde_json::json!({"payload":{"properties":{"info":{"directory":"/generated"},"sessionID":"nested"}}});
+        assert_eq!(
+            canonical_context(&generated),
+            (Some("/generated".into()), Some("nested".into()))
+        );
     }
 
     /// `marker_query_suffix` appends `&workspace=…&project=…` (and

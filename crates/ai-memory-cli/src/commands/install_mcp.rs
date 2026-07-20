@@ -69,6 +69,7 @@ pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
         McpClient::AntigravityCli => render_antigravity_cli(&args)?,
         McpClient::Zero => render_zero(&args)?,
         McpClient::Devin => render_devin(&args)?,
+        McpClient::KimiCode => render_kimi_code(&args)?,
         McpClient::VsCodeCopilot => render_vscode_copilot(&args)?,
     };
     println!("{snippet}");
@@ -169,6 +170,10 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
         // non-default XDG setups (same policy as OpenCode above).
         McpClient::Zero => home()?.join(".config").join("zero").join("config.json"),
         McpClient::Devin => home()?.join(".devin").join("config.json"),
+        // Kimi Code keeps its data dir at $KIMI_CODE_HOME when set,
+        // falling back to ~/.kimi-code; MCP servers live in mcp.json at
+        // that root.
+        McpClient::KimiCode => kimi_code_home(std::env::var_os("KIMI_CODE_HOME"))?.join("mcp.json"),
         // VS Code MCP is workspace-scoped by default: `.vscode/mcp.json`
         // at the current workspace root. The user-profile alternative
         // lives under VS Code's profile-specific data dir; use VS
@@ -179,6 +184,18 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
             .join(".vscode")
             .join("mcp.json"),
     })
+}
+
+/// Kimi Code's data dir: `$KIMI_CODE_HOME` when set (non-empty), else
+/// `~/.kimi-code`. The env value comes in as a parameter so tests can
+/// exercise both branches without mutating process env.
+fn kimi_code_home(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    if let Some(dir) = env_override.filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
+    Ok(home_dir()
+        .context("could not locate $HOME for config-file auto-detect")?
+        .join(".kimi-code"))
 }
 
 /// Resolve Grok Build CLI's user configuration root. Grok honours
@@ -241,7 +258,8 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         | McpClient::GeminiCli
         | McpClient::Omp
         | McpClient::AntigravityCli
-        | McpClient::Devin => Some(JsonMcpLocation::RootMcpServers),
+        | McpClient::Devin
+        | McpClient::KimiCode => Some(JsonMcpLocation::RootMcpServers),
         McpClient::OpenCode => Some(JsonMcpLocation::RootMcp),
         // Zero's config.json nests servers under `mcp.servers`, the same
         // shape OpenClaw uses.
@@ -330,6 +348,24 @@ fn render_json_mcp_fragment(args: &InstallMcpArgs) -> Result<String> {
     Ok(serde_json::to_string_pretty(&fragment)?)
 }
 
+/// Append the `flavor=moonshot` marker to the MCP URL written into Kimi
+/// Code's mcp.json: Moonshot's API 400s root-level `anyOf`/`oneOf`/`allOf`
+/// in tool parameter schemas (issue #155's `anyOf` on `memory_read_page`),
+/// and the server answers flavored requests with flat schemas. Idempotent
+/// so re-runs never stack duplicate query pairs.
+pub(crate) fn moonshot_flavored_mcp_url(server_url: &str) -> String {
+    const FLAVOR: &str = "flavor=moonshot";
+    let url = server_url.trim();
+    let already_marked = url
+        .split_once('?')
+        .is_some_and(|(_, query)| query.split('&').any(|pair| pair == FLAVOR));
+    if already_marked {
+        return url.to_string();
+    }
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{separator}{FLAVOR}")
+}
+
 /// JSON entry shape used by Claude Code, Claude Desktop, Cursor, and
 /// Gemini CLI — they all accept `mcpServers.<name>` with `url` or
 /// `httpUrl` plus optional `headers`. Returns the per-client variant.
@@ -390,6 +426,15 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
         McpClient::Devin => {
             entry.insert("url".into(), json!(server_url));
             entry.insert("transport".into(), json!("http"));
+            if let Some(b) = &bearer {
+                entry.insert("headers".into(), json!({"Authorization": b}));
+            }
+        }
+        McpClient::KimiCode => {
+            // Kimi Code treats an entry with `url` and no `transport`
+            // field as streamable-HTTP; `transport` is only for legacy
+            // SSE endpoints.
+            entry.insert("url".into(), json!(moonshot_flavored_mcp_url(server_url)));
             if let Some(b) = &bearer {
                 entry.insert("headers".into(), json!({"Authorization": b}));
             }
@@ -822,6 +867,20 @@ fn render_devin(args: &InstallMcpArgs) -> Result<String> {
     ))
 }
 
+fn render_kimi_code(args: &InstallMcpArgs) -> Result<String> {
+    Ok(format!(
+        "# Kimi Code — merge into ~/.kimi-code/mcp.json\n\
+         # ($KIMI_CODE_HOME/mcp.json when KIMI_CODE_HOME is set):\n\
+         #\n\
+         # An entry with `url` and no `transport` field is a streamable-HTTP\n\
+         # server; `transport` is only needed for legacy SSE endpoints.\n\
+         # `?flavor=moonshot`: Moonshot's API rejects root-level schema\n\
+         # combinators; ai-memory serves flat schemas to flavored requests.\n\
+         {snippet}\n",
+        snippet = render_json_mcp_fragment(args)?,
+    ))
+}
+
 fn render_vscode_copilot(args: &InstallMcpArgs) -> Result<String> {
     Ok(format!(
         "# VS Code GitHub Copilot (agent mode) — write to one of:\n\
@@ -891,6 +950,7 @@ mod tests {
             McpClient::AntigravityCli => render_antigravity_cli(&args).unwrap(),
             McpClient::Zero => render_zero(&args).unwrap(),
             McpClient::Devin => render_devin(&args).unwrap(),
+            McpClient::KimiCode => render_kimi_code(&args).unwrap(),
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
         }
     }
@@ -912,6 +972,7 @@ mod tests {
             McpClient::AntigravityCli,
             McpClient::Zero,
             McpClient::Devin,
+            McpClient::KimiCode,
             McpClient::VsCodeCopilot,
         ] {
             let out = render_with_token(client);
@@ -947,6 +1008,7 @@ mod tests {
             McpClient::AntigravityCli,
             McpClient::Zero,
             McpClient::Devin,
+            McpClient::KimiCode,
             McpClient::VsCodeCopilot,
         ] {
             let out = render_for_test(client);
@@ -973,6 +1035,7 @@ mod tests {
             McpClient::AntigravityCli => render_antigravity_cli(&args).unwrap(),
             McpClient::Zero => render_zero(&args).unwrap(),
             McpClient::Devin => render_devin(&args).unwrap(),
+            McpClient::KimiCode => render_kimi_code(&args).unwrap(),
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
         }
     }
@@ -1113,6 +1176,19 @@ mod tests {
         let devin_with_token = render_with_token(McpClient::Devin);
         assert!(devin_with_token.contains("\"headers\""));
         assert!(devin_with_token.contains("\"Authorization\": \"Bearer test-token-deadbeef\""));
+        // Kimi Code: `url` with NO `transport` field means streamable-HTTP
+        // (`transport` is legacy-SSE-only there), and the URL key is plain
+        // `url` — not Gemini's `httpUrl` or Antigravity's `serverUrl`.
+        let kimi = render_for_test(McpClient::KimiCode);
+        assert!(kimi.contains("\"mcpServers\""));
+        assert!(kimi.contains("\"url\""));
+        assert!(kimi.contains("http://127.0.0.1:49374/mcp?flavor=moonshot"));
+        assert!(!kimi.contains("\"transport\""));
+        assert!(!kimi.contains("\"httpUrl\""));
+        assert!(!kimi.contains("\"serverUrl\""));
+        let kimi_with_token = render_with_token(McpClient::KimiCode);
+        assert!(kimi_with_token.contains("\"headers\""));
+        assert!(kimi_with_token.contains("\"Authorization\": \"Bearer test-token-deadbeef\""));
         // VS Code Copilot must use the `servers` top-level key — the
         // `mcpServers` form is silently ignored by VS Code's MCP
         // framework. Regression guard against a future copy-paste
@@ -1121,6 +1197,53 @@ mod tests {
         assert!(vsc.contains("\"servers\""));
         assert!(!vsc.contains("\"mcpServers\""));
         assert!(vsc.contains("\"type\": \"http\""));
+    }
+
+    /// Kimi Code resolves its mcp.json under $KIMI_CODE_HOME when the env
+    /// var is set (non-empty), else under ~/.kimi-code. Tested through the
+    /// helper's parameter so no process-env mutation (unsafe in edition
+    /// 2024, and racy under parallel tests) is needed.
+    #[test]
+    fn kimi_code_home_honours_env_override() {
+        assert_eq!(
+            kimi_code_home(Some("/tmp/custom-kimi-home".into())).unwrap(),
+            PathBuf::from("/tmp/custom-kimi-home")
+        );
+        let default = home_dir().unwrap().join(".kimi-code");
+        // An empty override falls back to the default home-based dir.
+        assert_eq!(kimi_code_home(Some("".into())).unwrap(), default);
+        assert_eq!(kimi_code_home(None).unwrap(), default);
+    }
+
+    /// Pin the append rules: `?` on a bare endpoint, `&` with an existing
+    /// query, never duplicate an existing marker.
+    #[test]
+    fn moonshot_flavored_mcp_url_appends_marker_idempotently() {
+        for (input, expected) in [
+            (
+                "http://127.0.0.1:49374/mcp",
+                "http://127.0.0.1:49374/mcp?flavor=moonshot",
+            ),
+            (
+                "http://homelab:49374/mcp?token=abc",
+                "http://homelab:49374/mcp?token=abc&flavor=moonshot",
+            ),
+            (
+                "http://127.0.0.1:49374/mcp?flavor=moonshot",
+                "http://127.0.0.1:49374/mcp?flavor=moonshot",
+            ),
+            (
+                "http://homelab:49374/mcp?token=abc&flavor=moonshot",
+                "http://homelab:49374/mcp?token=abc&flavor=moonshot",
+            ),
+            // Whole-pair match: a marker inside another pair's VALUE doesn't count.
+            (
+                "http://homelab:49374/mcp?note=flavor=moonshot",
+                "http://homelab:49374/mcp?note=flavor=moonshot&flavor=moonshot",
+            ),
+        ] {
+            assert_eq!(moonshot_flavored_mcp_url(input), expected, "input: {input}");
+        }
     }
 
     #[test]

@@ -24,7 +24,10 @@ this case. Most ai-memory installs never need a proxy.
 Add a TLS-terminating proxy in front of ai-memory when any of these
 apply:
 
-- **Multi-user mode is on** (`[auth].token_pepper` set, users created via `ai-memory user add`). Per-user tokens travel between clients and the server — sniffable over plain HTTP on the LAN. See [`docs/users.md`](users.md).
+- **Multi-user mode is on** (at least one user row exists; `[auth].token_pepper`
+  is the credential prerequisite). Per-user tokens travel between clients and
+  the server — sniffable over plain HTTP on the LAN. See
+  [`docs/users.md`](users.md).
 - **The server is bound beyond loopback** (`AI_MEMORY_BIND=0.0.0.0:49374` or a LAN-routable IP). Anyone on the network segment sees plaintext token traffic and `/web` cookies.
 - **You access `/web` from a different machine** than the one running ai-memory. The browser session cookie set after Basic auth lives in the clear over HTTP.
 - **You're exposing ai-memory beyond the LAN.** Cloudflare Tunnel or a public-domain Caddy with Let's Encrypt are the two patterns most homelab operators land on.

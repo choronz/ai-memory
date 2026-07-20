@@ -202,6 +202,8 @@ pub enum AgentKind {
     Zero,
     /// Devin CLI (Cognition).
     Devin,
+    /// Kimi Code CLI (Moonshot AI).
+    KimiCode,
     /// Anything else (manual capture, future agents).
     Other,
 }
@@ -212,7 +214,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -226,6 +228,7 @@ impl AgentKind {
         Self::Grok,
         Self::Zero,
         Self::Devin,
+        Self::KimiCode,
         Self::Other,
     ];
 
@@ -246,6 +249,7 @@ impl AgentKind {
             Self::Grok => "grok",
             Self::Zero => "zero",
             Self::Devin => "devin",
+            Self::KimiCode => "kimi-code",
             Self::Other => "other",
         }
     }
@@ -269,6 +273,7 @@ impl AgentKind {
             "grok" => Self::Grok,
             "zero" => Self::Zero,
             "devin" => Self::Devin,
+            "kimi-code" | "kimi" => Self::KimiCode,
             _ => Self::Other,
         }
     }
@@ -357,6 +362,26 @@ mod tests {
         assert_eq!(AgentKind::from_wire("devin-2"), AgentKind::Other);
         // Devin can inject the session-start handoff (consumes additionalContext).
         assert!(AgentKind::Devin.session_start_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_kimi_code_round_trips() {
+        assert_eq!(AgentKind::KimiCode.as_str(), "kimi-code");
+        assert_eq!(AgentKind::from_wire("kimi-code"), AgentKind::KimiCode);
+        assert_eq!(AgentKind::from_wire("kimi"), AgentKind::KimiCode);
+        // serde uses rename_all = "kebab-case" → "kimi-code".
+        assert_eq!(
+            serde_json::to_string(&AgentKind::KimiCode).unwrap(),
+            "\"kimi-code\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"kimi-code\"").unwrap(),
+            AgentKind::KimiCode
+        );
+        // Unknown tags still degrade to Other.
+        assert_eq!(AgentKind::from_wire("kimi-2"), AgentKind::Other);
+        // Kimi Code can inject the session-start handoff (consumes additionalContext).
+        assert!(AgentKind::KimiCode.session_start_injects_handoff());
     }
 
     #[test]

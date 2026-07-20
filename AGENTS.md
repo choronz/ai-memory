@@ -36,8 +36,8 @@ install or refresh work.
 If you're about to write a durable project rule ("always X", "never
 Y", "all PRs must ..."), write it in the project's canonical agent instruction file.
 Many projects use CLAUDE.md for Claude Code and
-AGENTS.md for Codex / OpenCode / Cursor / Gemini CLI / Grok Build CLI, but if the project
-says one file is canonical, use that file.
+AGENTS.md for Codex / OpenCode / Cursor / Gemini CLI / Grok Build CLI / Kimi Code,
+but if the project says one file is canonical, use that file.
 
 If the rule is a standing *user/team* preference that should apply to
 every project (tech choices, code style, personal conventions), save it
@@ -53,8 +53,9 @@ latest binary's recommended copy:
 - **From the agent** (no terminal needed): ask "refresh the ai-memory
   routing in this project". The agent calls `memory_install_self_routing`,
   picks the right filename for itself (Claude Code -> `CLAUDE.md`; Codex /
-  OpenCode / Cursor / Gemini / Grok -> `AGENTS.md`), uses its Write / Edit tool
-  to replace or append the returned `markered_block` while preserving
+  OpenCode / Cursor / Gemini / Grok -> `AGENTS.md`; Kimi Code -> `AGENTS.md`),
+  uses its Write / Edit tool to replace or append the returned
+  `markered_block` while preserving
   non-ai-memory user content, then writes or updates each returned
   `managed_skills` item under the selected skill root from `target_hints`
   using its `relative_path`.

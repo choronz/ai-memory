@@ -1,9 +1,7 @@
 # Multi-user attribution
 
-> **Status:** v0.8 (rolling out across Phase 1 milestones P1.1–P1.8).
-> This page documents what's already merged today; per-page
-> attribution + frontmatter `last_modified_by` (P1.6) and `/api/v1`
-> author surfacing (P1.7) ship in subsequent milestones.
+> **Status:** Introduced in v0.8; this page documents the current shipped
+> contract.
 
 ai-memory is **single-tenant data** with **optional multi-user
 attribution**. Every authenticated request sees the same wiki pages —
@@ -11,8 +9,8 @@ there is no per-page RBAC, no per-user data scoping, no group
 permissions. What multi-user mode adds is *who-did-this*: every write
 attributes to a named user, audit-log rows carry that identity, and the
 web UI can show "Last edited by Alice Smith" instead of the anonymous
-default. Every `/admin/*` endpoint stays root-only once multi-user mode
-is configured, including read-only status/search/read-page helpers.
+default. Every `/admin/*` endpoint stays root-only once at least one user
+row exists, including read-only status/search/read-page helpers.
 
 If you run ai-memory alone, you can skip this page — your install
 keeps working unchanged.
@@ -31,10 +29,8 @@ You probably want multi-user mode when:
 
 You probably **don't** need it when:
 
-- You're the sole human user of your install. Single-user mode
-  (`[auth].bearer_token` set, no `[auth].token_pepper`) is what
-  the project has shipped since v0.1 and continues to work
-  identically.
+- You're the sole human user of your install. Single-user mode (no user rows)
+  remains compatible whether or not `init` has generated `[auth].token_pepper`.
 - You need permissions / access control. v1 of ai-memory does
   not implement RBAC by design (see
   [`design-decisions.md`](design-decisions.md) §13). Attribution
@@ -101,7 +97,14 @@ table useless to an offline attacker; an attacker with both the
 DB and the config has tokens at their disposal anyway, so the
 pepper's job is closed by the file-permission boundary.
 
-Restart `ai-memory serve` for the changes to take effect.
+`init` creates the pepper before any users exist. Until the first user is
+added, operational admin endpoints retain single-user compatibility; creating
+that first user switches them to root-only immediately, without a restart.
+Expired user rows still keep admin mode root-only. If a database has users but
+either the pepper or static root bearer is missing or blank, `serve` refuses
+startup. Restore both original secrets from configuration backup (or set the
+root bearer from the secret manager) rather than removing users; the root token
+is required to administer the existing users.
 
 ### 2. Add another user
 
@@ -144,7 +147,7 @@ The list never surfaces tokens — only their hashes are in the DB.
 `ai-memory user expire <username>` stamps `token_expired_at = now()`
 on the row. The user's bearer stops authenticating immediately, but
 the row stays put so historical `author_id` references in
-`audit_log` (and, after P1.6, in `pages`) keep resolving to their
+`audit_log` and `pages` keep resolving to their
 real names.
 
 ```console
@@ -189,9 +192,10 @@ If you're upgrading from a pre-v0.8 ai-memory:
   `multi-user not enabled` message. Existing installs never trip
   this because they never call `user add`.
 - `/admin/*` endpoints are open to the configured bearer token in
-  single-user mode, matching historical behavior. After you configure
-  `[auth].token_pepper`, every admin endpoint requires the root token;
-  DB-user tokens receive **403** and anonymous requests receive **401**.
+  single-user mode, matching historical behavior. Creating the first user row
+  immediately makes every admin endpoint root-only; DB-user tokens receive
+  **403** and anonymous requests receive **401**. Merely configuring
+  `[auth].token_pepper` does not activate that boundary.
 
 ### Migrating an existing single-user install
 
@@ -250,8 +254,8 @@ See `crates/ai-memory-store/src/users.rs` for the full rationale.
 | `/api/v1` page responses include `author: { username, name?, email? }` | ✓ P1.7 |
 | ETag invalidation on author change (so caches refresh attribution) | ✓ P1.7 |
 | `install-hooks --as-user <name>` metadata + flag validation | ✓ P1.8 |
-| Web UI shows author on page view + list views | ⏳ follow-up commit (data is already on `/api/v1`) |
-| `audit_log.author_id` populated on every write | ⏳ deferred (touches many ops; planned for next round) |
+| Web UI shows author on the page view | ✓ shipped |
+| Attributed mutation audit rows carry `audit_log.author_id` | ✓ shipped |
 
 Commit ids for each milestone are recorded in `CHANGELOG.md`.
 
