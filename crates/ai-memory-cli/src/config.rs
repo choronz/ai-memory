@@ -2143,7 +2143,7 @@ mod tests {
         let provider = cfg.llm_provider_config().unwrap().unwrap();
 
         assert_eq!(provider.provider, ProviderChoice::OpenAiOAuth);
-        assert_eq!(provider.model, "gpt-5.4");
+        assert_eq!(provider.model, "gpt-5.5");
         assert_eq!(
             provider.auth.requirement(),
             AuthRequirement::OpenAiOAuthToken
@@ -2171,7 +2171,7 @@ mod tests {
         let auth = provider.auth.require_copilot_auth().unwrap();
 
         assert_eq!(provider.provider, ProviderChoice::Copilot);
-        assert_eq!(provider.model, "gpt-5.4");
+        assert_eq!(provider.model, "gpt-5.5");
         assert_eq!(auth.token_file, tmp.path().join("auth.json"));
         assert_eq!(auth.github_token.unwrap().expose_secret(), "ghu-test");
     }
@@ -2189,7 +2189,7 @@ mod tests {
 
         let provider = cfg.llm_provider_config().unwrap().unwrap();
         assert_eq!(provider.provider, ProviderChoice::AnthropicOAuth);
-        assert_eq!(provider.model, "claude-sonnet-5-0");
+        assert_eq!(provider.model, "claude-sonnet-4-6");
         assert_eq!(
             provider.auth.requirement(),
             AuthRequirement::AnthropicOAuthToken

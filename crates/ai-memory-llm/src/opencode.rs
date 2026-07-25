@@ -76,7 +76,8 @@ mod tests {
 
     #[test]
     fn provider_reports_opencode_name_and_configured_model() {
-        let provider = OpenCodeProvider::new(SecretString::from("sk-test"), "model-x").unwrap();
+        let provider =
+            OpenCodeProvider::new(vec![SecretString::from("sk-test")], "model-x").unwrap();
         assert_eq!(provider.name(), "opencode");
         assert_eq!(provider.model(), "model-x");
     }
