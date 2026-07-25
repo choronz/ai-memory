@@ -36,8 +36,8 @@
 //! responsible for all state reads/writes against the wiki + SQLite.
 
 use std::sync::Arc;
-
 use std::future::Future;
+use std::fs;
 use std::io::Seek;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -3145,7 +3145,7 @@ async fn handle_purge_session(
         actor,
         ..Default::default()
     };
-    let resolved_purge_ctx = match state
+    let _resolved_purge_ctx = match state
         .wiki
         .admit_purge_project(ws_id, proj_id, Some(purge_ctx))
         .await
@@ -3177,29 +3177,25 @@ async fn handle_purge_session(
     };
 
     // Remove the session's summary page file from disk. The DB rows are gone;
-    // the file lives at <wiki>/<ws>/<proj>/sessions/<session_id>.md. We route
-    // through Wiki::delete_page so admission + quarantine semantics match a
-    // normal page delete. Skip when the session had no summary page.
+    // the file lives at <wiki>/<ws>/<proj>/sessions/<session_id>.md. We remove
+    // the file directly (the DB page row was already deleted inside
+    // purge_session, so wiki.delete_page would re-quarantine the file on
+    // DB-not-found, restoring it). Skip when the session had no summary page.
     let summary_path = ai_memory_core::PagePath::new(format!("sessions/{session_id}.md"))
         .expect("sessions/<uuid>.md is a valid page path");
     let mut file_deleted = false;
     let mut file_failed: Option<String> = None;
     if summary.had_summary_page {
-        match state
-            .wiki
-            .delete_page(
-                ws_id,
-                proj_id,
-                &summary_path,
-                resolved_purge_ctx.clone(),
-                author_id,
-            )
-            .await
-        {
+        let abs_path = state.wiki.abs_path(ws_id, proj_id, &summary_path);
+        match fs::remove_file(&abs_path) {
             Ok(()) => file_deleted = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // File already gone — that's fine.
+                file_deleted = true;
+            }
             Err(e) => {
                 warn!(
-                    path = %summary_path.as_str(),
+                    path = %abs_path.display(),
                     error = %e,
                     "purge-session: failed to remove summary page file"
                 );

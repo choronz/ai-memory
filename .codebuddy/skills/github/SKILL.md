@@ -4,7 +4,7 @@ name: github
 
 description: rules
 
-allowed-tools: Read, Write, Bash, WebFetch
+allowed-tools: Read, Write, Bash, WebFetch, Glob
 
 \---
 
@@ -23,10 +23,4 @@ local project is D:\\Projects\\Forks\\ai-memory. After code changes, it is compi
 
 
 config.toml is at C:\\Apps\\ai-memory\\data
-
-
-
-
-
-
 

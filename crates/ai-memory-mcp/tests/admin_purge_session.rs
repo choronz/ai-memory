@@ -2,7 +2,7 @@
 
 use ai_memory_core::{
     AgentKind, NewHandoff, NewObservation, NewSession, ObservationKind, PagePath, ProjectId,
-    SessionId, Tier, WorkspaceId,
+    Sanitized, Sanitizer, SessionId, Tier, WorkspaceId,
 };
 use ai_memory_mcp::{AdminState, admin_router};
 use ai_memory_store::{DecayParams, Store};
@@ -92,17 +92,20 @@ async fn seed_session(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectId, Se
     for i in 0..4u8 {
         store
             .writer
-            .insert_observation(NewObservation {
-                session_id: sid,
-                workspace_id: ws,
-                project_id: proj,
-                kind: ObservationKind::UserPrompt,
-                extension: None,
-                source_event: None,
-                title: format!("obs {i}"),
-                body: "body".into(),
-                importance: 5,
-            })
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id: sid,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: format!("obs {i}"),
+                    body: "body".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
             .await
             .unwrap();
     }
@@ -143,6 +146,23 @@ async fn seed_session(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectId, Se
         })
         .await
         .unwrap();
+
+    // A standing page so the project isn't reaped after the purge.
+    wiki.write_page(WritePageRequest {
+        workspace_id: ws,
+        project_id: proj,
+        path: PagePath::new("notes/standing.md").unwrap(),
+        frontmatter: serde_json::json!({"title": "standing page"}),
+        body: "This page keeps the project alive.".into(),
+        tier: Tier::Episodic,
+        pinned: false,
+        title: Some("standing page".into()),
+        admission_ctx: None,
+        author_id: None,
+        actor: ai_memory_core::ActorContext::anonymous(),
+    })
+    .await
+    .unwrap();
 
     (ws, proj, sid)
 }
@@ -339,17 +359,20 @@ async fn purge_session_without_summary_page_is_clean() {
         .unwrap();
     store
         .writer
-        .insert_observation(NewObservation {
-            session_id: sid,
-            workspace_id: ws,
-            project_id: proj,
-            kind: ObservationKind::UserPrompt,
-            extension: None,
-            source_event: None,
-            title: "t".into(),
-            body: "b".into(),
-            importance: 5,
-        })
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id: sid,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "t".into(),
+                    body: "b".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
         .await
         .unwrap();
 
